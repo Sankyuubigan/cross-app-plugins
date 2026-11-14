@@ -233,5 +233,46 @@
     "vram_fast_gb": 8.0,
     "vram_min_gb": 7.0,
     "ram_min_gb": 8.0
+  },
+  {
+    "name": "minimax_h3_image-q4km",
+    "label": "MiniMax H3 Image (Q4_K_M) — 6 шагов, генерация И правка (до 16 референсов); 4 МП",
+    "note": "MiniMax-H3-Image 20B: T2I и ref-редактирование одним чекпоинтом, дистиллят 6 шагов (PDD), day-0 sd.cpp 11.11.2026. Пресет — рецепт sd.cpp minimax-h3-image: 6 шагов, CFG 1.0, euler, сигмы PDD (массив задан явно). Канвас 2048×2048 (4 МП, кратно 32; модель умеет 4–20 МП). Полный функционал: генерация И редактирование — native ref_images до 16 референсов (mmproj НЕ нужен: vision tower внутри TE); референсы адресуются Picture 1, Picture 2 — по порядку вложений; авто-префикса «Edit ...» у базовой модели нет — инструкцию правки писать явно. Требуется движок master-1088-32d516c или новее (день-0 поддержка). TE qwen3vl_32b Q2_K_M — общий с видео-бандлами H3, но папки image/video раздельные → докачается в папку image-бандлов (~13.1 ГБ). Лоры: база minimax_h3_image — папка пуста (лор для стека пока нет; лоры видео-базы minimax_h3 — другой бэкбон, не заявлять). VRAM/RAM — ОЦЕНКИ: бенч Hearthscale RTX 3080 10GB Vulkan: 2048²=77 с, правки=76 с; фактический compute_buffers_mb заполнит замер (методика §4 docs/BUNDLES.md). Q2_K квант диффузии отклонён автором квантов (ломает буквы/детали) — Q4_K_M «Recommended».",
+    "is_default": false,
+    "lora_base": "minimax_h3_image",
+    "ref_edit_mode": "native",
+    "files": [
+      {
+        "role": "diffusion",
+        "filename": "minimax_h3_image_pruned-Q4_K_M.gguf",
+        "download_url": "https://huggingface.co/Hearthscale/MiniMax-H3-Image-GGUF/resolve/main/minimax_h3_image_pruned-Q4_K_M.gguf?download=true",
+        "size_bytes": 11429589600
+      },
+      {
+        "role": "llm",
+        "filename": "qwen3vl_32b_minimax_h3-Q2_K_M.gguf",
+        "download_url": "https://huggingface.co/unsloth/MiniMax-H3-GGUF/resolve/main/qwen3vl_32b_minimax_h3-Q2_K_M.gguf?download=true",
+        "size_bytes": 13102161024
+      },
+      {
+        "role": "vae",
+        "filename": "minimax_h3_image_vae_fp16.safetensors",
+        "download_url": "https://huggingface.co/Comfy-Org/MiniMax-H3-Image/resolve/main/vae/minimax_h3_image_vae_fp16.safetensors?download=true",
+        "size_bytes": 1168505312
+      }
+    ],
+    "preset": {
+      "cfg_scale": 1.0,
+      "sampler": "euler",
+      "width": 2048,
+      "height": 2048,
+      "steps": 6,
+      "seed": -1,
+      "custom_sigmas": [1.0, 0.9675237, 0.8875485, 0.75, 0.5327739, 0.23200887, 0.0]
+    },
+    "size_gb": "25.7",
+    "vram_fast_gb": 27.0,
+    "vram_min_gb": 10.0,
+    "ram_min_gb": 27.0
   }
 ]

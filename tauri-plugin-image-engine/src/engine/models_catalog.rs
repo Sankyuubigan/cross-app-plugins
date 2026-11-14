@@ -999,8 +999,8 @@ mod tests {
         let catalog = load_image_catalog();
         assert_eq!(
             catalog.len(),
-            5,
-            "после добавления FLUX.3 Klein в каталоге 5 бандлов, got {}",
+            6,
+            "после добавления MiniMax H3-Image в каталоге 6 бандлов, got {}",
             catalog.len()
         );
         let def = default_bundle_entry().expect("нет бандла по умолчанию");
@@ -1158,13 +1158,100 @@ mod tests {
         }
     }
 
+    /// Контракт стека MiniMax H3-Image (PRP 12.11.2026): рецепт sd.cpp
+    /// `minimax-h3-image` — 6 шагов PDD, канвас 4 МП (решение владельца);
+    /// mmproj не нужен (vision tower внутри TE); native ref-edit без лоры;
+    /// TE общий с видео-бандлами H3 — имя/байты/URL совпадают байт-в-байт.
+    #[test]
+    fn minimax_h3_image_bundle_contract() {
+        let e = bundle_by_name("minimax_h3_image-q4km").expect("бандл H3-Image в каталоге");
+        let roles: Vec<&str> = e.files.iter().map(|f| f.role.as_str()).collect();
+        assert_eq!(
+            e.files.len(),
+            3,
+            "стек H3-Image = diffusion + llm + vae, mmproj не нужен (vision tower внутри TE)"
+        );
+        for r in ["diffusion", "llm", "vae"] {
+            assert!(roles.contains(&r), "нет роли {}", r);
+        }
+        assert!(
+            !roles.contains(&"mmproj"),
+            "H3-Image правит нативно без mmproj — его файла в наборе быть не должно"
+        );
+        // Рецепт sd.cpp minimax-h3-image.json: 6 шагов PDD, CFG 1.0, euler;
+        // канвас 4 МП (2048×2048, решение владельца), кратно 32.
+        assert_eq!(e.preset.steps, 6, "дистиллят PDD = 6 шагов");
+        let sigmas = e
+            .preset
+            .custom_sigmas
+            .clone()
+            .expect("PDD-сигмы заданы явно");
+        assert_eq!(
+            sigmas.len() as u32,
+            e.preset.steps + 1,
+            "шаги == len(custom_sigmas) - 1 (контракт SamplePlan::resolve)"
+        );
+        assert!(
+            (sigmas[sigmas.len() - 1]).abs() < 1e-6,
+            "терминальная сигма обязана быть 0.0"
+        );
+        assert_eq!(e.preset.cfg_scale, 1.0);
+        assert_eq!(e.preset.sampler, "euler");
+        assert_eq!(
+            (e.preset.width, e.preset.height),
+            (2048, 2048),
+            "канвас 4 МП — решение владельца"
+        );
+        assert_eq!(e.preset.width % 32, 0);
+        assert_eq!(e.preset.height % 32, 0);
+        // У стека нет своего парсера model-args — флаг не посылается (как Krea2).
+        assert!(e.model_args.is_none(), "model_args у H3-Image отсутствует");
+        // Native ref-edit без лоры/пресета; новая база лор (не видео-minimax_h3).
+        assert_eq!(e.ref_edit_mode, Some(RefEditMode::Native));
+        let c = ref_edit_contract(&e).unwrap().unwrap();
+        assert_eq!(c.mode, RefEditMode::Native);
+        assert!(
+            c.lora.is_none() && c.ref_image_args.is_none(),
+            "native: лора и ref_image_args не нужны серверу"
+        );
+        assert_eq!(
+            e.lora_base.as_deref(),
+            Some("minimax_h3_image"),
+            "лоры видео-базы minimax_h3 — другой бэкбон, база обязана быть отдельной"
+        );
+        // TE общий с видео-бандлами H3: имя/байты/URL байт-в-байт как у uni-q4k
+        // (защита от расползания общего файла между каталогами).
+        let video = load_video_catalog();
+        let vq4k = video
+            .iter()
+            .find(|v| v.name == "minimax_h3_uni-q4k")
+            .expect("видео-бандл minimax_h3_uni-q4k");
+        let img_llm = e.files.iter().find(|f| f.role == "llm").unwrap();
+        let vid_llm = vq4k
+            .files
+            .iter()
+            .find(|f| f.role == "llm")
+            .expect("llm у видео-бандла");
+        assert_eq!(img_llm.filename, vid_llm.filename, "один и тот же файл TE");
+        assert_eq!(img_llm.size_bytes, vid_llm.size_bytes);
+        assert_eq!(img_llm.download_url, vid_llm.download_url);
+        // Точные байты HF API (12.11.2026): diffusion Q4_K_M Hearthscale,
+        // VAE fp16 Comfy-Org.
+        let diff = e.files.iter().find(|f| f.role == "diffusion").unwrap();
+        assert_eq!(diff.filename, "minimax_h3_image_pruned-Q4_K_M.gguf");
+        assert_eq!(diff.size_bytes, Some(11_429_589_600));
+        let vae = e.files.iter().find(|f| f.role == "vae").unwrap();
+        assert_eq!(vae.filename, "minimax_h3_image_vae_fp16.safetensors");
+        assert_eq!(vae.size_bytes, Some(1_168_505_312));
+    }
+
     /// F4 29.10.26: ref-edit контракт каталога — Qwen native (сервер сам умеет
     /// ref-conditioning), Krea2 = edit_lora (identity-лора + preset
     /// `krea2_edit`, docs/edit.md), контракт отдаёт готовый `preset=...`.
     #[test]
     fn ref_edit_contract_catalog_bundles() {
         let catalog = load_image_catalog();
-        assert_eq!(catalog.len(), 5, "каталог должен пройти валидацию целым");
+        assert_eq!(catalog.len(), 6, "каталог должен пройти валидацию целым");
         let by = |name: &str| {
             catalog
                 .iter()
@@ -1837,7 +1924,7 @@ mod video_tests {
     #[test]
     fn embedded_catalog_satisfies_pool_filename_invariant() {
         let cat = load_image_catalog();
-        assert_eq!(cat.len(), 5, "все 5 бандлов боевого каталога обязаны грузиться без пропусков");
+        assert_eq!(cat.len(), 6, "все 6 бандлов боевого каталога обязаны грузиться без пропусков");
         let names: std::collections::HashSet<&str> = cat.iter().map(|e| e.name.as_str()).collect();
         for expected in [
             "qwen-image-2.1-turbo-unsloth-q5_ks",
@@ -1845,6 +1932,7 @@ mod video_tests {
             "krea2-turbo-q4km",
             "krea2-turbo-q3km",
             "flux3-klein-adq4k",
+            "minimax_h3_image-q4km",
         ] {
             assert!(names.contains(expected), "в каталоге нет бандла {}", expected);
         }

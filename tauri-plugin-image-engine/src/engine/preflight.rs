@@ -179,16 +179,18 @@ mod tests {
         let catalog = load_image_catalog();
         assert_eq!(
             catalog.len(),
-            5,
-            "в каталоге 5 бандлов (2 qwen-turbo + 2 krea2-turbo + 1 flux3-klein)"
+            6,
+            "в каталоге 6 бандлов (2 qwen-turbo + 2 krea2-turbo + 1 flux3-klein + 1 minimax-h3-image)"
         );
         for e in &catalog {
             let est = estimate_image_memory_mb(e);
             // Диск: из bytes каталога. Qwen-стек 11.2–11.4 ГБ десятичных;
             // Krea2: Q4_K_M 10.8 ГБ, Q3_K_M 9.1 ГБ;
-            // flux3 AD-Q4_K: diffusion 3.65 + TE 2.5 + VAE 0.34 ≈ 6.2 ГиБ.
+            // flux3 AD-Q4_K: diffusion 3.65 + TE 2.5 + VAE 0.34 ≈ 6.2 ГиБ;
+            // minimax_h3_image Q4_K_M: diffusion 11.4 + TE 13.1 + VAE 1.2
+            // ≈ 25.7 ГБ десятичных (~24.5 ГиБ).
             assert!(
-                est.disk_mb > 6_000.0 && est.disk_mb < 14_000.0,
+                est.disk_mb > 6_000.0 && est.disk_mb < 27_000.0,
                 "{}: disk {}",
                 e.name,
                 est.disk_mb
@@ -196,17 +198,25 @@ mod tests {
             // Full-режим дороже min (буферы/вторая копия весов) — инвариант формулы.
             assert!(est.full_mb > est.min_mb, "{}: full {} <= min {}", e.name, est.full_mb, est.min_mb);
             // Замер 19.10.2026: turbo full-пик 13.0–14.6 ГБ — минимумы бандлов
-            // по диапазону: diffusion 3.5–7.2 ГБ + буферы (2048) + резерв ⇒ 6–11 ГБ.
+            // по диапазону: diffusion 3.5–7.2 ГБ + буферы (2048) + резерв ⇒ 6–11 ГБ;
+            // minimax_h3_image: diffusion 10.9 ГиБ + буферы (2048) + резерв
+            // ⇒ ~13.7 ГБ.
             assert!(
-                est.min_mb > 5000.0 && est.min_mb < 12000.0,
+                est.min_mb > 5000.0 && est.min_mb < 15000.0,
                 "{}: min {}",
                 e.name,
                 est.min_mb
             );
             // У КАЖДОГО набора редактирование (правило юзера): qwen/krea2 несут
-            // mmproj — 4 файла; flux3 правит нативно БЕЗ mmproj
-            // (docs/flux3.md) — 3 файла.
-            let expected_files = if e.name.starts_with("flux3") { 3 } else { 4 };
+            // mmproj — 4 файла; flux3 и minimax_h3_image правят нативно БЕЗ
+            // mmproj (docs/flux3.md, docs/minimax_h3_image.md) — 3 файла.
+            let expected_files = if e.name.starts_with("flux3")
+                || e.name.starts_with("minimax_h3_image")
+            {
+                3
+            } else {
+                4
+            };
             assert_eq!(e.files.len(), expected_files, "{}: файлов {}", e.name, e.files.len());
         }
     }
