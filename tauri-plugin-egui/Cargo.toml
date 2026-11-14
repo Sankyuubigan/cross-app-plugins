@@ -1,0 +1,28 @@
+[package]
+name = "tauri-plugin-egui"
+version = "0.1.0"
+authors = ["Siddharth <siddharth99c@gmail.com>"]
+license = "MIT"
+description = "Vendored from clearlysid/tauri-plugin-egui (main, 12.11.2026): native egui rendering in a Tauri Window without a Webview. Patched: clipboard copy/paste via arboard."
+edition = "2021"
+rust-version = "1.77.2"
+links = "tauri-plugin-egui"
+
+[dependencies]
+tauri = "2.7.0"
+tauri-runtime = "2.7.1"
+tauri-runtime-wry = "2.7.2"
+anyhow = "1.0.98"
+wgpu = "25"
+egui = "0.32"
+egui-wgpu = "0.32"
+# Патч хоста: буфер обмена для egui (CopyText/Ctrl+V) — чистый Rust, Win32 напрямую.
+arboard = "3"
+log = "0.4"
+
+[build-dependencies]
+tauri-plugin = { version = "2.3.0", features = ["build"] }
+
+# Отрыв от workspace-репозитория my-tauri-plugins: собирается независимо,
+# версии egui/wgpu зафиксированы в этом файле (решение спеца, 12.11.2026).
+[workspace]
