@@ -107,6 +107,17 @@ fn stderr_line_shows_progress(line: &str) -> bool {
     line.contains("print_timing") || line.contains("eval progress")
 }
 
+/// Зеркалить ли строку stderr движка в лог приложения. Строки прогресса
+/// (`print_timing` / `eval progress`) — рутинный тайминг, а не ошибки: в лог
+/// приложения они не идут (спам «slot print_timing», решение владельца
+/// 14.11.26), но остаются доступными сторожу живости
+/// (`engine_last_progress_ms`) и диагностике падений (`server_trace`).
+/// Гейт использует ТОТ ЖЕ классификатор, что и сторож, — разойтись они
+/// не могут (инцидент 30.10.26: сторож и зеркало читают одни и те же строки).
+fn stderr_line_mirrors_to_log(line: &str) -> bool {
+    !stderr_line_shows_progress(line)
+}
+
 /// Мс-таймштап «сейчас» (unix epoch) — единая шкала для stderr-насосов и сторожа.
 fn now_unix_ms() -> u64 {
     std::time::SystemTime::now()
@@ -887,7 +898,9 @@ impl LlamaEngine {
                                 engine_last_progress_ms.store(now_unix_ms(), Ordering::Relaxed);
                             }
                             server_trace.push_stderr(line.to_string());
-                            log_cb(format!("[llama-server] {}", line));
+                            if stderr_line_mirrors_to_log(line) {
+                                log_cb(format!("[llama-server] {}", line));
+                            }
                         }
                     }
                 });
@@ -2422,7 +2435,9 @@ impl LlamaEngine {
                             engine_last_progress_ms.store(now_unix_ms(), Ordering::Relaxed);
                         }
                         server_trace.push_stderr(line.clone());
-                        log_cb(format!("[llama-server] {}", line));
+                        if stderr_line_mirrors_to_log(&line) {
+                            log_cb(format!("[llama-server] {}", line));
+                        }
                     }
                 }
             });
@@ -3180,6 +3195,27 @@ mod tests {
         assert!(!stderr_line_shows_progress("srv init_listene: The UI is disabled"));
         assert!(!stderr_line_shows_progress("slot get_availabl: id  0 | task -1 | selected slot by LRU, n_tokens = 0, t_last = -1"));
         assert!(!stderr_line_shows_progress("srv  chat_template:.chat_template"));
+    }
+
+    /// Зеркало stderr в лог приложения гейтится ТЕМ ЖЕ классификатором, что
+    /// кормит сторож живости: прогресс-строки (`print_timing` / `eval progress`)
+    /// — рутинный тайминг, не ошибки, в лог приложения не идут (решение
+    /// владельца 14.11.26); ошибки и служебные строки зеркалятся как раньше.
+    #[test]
+    fn progress_lines_are_not_mirrored_to_app_log() {
+        let gen = "\u{1b}[34m2.53.844.948\u{1b}[0m \u{1b}[32mI \u{1b}[0mslot print_timing: id  0 | task 0 | n_gen =    302, tg =   5.09 t/s, tg_3s =   4.84 t/s";
+        assert!(stderr_line_shows_progress(gen), "тайминг генерации — прогресс");
+        assert!(!stderr_line_mirrors_to_log(gen), "print_timing не должен попадать в лог приложения");
+        let prefill = "\u{1b}[34m1.50.703.145\u{1b}[0m \u{1b}[32mI \u{1b}[0mslot print_timing: id  0 | task 0 | prompt processing, n_tokens =   1699, progress = 0.77, t =  14.17 s / 119.89 tokens per second";
+        assert!(!stderr_line_mirrors_to_log(prefill), "тайминг префилла не должен попадать в лог приложения");
+        assert!(
+            stderr_line_mirrors_to_log("slot get_availabl: id  0 | task -1 | selected slot by LRU, n_tokens = 0, t_last = -1"),
+            "слот-строки без print_timing — не прогресс, зеркалятся"
+        );
+        assert!(
+            stderr_line_mirrors_to_log("ggml_backend_cuda_buffer_type_alloc_buffer: failed to allocate"),
+            "ошибки движка зеркалятся"
+        );
     }
 
     /// G5: решение сторожа — свежий прогресс движка продолжает ожидание,
