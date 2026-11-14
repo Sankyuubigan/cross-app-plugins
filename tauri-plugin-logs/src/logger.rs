@@ -223,14 +223,52 @@ fn is_noisy_browser_info(metadata: &Metadata) -> bool {
         .any(|prefix| metadata.target().starts_with(prefix))
 }
 
+/// Таргеты GPU-стека под egui (wgpu/naga): DEBUG/TRACE — это дампы
+/// naga-валидации шейдеров (таблицы типов WGSL, IR-листинги), сотни килобайт
+/// при каждом запуске окна (инцидент 12.11.26 — vibebridge.log 133 КБ за
+/// секунду). WARN/ERROR от этих же таргетов проходят — сбой рендера
+/// терять нельзя.
+const NOISY_GPU_TARGET_PREFIXES: [&str; 4] = ["wgpu", "naga", "egui_wgpu", "egui-wgpu"];
+
+fn is_noisy_gpu_debug(metadata: &Metadata) -> bool {
+    if !matches!(metadata.level(), Level::Debug | Level::Trace) {
+        return false;
+    }
+    NOISY_GPU_TARGET_PREFIXES
+        .iter()
+        .any(|prefix| metadata.target().starts_with(prefix))
+}
+
+/// Таргеты крейта `ignore` (движок обхода ripgrep): DEBUG/TRACE — внутренняя
+/// кухня gitignore («opened gitignore file», «glob … converted to regex»,
+/// «built glob set», построчные «ignoring …»): на крупном проекте сотни
+/// килобайт за один скан (инцидент 12.11.26 — vibebridge.log 128 КБ).
+/// WARN/ERROR от крейта проходят — реальный сбой каскада игноров терять нельзя.
+const NOISY_WALK_TARGET_PREFIXES: [&str; 2] = ["ignore", "globset"];
+
+fn is_noisy_walk_debug(metadata: &Metadata) -> bool {
+    if !matches!(metadata.level(), Level::Debug | Level::Trace) {
+        return false;
+    }
+    NOISY_WALK_TARGET_PREFIXES
+        .iter()
+        .any(|prefix| metadata.target().starts_with(prefix))
+}
+
 /// Итоговое решение «пишем ли запись». Единая точка для `log()` и `enabled()`.
 fn writes(record: &Record) -> bool {
-    !is_noisy_http_debug(record.metadata()) && !is_noisy_browser_info(record.metadata())
+    !is_noisy_http_debug(record.metadata())
+        && !is_noisy_browser_info(record.metadata())
+        && !is_noisy_gpu_debug(record.metadata())
+        && !is_noisy_walk_debug(record.metadata())
 }
 
 impl Log for AppLogger {
     fn enabled(&self, metadata: &Metadata) -> bool {
-        !is_noisy_http_debug(metadata) && !is_noisy_browser_info(metadata)
+        !is_noisy_http_debug(metadata)
+            && !is_noisy_browser_info(metadata)
+            && !is_noisy_gpu_debug(metadata)
+            && !is_noisy_walk_debug(metadata)
     }
 
     fn log(&self, record: &Record) {
@@ -318,6 +356,21 @@ pub fn early_log(level: &str, msg: &str) {
 /// Установка логгера и путей в setup плагина. Повторные вызовы безвредны.
 pub fn install(app: &AppHandle, last_logs: bool, log_file_name: Option<&str>) {
     let _ = APP_HANDLE.set(app.clone());
+    if last_logs {
+        ensure_last_logs();
+    }
+    if let Some(name) = log_file_name {
+        ensure_log_file(name);
+    }
+    install_panic_hook();
+    install_logger();
+}
+
+/// Установка логгера для нативных хостов без Tauri (GPUI-фронтенд и др.): тот
+/// же единый `log::Log`, но без `AppHandle` — emit-события `logs:message` не
+/// шлются (`write_regular` пропускает их через `APP_HANDLE.get()`), файл лога,
+/// `last_logs` и panic-hook работают как обычно. Повторные вызовы безвредны.
+pub fn install_standalone(last_logs: bool, log_file_name: Option<&str>) {
     if last_logs {
         ensure_last_logs();
     }
@@ -467,5 +520,30 @@ mod tests {
         assert!(logger.enabled(&make(Level::Error, "headless_chrome")));
         // Префикс должен совпасть С НАЧАЛА: «xheadless_chrome» — не шум.
         assert!(logger.enabled(&make(Level::Info, "xheadless_chrome")));
+    }
+
+    #[test]
+    fn noisy_walk_debug_is_filtered_but_warn_passes() {
+        fn make(level: Level, target: &str) -> Metadata<'_> {
+            Metadata::builder().level(level).target(target).build()
+        }
+        let logger = AppLogger;
+        // Внутренняя кухня gitignore на DEBUG/TRACE — заглушена.
+        assert!(!logger.enabled(&make(Level::Debug, "ignore::gitignore")));
+        assert!(!logger.enabled(&make(Level::Trace, "ignore::walk")));
+        // Реальный сбой каскада игноров на WARN/ERROR — проходит.
+        assert!(logger.enabled(&make(Level::Warn, "ignore::walk")));
+        assert!(logger.enabled(&make(Level::Error, "ignore")));
+        // Префикс должен совпасть С НАЧАЛА: «signature» — не шум.
+        assert!(logger.enabled(&make(Level::Debug, "signature")));
+    }
+
+    #[test]
+    fn install_standalone_is_idempotent_and_sets_level() {
+        // Двойной вызов не паникует: повторный set_logger возвращает Err (no-op).
+        // После установки единый маршрут log:: активен (уровень Debug).
+        install_standalone(true, None);
+        install_standalone(true, None);
+        assert_eq!(log::max_level(), LevelFilter::Debug);
     }
 }

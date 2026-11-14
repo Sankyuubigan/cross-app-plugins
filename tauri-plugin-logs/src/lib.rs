@@ -51,10 +51,17 @@ use tauri::Wry;
 mod commands;
 mod error_reporting;
 mod flight;
-mod logger;
+// pub: egui-хосты без WebView читают лог-хвост напрямую из Rust
+// (tauri_plugin_logs::logger::read_tail) — вкладка «Логи» без JS-канала.
+pub mod logger;
 mod path;
 
 pub use error_reporting::ReportingConfig;
+
+/// Установка единого логгера без Tauri-хоста (нативные фронтенды без
+/// `AppHandle`, например GPUI): файл лога / `last_logs` / panic-hook работают,
+/// emit-события UI не шлются. См. `logger::install_standalone`.
+pub use logger::install_standalone;
 
 /// Конфиг плагина (`plugins.logs` в `tauri.conf.json` хоста).
 #[derive(Deserialize, Clone)]
