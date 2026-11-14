@@ -89,15 +89,56 @@ function ensureBundleActive(cfg) {
     }
 }
 
-function checkExeFresh(cfg) {
+// Папки, НЕ являющиеся входами cargo-сборки (артефакты/окружение).
+const NON_INPUT_DIRS = new Set(['target', 'node_modules', 'bundle', '.git']);
+
+// Самый свежий mtime среди входов cargo-сборки: исходники, Cargo-манифесты,
+// tauri.conf.json, иконки, .cargo/config.toml. Прокси для «есть ли что
+// пересобирать» — cargo сам не сообщает, было ли что-то перекомпилировано.
+function newestInputMtime(cfg) {
+    let newest = 0;
+    const roots = [
+        path.join(cfg.projectRoot, 'Cargo.toml'),
+        path.join(cfg.projectRoot, 'Cargo.lock'),
+        path.join(cfg.projectRoot, '.cargo'),
+        path.join(cfg.projectRoot, 'crates'),
+        path.join(cfg.projectRoot, 'src-tauri'),
+    ];
+    const walk = (p) => {
+        let st;
+        try {
+            st = fs.statSync(p);
+        } catch {
+            return;
+        }
+        if (st.isDirectory()) {
+            if (NON_INPUT_DIRS.has(path.basename(p))) return;
+            for (const e of fs.readdirSync(p)) walk(path.join(p, e));
+            return;
+        }
+        if (st.mtimeMs > newest) newest = st.mtimeMs;
+    };
+    for (const r of roots) walk(r);
+    return newest;
+}
+
+// Проверка exe после сборки. Легитимны два исхода: exe пересобран этим
+// запуском (mtime >= начало сборки) ИЛИ cargo честно решил, что нечего
+// пересобирать (без исходных изменений exe остаётся прежним — это НЕ провал).
+// Провал — только когда входы сборки новее exe, а exe не обновился: значит
+// сборка реально не пересобрала то, что должна была.
+function checkExeFresh(cfg, buildStartMs) {
     const exe = RELEASE_EXE(cfg);
     if (!exe || !fs.existsSync(exe)) {
         throw new Error(`Built exe not found: ${exe}`);
     }
-    const ageSec = (Date.now() - fs.statSync(exe).mtimeMs) / 1000;
-    if (ageSec > 600) {
-        throw new Error(`Built exe is stale (${Math.round(ageSec)}s). Build did not refresh it: ${exe}`);
+    const mtimeMs = fs.statSync(exe).mtimeMs;
+    if (buildStartMs !== undefined && mtimeMs >= buildStartMs) return exe;
+    if (newestInputMtime(cfg) > mtimeMs) {
+        const ageSec = Math.round((Date.now() - mtimeMs) / 1000);
+        throw new Error(`Built exe is stale (${ageSec}s). Inputs are newer than exe, build did not refresh it: ${exe}`);
     }
+    console.log('[build] exe up-to-date (cargo: nothing to rebuild).');
     return exe;
 }
 
@@ -141,13 +182,14 @@ async function run(cfg, opts = {}) {
 
     killApp(cfg); // освободить file lock exe до пересборки
     fs.writeFileSync(ovrPath, JSON.stringify(buildDevOverride(cfg), null, 2) + '\n', 'utf8');
+    const buildStart = Date.now();
     try {
         sh(cfg, 'npx', ['tauri', 'build', '--config', ovrPath], { echo: true });
     } finally {
         fs.rmSync(ovrPath, { force: true });
     }
 
-    const exe = checkExeFresh(cfg);
+    const exe = checkExeFresh(cfg, buildStart);
     copyVcRedistIfConfigured(cfg, exe);
 
     // launchApp: false → ранний краш (PANIC/missing DLL) — фейлим билд, не молчим.
