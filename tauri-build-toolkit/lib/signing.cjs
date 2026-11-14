@@ -3,7 +3,6 @@
 // Никаких хардкодов паролей (исходник хранил '123' прямо в .cjs).
 
 const fs = require('fs');
-const os = require('os');
 const path = require('path');
 
 // Приоритет пути к ключу:
@@ -85,7 +84,7 @@ function setupSigningEnv(cfg, opts = {}) {
     delete process.env.TAURI_KEY_PASSWORD;
 
     console.log('Signing key loaded.');
-    return { keyPath, keyContent };
+    return { keyPath, keyContent, singleLineKey, password };
 }
 
 // Подписать установщик (Tauri signer). Если .sig уже существует — не переписываем.
@@ -99,25 +98,34 @@ function signInstaller(cfg, installerPath, opts = {}) {
         return sig;
     }
 
-    const { keyContent, keyPath } = setupSigningEnv(cfg, { strict });
+    const { keyContent, singleLineKey, password } = setupSigningEnv(cfg, { strict });
     if (!keyContent) {
         return null;
     }
 
-    const tmpKey = path.join(os.tmpdir(), `tauri-sign-${Date.now()}-${process.pid}.key`);
-    fs.writeFileSync(tmpKey, keyContent, 'utf8');
-    try {
-        const { run } = require('./run.cjs');
-        const args = ['tauri', 'signer', 'sign', '--private-key-path', tmpKey];
-        const password = resolvePassword(cfg, keyPath);
-        if (password) {
-            args.push('--password', password);
-        }
-        args.push(installerPath);
-        run(cfg, 'npx', args, { echo: true });
-    } finally {
-        fs.rmSync(tmpKey, { force: true });
+    // Ключ передаём СОДЕРЖИМЫМ, одной строкой (тот же формат, что в env для
+    // bundler'а; e2e-проверка парсинга на CLI 2.9.0 и 2.12.4 — 2026-11-14).
+    // Temp-копия ключа в %TEMP% больше не создаётся.
+    // env-дубль стираем: CLI >= 2.12 мапит TAURI_SIGNING_PRIVATE_KEY на аргумент
+    // --private-key и при стороннем источнике этого аргумента падает
+    // clap-конфликтом (регрессия релиза VibeBridge 26.11.1); CLI 2.9.0 env для
+    // signer sign игнорирует — стрип для него безвреден.
+    // ВАЖНО: run() подменяет env дочернего процесса ЦЕЛИКОМ (не мержит),
+    // поэтому передаём полный клон process.env.
+    const env = { ...process.env };
+    delete env.TAURI_SIGNING_PRIVATE_KEY;
+
+    const args = ['tauri', 'signer', 'sign', '--private-key', singleLineKey];
+    if (password) {
+        args.push('--password', password);
     }
+    args.push(installerPath);
+
+    // Echo вручную, а не run({ echo: true }): в командной строке ключ и пароль —
+    // в лог им нельзя.
+    console.log('$ npx tauri signer sign --private-key *** --password ***', installerPath);
+    const { run } = require('./run.cjs');
+    run(cfg, 'npx', args, { env });
 
     if (!fs.existsSync(sig)) {
         throw new Error(`Signer finished but signature not produced: ${sig}`);
