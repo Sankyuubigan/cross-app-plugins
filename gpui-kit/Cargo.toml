@@ -5,7 +5,7 @@ edition = "2021"
 description = "Owner's SSOT GPUI UI kit: 4-layer theme (setup_theme), AppShell window frame, AppCard, domain panels; rules in AI_UI_RULES.md"
 license = "MIT"
 
-# Отдельный workspace (НЕ корень my-tauri-plugins): опциональные депы
+# Отдельный workspace (НЕ корень cross-app-plugins): опциональные депы
 # gpui-webview/lb-wry пинят webkit2gtk =2.0.1, а wry 0.54.x tauri-плагинов —
 # =2.0.2; в одном lock несовместимо. Пустая таблица [workspace] отцепляет
 # пакет от корневого workspace при поиске вверх по каталогам.

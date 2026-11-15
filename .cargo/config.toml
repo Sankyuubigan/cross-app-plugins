@@ -1,4 +1,4 @@
-# Настройки cargo для workspace плагинов (my-tauri-plugins).
+# Настройки cargo для workspace плагинов (cross-app-plugins).
 #
 # CMAKE_POLICY_VERSION_MINIMUM: крейт `opus` (audiopus_sys, используется в
 # tauri-plugin-speech) собирает libopus через CMake, а в её CMakeLists.txt стоит

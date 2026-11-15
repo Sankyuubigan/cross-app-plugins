@@ -13,7 +13,7 @@
 //!
 //! `Cargo.toml`:
 //! ```toml
-//! tauri-plugin-downloader = { path = "../../my-tauri-plugins/tauri-plugin-downloader" }
+//! tauri-plugin-downloader = { path = "../../cross-app-plugins/tauri-plugin-downloader" }
 //! ```
 //!
 //! `main.rs`: `.plugin(tauri_plugin_downloader::init())`

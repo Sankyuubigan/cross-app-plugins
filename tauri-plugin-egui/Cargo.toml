@@ -23,6 +23,6 @@ log = "0.4"
 [build-dependencies]
 tauri-plugin = { version = "2.3.0", features = ["build"] }
 
-# Отрыв от workspace-репозитория my-tauri-plugins: собирается независимо,
+# Отрыв от workspace-репозитория cross-app-plugins: собирается независимо,
 # версии egui/wgpu зафиксированы в этом файле (решение спеца, 12.11.2026).
 [workspace]

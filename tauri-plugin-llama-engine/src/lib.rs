@@ -14,7 +14,7 @@
 //!
 //! `Cargo.toml`:
 //! ```toml
-//! tauri-plugin-llama-engine = { path = "../../my-tauri-plugins/tauri-plugin-llama-engine" }
+//! tauri-plugin-llama-engine = { path = "../../cross-app-plugins/tauri-plugin-llama-engine" }
 //! ```
 //!
 //! `main.rs`:

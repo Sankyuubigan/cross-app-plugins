@@ -11,7 +11,7 @@
 //!
 //! `Cargo.toml`:
 //! ```toml
-//! tauri-plugin-ffmpeg = { path = "../../my-tauri-plugins/tauri-plugin-ffmpeg" }
+//! tauri-plugin-ffmpeg = { path = "../../cross-app-plugins/tauri-plugin-ffmpeg" }
 //! ```
 //!
 //! `main.rs`:

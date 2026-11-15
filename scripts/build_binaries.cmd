@@ -6,7 +6,7 @@ rem удаляется командой `cargo clean`, а путь к инстр
 rem хосты в ДРУГИХ репозиториях. Путь из target\ недолговечен, bin\ — постоянный
 rem и при этом единственный: две копии одного бинаря разъезжаются.
 rem
-rem Запуск из корня репозитория my-tauri-plugins:
+rem Запуск из корня репозитория cross-app-plugins:
 rem     scripts\build_binaries.cmd
 rem
 rem Требует MSVC в PATH: скрипт НЕ поднимает vcvarsall сам (это делает

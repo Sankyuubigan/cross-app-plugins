@@ -1,4 +1,4 @@
-# my-tauri-plugins
+# cross-app-plugins
 
 Репозиторий переиспользуемых **Tauri-плагинов** (Rust-крейт + npm-пакет + Web Component).
 Один плагин = один workspace-member = один модуль «улучшил раз — обновилось везде».
@@ -90,7 +90,7 @@ JS из корня плагина.
 ```toml
 # src-tauri/Cargo.toml
 [dependencies]
-tauri-plugin-logs = { path = "../../my-tauri-plugins/tauri-plugin-logs" }
+tauri-plugin-logs = { path = "../../cross-app-plugins/tauri-plugin-logs" }
 ```
 
 ```json

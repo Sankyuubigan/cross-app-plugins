@@ -5,7 +5,7 @@ rem Сборка release-бинаря шлюза cloud-routers-gateway.
 rem Окружение — по образцу test-plugin.bat: vswhere → vcvarsall x64
 rem (прямой cargo-запуск без MSVC-инициализации запрещён правилами сборки).
 rem
-rem Место результата: D:\Projects\my-tauri-plugins\target\release\cloud-routers-gateway.exe —
+rem Место результата: D:\Projects\cross-app-plugins\target\release\cloud-routers-gateway.exe —
 rem именно его видит `check_router_update` через source_candidates, поэтому
 rem после пересборки панель King Orch при следующем старте сама предложит
 rem «Обновить сейчас» (сравнение версии/mtime/размера).

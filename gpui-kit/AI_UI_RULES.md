@@ -1,7 +1,7 @@
 # AI_UI_RULES — обязательные правила GPUI-UI (кит gpui-kit)
 
 > Этот файл скармливается ИИ-агенту в начале любой задачи на GPUI-интерфейс.
-> Кит: `D:\Projects\my-tauri-plugins\gpui-kit` (Cargo-пакет `my-gpui-kit`).
+> Кит: `D:\Projects\cross-app-plugins\gpui-kit` (Cargo-пакет `my-gpui-kit`).
 
 ## 0. Перед работой
 

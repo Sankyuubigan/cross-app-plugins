@@ -41,7 +41,7 @@ import '@my-tauri-plugins/plugin-speech'
 
 ```toml
 # Cargo.toml
-tauri-plugin-speech = { path = "../../my-tauri-plugins/tauri-plugin-speech" }
+tauri-plugin-speech = { path = "../../cross-app-plugins/tauri-plugin-speech" }
 ```
 
 ```rust
@@ -55,7 +55,7 @@ tauri-plugin-speech = { path = "../../my-tauri-plugins/tauri-plugin-speech" }
 
 ```jsonc
 // package.json
-"@my-tauri-plugins/plugin-speech": "file:../my-tauri-plugins/tauri-plugin-speech"
+"@my-tauri-plugins/plugin-speech": "file:../cross-app-plugins/tauri-plugin-speech"
 ```
 
 ```ts

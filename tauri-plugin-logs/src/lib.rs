@@ -5,7 +5,7 @@
 //!
 //! `Cargo.toml`:
 //! ```toml
-//! tauri-plugin-logs = { path = "../../my-tauri-plugins/tauri-plugin-logs" }
+//! tauri-plugin-logs = { path = "../../cross-app-plugins/tauri-plugin-logs" }
 //! ```
 //!
 //! `main.rs`:

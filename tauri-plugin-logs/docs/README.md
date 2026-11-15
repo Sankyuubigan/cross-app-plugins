@@ -38,7 +38,7 @@ node cli.cjs init --with-logs --project <корень-проекта>
 (вкладывает `LOGS_SETUP.md` в корень проекта). Полный список шагов:
 
 1. `src-tauri/Cargo.toml`:
-   `tauri-plugin-logs = { path = "../../my-tauri-plugins/tauri-plugin-logs" }`, `log = "0.4"`.
+   `tauri-plugin-logs = { path = "../../cross-app-plugins/tauri-plugin-logs" }`, `log = "0.4"`.
 2. `src-tauri/tauri.conf.json` → корневой блок `plugins.logs` (схема конфига v2):
    ```json
    "plugins": {
@@ -63,7 +63,7 @@ node cli.cjs init --with-logs --project <корень-проекта>
    ```
 5. Фронтенд:
    ```json
-   "dependencies": { "@my-tauri-plugins/plugin-logs": "file:../my-tauri-plugins/tauri-plugin-logs" }
+   "dependencies": { "@my-tauri-plugins/plugin-logs": "file:../cross-app-plugins/tauri-plugin-logs" }
    ```
    ```ts
    import "@my-tauri-plugins/plugin-logs"; // side-effect: ловит ошибки UI

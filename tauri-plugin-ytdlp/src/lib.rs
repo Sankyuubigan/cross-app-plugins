@@ -7,7 +7,7 @@
 //!
 //! `Cargo.toml`:
 //! ```toml
-//! tauri-plugin-ytdlp = { path = "../../my-tauri-plugins/tauri-plugin-ytdlp" }
+//! tauri-plugin-ytdlp = { path = "../../cross-app-plugins/tauri-plugin-ytdlp" }
 //! ```
 //!
 //! `main.rs`:

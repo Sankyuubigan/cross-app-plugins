@@ -4,7 +4,7 @@ CLI-набор инструментов для ИИ-агентов кодеро�
 (с согласия пользователя) из своей оболочки — например через `bash`.
 
 Это **не Tauri-плагин**: нет `links`, `build.rs`, permissions и npm-пакета. Крейт —
-обычный workspace-member `my-tauri-plugins` с бинарником `agent-tools`. Единственный
+обычный workspace-member `cross-app-plugins` с бинарником `agent-tools`. Единственный
 общий с остальным репозиторием примитив — `json-store` (атомарные записи JSON).
 
 | Инструмент | Назначение |
@@ -334,11 +334,11 @@ src-tauri/mcp_servers/web_http.ts:
 
 ### Как положить бинарь туда, где его зовут агенты
 
-Постоянный путь — **`D:\Projects\my-tauri-plugins\bin\agent-tools.exe`**. Он
+Постоянный путь — **`D:\Projects\cross-app-plugins\bin\agent-tools.exe`**. Он
 принадлежит репозиторию инструмента, а не одному приложению, потому что пользоваться им
 должны агенты в **любом** проекте, а не только внутри одного приложения.
 
-Обновляется одной командой из корня `my-tauri-plugins`:
+Обновляется одной командой из корня `cross-app-plugins`:
 
 ```bat
 scripts\build_binaries.cmd
@@ -356,7 +356,7 @@ scripts\build_binaries.cmd
 Команда, которую даётся агенту (работает из корня любого проекта):
 
 ```bash
-D:\Projects\my-tauri-plugins\bin\agent-tools.exe codemap map --path . --tokens 2048
+D:\Projects\cross-app-plugins\bin\agent-tools.exe codemap map --path . --tokens 2048
 ```
 
 > В MCP-режиме (`codemap mcp --path .`) корень проекта фиксируется флагом `--path`

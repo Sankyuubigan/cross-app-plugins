@@ -23,7 +23,7 @@
 
 ## Подключение к проекту (механизм интеграции)
 
-1. **Положи toolkit** в предсказуемое место рядом с проектами, напр. `..\my-tauri-plugins\tauri-build-toolkit` (или задай env `TAURI_BUILD_TOOLKIT` на `cli.cjs`). Сам пакет развёрнут как каталог; при работе он **не пишет** в свою папку.
+1. **Положи toolkit** в предсказуемое место рядом с проектами, напр. `..\cross-app-plugins\tauri-build-toolkit` (или задай env `TAURI_BUILD_TOOLKIT` на `cli.cjs`). Сам пакет развёрнут как каталог; при работе он **не пишет** в свою папку.
 2. **Раскидай `.bat`-обёртки** (одним из способов):
    ```powershell
    node <toolkit>\cli.cjs init --project "D:\Projects\<my_app>"

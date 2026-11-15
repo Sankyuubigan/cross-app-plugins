@@ -1,7 +1,7 @@
 //! my-gpui-kit — общий GPUI UI-кит владельца: SSOT темы/каркаса/панелей для
 //! всех GPUI-проектов (PRP 261115_my_gpui_kit.md).
 //!
-//! Кит называется **gpui-kit** (папка `my-tauri-plugins/gpui-kit`; рядом с крейтом
+//! Кит называется **gpui-kit** (папка `cross-app-plugins/gpui-kit`; рядом с крейтом
 //! лежат правила `AI_UI_RULES.md` и доки `from_Tauri_to_GPUI.md`). Cargo-пакет
 //! вынужденно `my-gpui-kit`: имя `gpui-kit` на crates.io занято крейтом longbridge,
 //! от которого кит зависит — одноимённый пакет Cargo не разрешает.

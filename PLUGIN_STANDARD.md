@@ -1,8 +1,8 @@
-# Переиспользуемые модули как Tauri-плагины (репозиторий `my-tauri-plugins`)
+# Переиспользуемые модули как Tauri-плагины (репозиторий `cross-app-plugins`)
 
 > **Назначение доки:** подробный, воспроизводимый инженерный референс по тому, как выносить
 > переиспользуемый модуль (бизнес-логику **и** GUI) из Tauri-приложения в отдельный репозиторий
-> `my-tauri-plugins` в виде **Tauri-плагина** (Rust-крейт + npm-пакет + Web Component). Написано
+> `cross-app-plugins` в виде **Tauri-плагина** (Rust-крейт + npm-пакет + Web Component). Написано
 > так, чтобы по этой доке архитектуру можно было **один-в-один повторить в любом другом
 > Rust/Tauri-проекте**.
 >
@@ -20,7 +20,7 @@
 ## 0. Архитектурная сводка
 
 ```
-my-tauri-plugins/                      ← отдельный git-репозиторий (НЕ внутри хост-проекта)
+cross-app-plugins/                      ← отдельный git-репозиторий (НЕ внутри хост-проекта)
 ├─ Cargo.toml                          ← workspace: members + [workspace.dependencies]
 ├─ PLUGIN_STANDARD.md                  ← эта дока (SSOT инженерного стандарта)
 └─ tauri-plugin-logs/                  ← один плагин = крейт + npm-пакет + iife-глобал
@@ -39,7 +39,7 @@ my-tauri-plugins/                      ← отдельный git-репозит
 
 repos-control/                         ← ХОСТ (vanilla, без npm/бандлера)
 ├─ src-tauri/
-│  ├─ Cargo.toml                       ← path = "../../my-tauri-plugins/tauri-plugin-logs"
+│  ├─ Cargo.toml                       ← path = "../../cross-app-plugins/tauri-plugin-logs"
 │  ├─ main.rs                          ← .plugin(tauri_plugin_logs::init())
 │  ├─ tauri.conf.json                  ← "plugins": { "logs": {...} }, "withGlobalTauri": true
 │  └─ capabilities/default.json        ← "logs:default"
@@ -56,12 +56,12 @@ repos-control/                         ← ХОСТ (vanilla, без npm/бан�
 
 ---
 
-## 1. Репозиторий `my-tauri-plugins`
+## 1. Репозиторий `cross-app-plugins`
 
 Это **отдельный** git-репозиторий (sibling хост-проектов), а не сабмодуль и не папка внутри проекта.
 Каждый плагин — отдельный workspace-member.
 
-`my-tauri-plugins/Cargo.toml` (workspace с общими зависимостями):
+`cross-app-plugins/Cargo.toml` (workspace с общими зависимостями):
 ```toml
 [workspace]
 resolver = "2"
@@ -84,7 +84,7 @@ cargo не должен требовать node при сборке хоста.
 
 ## 2. Записи в `app_data_dir` / `sessions` — только через `json-store`
 
-**Общий крейт `json-store`** (`my-tauri-plugins/json-store`) — обычная библиотека, **НЕ** Tauri-плагин (без `links`/`build.rs`/permissions). Единый механизм атомарных записей JSON для хоста и всех плагинов, чтобы протокол записи не дублировался:
+**Общий крейт `json-store`** (`cross-app-plugins/json-store`) — обычная библиотека, **НЕ** Tauri-плагин (без `links`/`build.rs`/permissions). Единый механизм атомарных записей JSON для хоста и всех плагинов, чтобы протокол записи не дублировался:
 
 ```toml
 [dependencies]
@@ -354,7 +354,7 @@ permissions = [ "allow-get-last-logs-path", /* ... */ ]
 
 ```toml
 [dependencies]
-tauri-plugin-logs = { path = "../../my-tauri-plugins/tauri-plugin-logs" }
+tauri-plugin-logs = { path = "../../cross-app-plugins/tauri-plugin-logs" }
 ```
 Плюс зависимости `package.json`/npm НЕ нужны — они только для bundler-хостов (см. §7.5).
 
@@ -386,7 +386,7 @@ tauri-plugin-logs = { path = "../../my-tauri-plugins/tauri-plugin-logs" }
 ### 7.5 Фронтенд — ДВА канала (выбери один для своего хоста)
 
 **A. Хост с npm/бандлером** — npm-канал: `package.json` хоста
-`"@my-tauri-plugins/plugin-logs": "file:../my-tauri-plugins/tauri-plugin-logs"`, затем
+`"@my-tauri-plugins/plugin-logs": "file:../cross-app-plugins/tauri-plugin-logs"`, затем
 `import "@my-tauri-plugins/plugin-logs";` (side-effect → регистрация WC). Официальный путь для
 bundler-проектов.
 
@@ -411,7 +411,7 @@ JS плагина вшит в бинарник Тauri и вставлен до �
 
 ## 9. Чек-лист создания/переноса плагина
 
-1. Создать папку `tauri-plugin-<name>/` как member workspace `my-tauri-plugins`.
+1. Создать папку `tauri-plugin-<name>/` как member workspace `cross-app-plugins`.
 2. `Cargo.toml`: `links` + `[build-dependencies] tauri-plugin`.
 3. `build.rs`: `COMMANDS` + `.global_api_script_path("./api-iife.js")` + `.build()`.
 4. `lib.rs`: `Config`, `PluginState`, `init<R: Runtime>()`, `generate_handler!`.
@@ -437,7 +437,7 @@ JS плагина вшит в бинарник Тauri и вставлен до �
 - **«permission not found»** → нет `links`/`build.rs` ИЛИ команда не во всех трёх местах.
 - **`E0277: AppHandle: CommandArg`** → команда не `<R: Runtime>`-дженерик.
 - **`config().version` — `Option<String>`** → `app.package_info().version`.
-- **Неверный путь зависимости** → от `src-tauri/` пиши `../../my-tauri-plugins/...`, не `../`.
+- **Неверный путь зависимости** → от `src-tauri/` пиши `../../cross-app-plugins/...`, не `../`.
 - **WC «белый в тёмной теме»** → захардкожены светлые цвета; только `var(--token)`.
 - **Динамические `import('@tauri-apps/...')` ломают esbuild-IIFE** → замени на глобал
   `window.__TAURI__.<plugin>` с фолбэком.
@@ -452,7 +452,7 @@ JS плагина вшит в бинарник Тauri и вставлен до �
 
 ## 11. Кодировка файлов исходного кода (КРИТИЧНО)
 
-**Все файлы `.rs`, `.ts`, `.json`, `.toml`, `.md` в репозитории `my-tauri-plugins` ОБЯЗАНЫ храниться в UTF-8 без BOM.**
+**Все файлы `.rs`, `.ts`, `.json`, `.toml`, `.md` в репозитории `cross-app-plugins` ОБЯЗАНЫ храниться в UTF-8 без BOM.**
 
 ### Почему это критично
 - Rust-компилятор (`rustc`) требует UTF-8. Если файл содержит русский текст в CP1251 с UTF-8 BOM, `rustc` не выдаёт ошибку, а компилирует кракозябры прямо в бинарник.

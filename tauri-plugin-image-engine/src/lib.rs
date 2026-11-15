@@ -15,7 +15,7 @@
 //!
 //! `Cargo.toml`:
 //! ```toml
-//! tauri-plugin-image-engine = { path = "../../my-tauri-plugins/tauri-plugin-image-engine" }
+//! tauri-plugin-image-engine = { path = "../../cross-app-plugins/tauri-plugin-image-engine" }
 //! ```
 //!
 //! `main.rs`:

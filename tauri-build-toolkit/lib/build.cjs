@@ -37,7 +37,7 @@ function runNpmInstall(cfg) {
 }
 
 // Автосборка локальных file: плагинов перед сборкой хоста.
-// Плагины подключены через "file:../my-tauri-plugins/..." — npm копирует их
+// Плагины подключены через "file:../cross-app-plugins/..." — npm копирует их
 // в node_modules при install, но НЕ компилирует guest-js → dist-js.
 // Без этого шага хост подтягивает старый скомпилированный dist-js.
 function buildLocalPlugins(cfg) {

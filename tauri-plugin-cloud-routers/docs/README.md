@@ -96,7 +96,7 @@
 `src-tauri/Cargo.toml`:
 
 ```toml
-tauri-plugin-cloud-routers = { path = "../../my-tauri-plugins/tauri-plugin-cloud-routers" }
+tauri-plugin-cloud-routers = { path = "../../cross-app-plugins/tauri-plugin-cloud-routers" }
 ```
 
 `main.rs`:
