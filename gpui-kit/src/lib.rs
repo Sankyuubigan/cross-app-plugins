@@ -24,6 +24,10 @@ pub mod theme;
 // перетаскивании): без VIBEBRIDGE_DRAG_PROBE=1 в окружении не делает ничего.
 pub mod drag_probe;
 
+// Фикс фриза при перетаскивании (F2, по цифрам замера): timeBeginPeriod(1)
+// на время модального move/size-цикла — всегда активен, без env-гейта.
+pub mod drag_fix;
+
 #[cfg(feature = "log-collector")]
 pub mod logs_panel;
 #[cfg(feature = "llama")]
