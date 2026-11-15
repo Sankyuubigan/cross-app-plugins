@@ -1,7 +1,6 @@
-//! Tauri-команды плагина (тонкий слой → engine::api).
+//! Tauri-команды плагина (тонкий слой → downloader-core).
 
-use crate::engine::api::{download, download_bytes_to_vec, DownloadOptions};
-use crate::engine::progress;
+use downloader_core::{download, download_bytes_to_vec, DownloadOptions};
 use tauri::AppHandle;
 
 /// Скачать файл в dest. Ожидает завершения; прогресс — событие `downloader:progress`.
@@ -30,11 +29,11 @@ pub async fn download_bytes(
 /// Отменить активную загрузку по task_id. Возвращает true, если задача найдена.
 #[tauri::command]
 pub fn cancel_download(task_id: String) -> bool {
-    progress::cancel(&task_id)
+    downloader_core::cancel(&task_id)
 }
 
 /// Список активных загрузок.
 #[tauri::command]
 pub fn list_active() -> Vec<serde_json::Value> {
-    progress::list_active()
+    downloader_core::list_active()
 }

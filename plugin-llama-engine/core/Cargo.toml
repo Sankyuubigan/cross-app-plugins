@@ -23,6 +23,11 @@ minijinja = { workspace = true }
 # Атомарные записи JSON (app_config.json): tmp->rename + sidecar lock.
 json-store = { path = "../../json-store" }
 
+# Единый движок скачивания (ССОТ, Шаг 4a PRP 261115_universal_plugins):
+# multi-chunk reqwest + фоллбэки curl/process, stall/resume, зеркала HF —
+# один код на все плагины; llama-шейп DownloadProgress уходит (тип из downloader-core).
+downloader-core = { path = "../../plugin-downloader/core" }
+
 [lib]
 name = "llama_engine_core"
 path = "src/lib.rs"

@@ -9,8 +9,8 @@
 //! Точки инъекции хоста (см. crate::lib):
 //! - `downloader::set_progress_hook` — прогресс скачивания (плагин эмитит
 //!   `download_progress`, GPUI-хосты рисуют свой бар);
-//! - `downloader::set_fallback_downloader` — фоллбэк-скачивание (плагин
-//!   адаптирует единый движок `plugin_downloader`);
+//! - скачивание — через единый движок downloader-core (деп ядра, Шаг 4a
+//!   PRP 261115): хосту фоллбэк-мост больше не нужен;
 //! - `vram::subscribe` — VRAM-уведомления (плагин эмитит `vram_notice`);
 //! - `analytics::set_track_hook` — аналитика (плагин при feature `host-logs`
 //!   мостит в `plugin_log_collector::track_event`).

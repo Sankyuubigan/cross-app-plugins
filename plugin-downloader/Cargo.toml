@@ -3,7 +3,7 @@ name = "plugin-downloader"
 version = "0.1.0"
 edition = "2021"
 links = "tauri-plugin-downloader"
-description = "Unified file download engine (reqwest multi-chunk + curl + process fallbacks) with progress/speed/ETA events and web-component progress UI"
+description = "Unified file download engine (reqwest multi-chunk + curl + process fallbacks) with progress/speed/ETA events and web-component progress UI — thin Tauri facade over downloader-core"
 license = "MIT"
 
 [dependencies]
@@ -12,9 +12,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 log = { workspace = true }
 tokio = { workspace = true }
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls-native-roots"] }
-futures-util = "0.3"
-curl = "0.4"
+# Ядро движка (без Tauri) — ССОТ скачивания, его берут и GPUI-хосты.
+downloader-core = { path = "core" }
 
 [lib]
 name = "plugin_downloader"

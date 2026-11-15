@@ -1,13 +1,9 @@
-//! 📦 plugin-downloader — единый источник правды скачивания файлов.
+//! 📦 plugin-downloader — тонкий Tauri-фасад над `downloader-core` (ядро без Tauri).
 //!
-//! Многоуровневый движок с прогрессом (скорость/ETA), stall-детектом,
-//! resume и отменой. Уровни (следующий — если предыдущий не сработал):
-//!   1. reqwest (multi-chunk при Range, stall 30s, ретраи, resume)
-//!   2. curl (libcurl crate: low-speed abort, resume, прогресс)
-//!   3. PowerShell Invoke-WebRequest (скрытое окно, таймаут, поллинг размера)
-//!   4. bitsadmin (WinINet, скрытое окно, таймаут, поллинг)
-//!   5. MCP/Deno downloader.ts (скрытое окно, таймаут, поллинг)
-//!   6. Chrome CDP (скрытое окно, таймаут, поллинг)
+//! Вся логика (6 уровней, stall/resume, редиректы GitHub→S3, ETA) живёт в
+//! `downloader-core` (`core/`). Здесь: регистрация плагина, команды, мост
+//! эмита события `downloader:progress` (прежний формат payload-а) и отмена
+//! всех загрузок при выходе хоста.
 //!
 //! ## Подключение в хосте
 //!
@@ -19,18 +15,25 @@
 //! `main.rs`: `.plugin(plugin_downloader::init())`
 //! `capabilities/default.json`: `"downloader:default"`
 //!
-//! ## Rust API (для других крейтов/плагинов)
+//! ## Rust API (для других крейтов/плагинов) — прежний корневой путь
 //! ```ignore
-//! plugin_downloader::download(app, url, dest, opts).await?;
-//! plugin_downloader::download_blocking(url, dest, opts)?;
+//! plugin_downloader::download(url, dest, opts, None).await?;
+//! plugin_downloader::download_blocking(url, dest, opts, Some(&log_cb))?;
 //! ```
 
 pub mod commands;
-pub mod engine;
 
 use serde::Deserialize;
+use std::sync::Arc;
 use tauri::plugin::{Builder, TauriPlugin};
 use tauri::Wry;
+
+/// Корневой реэкспорт ядра: прежние пути вызовов хостов не меняются.
+pub use downloader_core::{
+    cancel, cancel_all, download, download_blocking, download_bytes_blocking,
+    download_bytes_to_vec, list_active, set_progress_hook, DownloadOptions, DownloadProgress,
+    ProgressPayload, PROGRESS_EVENT,
+};
 
 /// Конфиг плагина (`plugins.downloader` в `tauri.conf.json` хоста).
 ///
@@ -56,12 +59,19 @@ impl<'de> Deserialize<'de> for Config {
 pub fn init() -> TauriPlugin<Wry, Config> {
     Builder::<Wry, Config>::new("downloader")
         .setup(|app, _api| {
-            engine::progress::set_app(app.clone());
+            // Мост эмита: ядро зовёт хук → фасад эмитит прежнее событие
+            // `downloader:progress` (payload — прежний формат ProgressPayload).
+            let handle = app.clone();
+            let hook: downloader_core::EmitHook = Arc::new(move |payload: &ProgressPayload| {
+                use tauri::Emitter;
+                let _ = handle.emit(PROGRESS_EVENT, payload.clone());
+            });
+            downloader_core::set_emit_hook(Some(hook));
             Ok(())
         })
         .on_event(|_app, event| {
             if let tauri::RunEvent::ExitRequested { .. } = event {
-                engine::progress::cancel_all();
+                downloader_core::cancel_all();
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -72,10 +82,6 @@ pub fn init() -> TauriPlugin<Wry, Config> {
         ])
         .build()
 }
-
-pub use engine::api::{
-    download, download_blocking, download_bytes_blocking, download_bytes_to_vec, DownloadOptions,
-};
 
 #[cfg(test)]
 mod tests {

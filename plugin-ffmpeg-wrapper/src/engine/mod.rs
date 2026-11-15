@@ -1,16 +1,11 @@
-//! Engine-модуль плагина: установка (installer), запуск subprocess (runner),
-//! метаданные через ffprobe (probe). Публичный API для нативных тулов хоста —
-//! функции принимают каталоги параметрами, без продуктовых имён.
+//! Тонкий re-export ядра `ffmpeg-core` (ССОТ, Шаг 4c PRP 261115): вся логика
+//! установки/запуска/probe/pipe живёт в `core/` (крейт ffmpeg-core, без tauri).
+//! Путь `plugin_ffmpeg_wrapper::engine::*` сохранён для хостов
+//! (King Orch infra/tools/ffmpeg.rs: `use plugin_ffmpeg_wrapper::engine;`).
 
-pub mod installer;
-pub mod pipe;
-pub mod probe;
-pub mod runner;
+pub use ffmpeg_core::{installer, pipe, probe, runner};
 
-pub use installer::{
+pub use ffmpeg_core::{
     ensure_ffmpeg, ffmpeg_dir, ffmpeg_exe, ffprobe_exe, is_installed, tool_version,
-    FFMPEG_DIR_NAME,
+    DEFAULT_RUN_TIMEOUT, FFMPEG_DIR_NAME, FfmpegPipe, RunOutput, probe_json, run_tool,
 };
-pub use pipe::FfmpegPipe;
-pub use probe::probe_json;
-pub use runner::{run_tool, RunOutput, DEFAULT_RUN_TIMEOUT};

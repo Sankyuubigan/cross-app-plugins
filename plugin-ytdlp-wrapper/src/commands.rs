@@ -7,22 +7,9 @@ use tauri::{AppHandle, Emitter, Manager};
 
 use crate::engine::{self, downloader, ytdlp_manager};
 
-#[derive(Serialize, Clone)]
-pub struct YtdlpStatus {
-    pub installed: bool,
-    pub version: Option<String>,
-    pub exe_path: String,
-    pub dir: String,
-    pub ffmpeg_installed: bool,
-    pub ffmpeg_path: Option<String>,
-    pub deno_installed: bool,
-    pub deno_path: Option<String>,
-    pub proxy: Option<String>,
-    /// Сохранённый источник кукисов (для префилла панели).
-    pub cookie_browser: Option<String>,
-    pub cookie_profile_dir: Option<String>,
-    pub message: String,
-}
+// YtdlpStatus переехал в ядро (Шаг 4d): обратная зависимость engine→commands
+// удалена; здесь ре-экспорт — путь `commands::YtdlpStatus` для фронтов тот же.
+pub use crate::engine::YtdlpStatus;
 
 fn ytdlp_dir(app: &AppHandle) -> PathBuf {
     let cfg = engine::load_config(app);

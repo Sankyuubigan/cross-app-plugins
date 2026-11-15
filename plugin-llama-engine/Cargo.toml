@@ -26,9 +26,6 @@ minijinja = { workspace = true }
 # Опциональная связка с plugin-log-collector (единая телеметрия King Orch). Хост
 # включает feature `host-logs`, если рядом стоит плагин логов.
 plugin-log-collector = { path = "../plugin-log-collector", optional = true }
-# Единый движок скачивания (SSOT): multi-chunk reqwest + curl + process-фоллбэки,
-# stall/resume/прогресс `downloader:progress`. Заменяет старый download_fallback.
-plugin-downloader = { path = "../plugin-downloader" }
 
 # Атомарные записи JSON (app_config.json): tmp->rename + sidecar lock.
 json-store = { path = "../json-store" }

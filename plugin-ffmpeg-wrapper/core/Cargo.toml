@@ -1,0 +1,15 @@
+[package]
+name = "ffmpeg-core"
+version = "0.1.0"
+edition = "2021"
+description = "Pure domain core of plugin-ffmpeg-wrapper: auto-download official FFmpeg build, run ffmpeg/ffprobe as subprocess (no shell, CREATE_NO_WINDOW), ffprobe metadata, stdin-pipe runner. No Tauri, no AppHandle - so a GPUI/native host can depend on it without dragging Tauri into the binary."
+license = "MIT"
+
+[dependencies]
+log = { workspace = true }
+serde_json = { workspace = true }
+zip = { workspace = true }
+# Скачивание архива — единое ЯДРО репозитория (chain фолбэков, magic/min_size-гейты).
+# Именно core, а не tauri-фасад plugin-downloader: ядро ffmpeg должно тянуть
+# ноль tauri (cargo tree хоста — правило PLUGIN_STANDARD).
+downloader-core = { path = "../../plugin-downloader/core" }

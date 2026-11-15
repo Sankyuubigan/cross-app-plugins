@@ -1,0 +1,54 @@
+[package]
+name = "speech-core"
+version = "0.1.0"
+edition = "2021"
+description = "Pure core of the CrispASR speech plugin (TTS/STT/dialog engines, audio, downloads) — no tauri"
+license = "MIT"
+
+[features]
+# opus-декод голосов (.opus): тянет audiopus_sys → cmake. Включать только хостам,
+# которым нужен формат (по умолчанию ВЫКЛ — сборка без C-компилятора).
+audiopus = ["dep:opus"]
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+zip = { workspace = true }
+
+# Проверка SHA256SUMS релиза speech.cpp (движок диалога)
+sha2 = { workspace = true }
+
+# Скачивание файлов — ЕДИНЫЙ движок проекта (core §2.1 SSOT, Шаг 4e PRP 261115):
+# stall-детект, таймауты, 6 уровней фолбэка (reqwest → curl → PowerShell →
+# bitsadmin → MCP → Chrome) + логи. plugin-downloader (tauri-фасад) ядру запрещён.
+downloader-core = { path = "../../plugin-downloader/core" }
+
+# Аудио: декод ogg/vorbis/wav/flac/mp3/opus, шумоподавление RNNoise, ресемплинг
+symphonia = { workspace = true }
+hound = { workspace = true }
+# opus-декод голосов (audiopus_sys → cmake, C-компилятор) — СТРОГО за фичей
+# `audiopus` (Шаг 4e PRP 261115): без фичи ядро собирается чисто без C.
+opus = { workspace = true, optional = true }
+ogg = { workspace = true }
+nnnoiseless = { workspace = true }
+rubato = { workspace = true }
+audioadapter-buffers = { workspace = true }
+
+# STT WebSocket клиент + инжекция текста
+tungstenite = { workspace = true }
+arboard = { workspace = true }
+windows = { workspace = true }
+
+# Логи: через log! макросы в единый кастомный log::Log логгер хоста (core rules §2.5)
+log = { workspace = true }
+
+# Сохранение озвучки в MP3 (tts_save_mp3). Pure Rust, ноль зависимостей,
+# без build.rs — сборка хоста не компилирует C++.
+rusty_mp3 = { workspace = true }
+
+[lib]
+name = "speech_core"
+path = "src/lib.rs"

@@ -31,8 +31,12 @@
 //! `capabilities/default.json`: добавить `"image-engine:default"`.
 
 pub mod commands;
-pub mod engine;
-pub mod pool;
+
+// Ядро (ССОТ, Шаг 4f PRP 261115): вся логика — в крейте `media-gen-core`
+// (без tauri). Реэкспорт модулей сохраняет прежние пути
+// `plugin_media_gen_engine::engine::*` / `::pool::*` для хостов.
+pub use media_gen_core::engine;
+pub use media_gen_core::pool;
 
 use tauri::plugin::{Builder, TauriPlugin};
 use tauri::{RunEvent, Wry};

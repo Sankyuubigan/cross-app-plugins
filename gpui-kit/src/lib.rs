@@ -26,6 +26,8 @@ pub mod logs_panel;
 pub mod llama_settings;
 #[cfg(feature = "webview")]
 pub mod webview_host;
+#[cfg(feature = "about-updates")]
+pub mod about_updates_card;
 
 #[cfg(feature = "log-collector")]
 pub use logs_panel::LogsPanel;
@@ -33,6 +35,11 @@ pub use logs_panel::LogsPanel;
 pub use llama_settings::{LlamaModelItem, LlamaSettingsCard};
 #[cfg(feature = "webview")]
 pub use webview_host::LegacyWebViewHost;
+#[cfg(feature = "about-updates")]
+pub use about_updates_card::{
+    progress_line, watch_updates, AboutUpdatesCard, AboutUpdatesConfig, UpdatePhase,
+    UpdatesSnapshot,
+};
 
 pub use card::AppCard;
 pub use gpui_kit::component::theme::ThemeMode;

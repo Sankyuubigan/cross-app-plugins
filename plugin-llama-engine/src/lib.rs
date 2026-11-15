@@ -135,17 +135,31 @@ pub fn init() -> TauriPlugin<Wry, Config> {
 
 /// Мосты ядра `llama-engine-core` в Tauri-хост (вызывается из setup плагина):
 /// - прогресс скачивания → событие `download_progress` (тот же payload, что раньше);
-/// - VRAM-уведомления → событие `vram_notice`;
-/// - фоллбэк-скачивание → единый движок `plugin_downloader` (зеркала HF).
+/// - VRAM-уведомления → событие `vram_notice`.
+///
+/// Фоллбэк-мост удалён (Шаг 4a PRP 261115_universal_plugins): единый движок
+/// скачивания теперь ВНУТРИ llama-engine-core (деп downloader-core) — цепочка
+/// reqwest → curl → process, stall/resume/зеркала HF живут в downloader-core,
+/// адаптер хоста больше не нужен.
 fn install_host_bridges(app: &tauri::AppHandle) {
     use std::sync::Arc;
 
-    // Прогресс скачивания (ядро зовёт колбэк из потоков скачивания).
+    // Прогресс скачивания: единый глобальный хук downloader-core (ядро зовёт его
+    // из потоков скачивания) → событие `download_progress`. Слоты set_emit_hook
+    // (событие downloader:progress плагина downloader) и set_progress_hook (этот)
+    // — РАЗНЫЕ слоты, конфликтов нет. Конвертер типов downloader_core::
+    // DownloadProgress → llama-шейп {downloaded, total, speed_bps} (форма payload'а
+    // для KO-фронта, chat.ts:815).
     let handle = app.clone();
     engine::downloader::set_progress_hook(Some(Arc::new(
         move |p: &engine::downloader::DownloadProgress| {
             use tauri::Emitter;
-            let _ = handle.emit("download_progress", p);
+            let payload = serde_json::json!({
+                "downloaded": p.downloaded_bytes,
+                "total": p.total_bytes.unwrap_or(0),
+                "speed_bps": p.speed_bps,
+            });
+            let _ = handle.emit("download_progress", payload);
         },
     )));
 
@@ -155,34 +169,6 @@ fn install_host_bridges(app: &tauri::AppHandle) {
         use tauri::Emitter;
         let _ = handle.emit("vram_notice", notice.note.clone());
     }));
-
-    // Фоллбэк-скачивание: адаптер в единый движок plugin-downloader
-    // (stall/resume/зеркала HF остались в плагине downloader, как и было).
-    // Future заимствует on_log на время скачивания (HRTB-контракт ядра).
-    // Именованная fn вместо замыкания: fn item честно полиморфна по 'a,
-    // а замыкание с let-аннотацией компилятор не выводит как for<'a>.
-    engine::downloader::set_fallback_downloader(Some(Arc::new(
-        tauri_fallback_download,
-    ) as engine::downloader::FallbackHandler));
-}
-
-/// Адаптер фоллбэк-скачивания ядра в `plugin_downloader::download`.
-/// HRTB: future заимствует `on_log` ровно на время скачивания.
-fn tauri_fallback_download<'a>(
-    req: engine::downloader::FallbackRequest,
-    on_log: &'a (dyn Fn(String) + Send + Sync),
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
-    Box::pin(async move {
-        let opts = plugin_downloader::DownloadOptions {
-            label: req.label,
-            kind: req.kind,
-            magic: req.magic,
-            min_size: req.min_size,
-            expected_size: req.expected_size,
-            ..Default::default()
-        };
-        plugin_downloader::download(&req.url, &req.dest, opts, Some(on_log)).await
-    })
 }
 
 /// Хелпер для хоста (setup): папка движка `<exe>/llamacpp` (или из конфига).

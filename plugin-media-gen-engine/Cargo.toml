@@ -12,41 +12,18 @@ tauri = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 log = { workspace = true }
-tokio = { workspace = true }
-# Движок (внешний процесс sd-server) + каталог бандлов. reqwest — как в хосте
-# King Orch (default-features=false + rustls, чтобы не конфликтовать
-# с native-tls воркспейса).
-reqwest = { version = "0.12", features = ["json", "rustls-tls-native-roots", "stream", "blocking"], default-features = false }
-zip = { workspace = true }
-sysinfo = "0.30.0"
+# Системные метрики команд (GPU-имя, свободное место) — тонкие фасадные хелперы.
 nvml-wrapper = "0.10.0"
-sha2 = "0.10"
-futures-util = "0.3"
-base64 = "0.22"
-# Бенч (Шаг 6/7 PRP): pHash-индикация различий между наборами картинок.
-# jpeg/webp нужны refmod-карточкам (SSOT engine/refmod.rs): фото юзера — любые
-# форматы (save нормирует в PNG), миниатюра плашки — JPEG-энкод.
-image_hasher = "3.1"
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+sysinfo = "0.30.0"
+tokio = { workspace = true }
+# Скачивание бандлов/LoRA — ядро downloader-core (как в ядре media-gen-core);
+# plugin-downloader (tauri-фасад) сюда больше не тянется.
+downloader-core = { path = "../plugin-downloader/core" }
 
-# Голос RefMod-карточек (Этап 3, tasks/261104_0230-db2cb59c): декод аудио-вложений
-# юзера (mp3/m4a/ogg-vorbis/flac/wav) → PCM16 WAV для ref_audios движка (H3
-# voice cloning). Pure Rust, без DLL. opus/webm-аудио НЕ декодируется — в
-# symphonia 0.5 opus-кодека нет (проверено crates.io 05.11.26), такие файлы
-# честно отклоняются с подсказкой «нужен mp3/wav».
-symphonia = { version = "0.5", default-features = false, features = ["mp3", "aac", "isomp4", "ogg", "vorbis", "wav", "pcm", "flac", "mkv"] }
-
-# Единый движок скачивания (SSOT): multi-chunk reqwest + curl + process-фоллбэки,
-# stall/resume/прогресс `downloader:progress`.
-plugin-downloader = { path = "../plugin-downloader" }
-
-# Атомарные записи JSON (app_config.json): tmp->rename + sidecar lock.
-json-store = { path = "../json-store" }
-
-[dev-dependencies]
-# Бенч: серверные строки sd-server (pipe_log → log::info!) должны попадать
-# в bench_run.log, иначе диагностика темпа невозможна.
-env_logger = "0.11"
+# Чистое ядро (ССОТ, без tauri, Шаг 4f PRP 261115): sd-server-процесс, каталог
+# бандлов, VRAM-preflight, generate/edit живут здесь; Tauri-плагин — фасад
+# (команды + события). GPUI-хосты берут ядро напрямую.
+media-gen-core = { path = "core" }
 
 [build-dependencies]
 tauri-plugin = { version = "2", features = ["build"] }

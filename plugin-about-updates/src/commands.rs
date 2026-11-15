@@ -1,103 +1,23 @@
+//! Tauri-команды плагина (тонкий слой → about-updates-core).
+
+use about_updates_core::install_report::InstallReport;
+use about_updates_core::models::ReleaseInfo;
 use tauri::{AppHandle, Manager, Runtime};
 
-use crate::install_report::{self, InstallKind, InstallReport};
-use crate::models::ReleaseInfo;
+use crate::install_report;
+use crate::installer;
+use crate::updater_rollback;
 use crate::PluginState;
 
 /// Список доступных релизов через GitHub Releases REST API.
 /// Репозиторий берётся из состояния плагина (задано в tauri.conf.json хоста).
 #[tauri::command]
-pub async fn get_release_history<R: Runtime>(app: AppHandle<R>) -> Result<Vec<ReleaseInfo>, String> {
+pub async fn get_release_history<R: Runtime>(
+    app: AppHandle<R>,
+) -> Result<Vec<ReleaseInfo>, String> {
     let repo = app.state::<PluginState>().repo.clone();
-
-    let client = reqwest::Client::builder()
-        .user_agent("plugin-about-updates")
-        .build()
-        .map_err(|e| {
-            log::error!("[about-updates] HTTP-клиент: {}", e);
-            format!("Ошибка создания HTTP-клиента: {}", e)
-        })?;
-
-    let url = format!("https://api.github.com/repos/{repo}/releases?per_page=100");
-    let resp = client
-        .get(&url)
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .await
-        .map_err(|e| {
-            log::error!("[about-updates] запрос истории релизов не удался: {}", e);
-            format!("Ошибка запроса GitHub: {}", e)
-        })?;
-
-    if !resp.status().is_success() {
-        log::error!("[about-updates] GitHub API вернул HTTP {}", resp.status());
-        return Err(format!("GitHub API error: {}", resp.status()));
-    }
-
-    let releases: serde_json::Value = resp.json().await.map_err(|e| {
-        log::error!("[about-updates] ответ GitHub API не распознан: {}", e);
-        format!("Некорректный ответ GitHub API: {}", e)
-    })?;
     let current = app.package_info().version.to_string();
-
-    let mut out: Vec<ReleaseInfo> = Vec::new();
-    let arr = releases.as_array().ok_or_else(|| {
-        log::error!("[about-updates] ответ GitHub API не массив");
-        "Некорректный ответ GitHub API".to_string()
-    })?;
-
-    for rel in arr {
-        let tag = rel
-            .get("tag_name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let version = tag.trim_start_matches('v').to_string();
-        if version.is_empty() {
-            continue;
-        }
-
-        let pub_date = rel
-            .get("published_at")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        let notes = rel
-            .get("body")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-
-        let mut download_url = String::new();
-        if let Some(assets) = rel.get("assets").and_then(|v| v.as_array()) {
-            if let Some(a) = assets.iter().find(|a| {
-                let n = a
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                n.ends_with("-setup.exe") && !n.ends_with(".sig")
-            }) {
-                download_url = a
-                    .get("browser_download_url")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-            }
-        }
-        if download_url.is_empty() {
-            log::warn!("[about-updates] у релиза {} нет ассета -setup.exe, пропускаем", version);
-            continue;
-        }
-
-        out.push(ReleaseInfo {
-            version: version.clone(),
-            pub_date,
-            notes,
-            download_url,
-            is_current: version == current,
-        });
-    }
-
-    log::info!("[about-updates] история релизов: {} шт.", out.len());
-    Ok(out)
+    about_updates_core::fetch_release_history(&repo, &current).await
 }
 
 /// Откат к конкретной версии.
@@ -119,13 +39,19 @@ pub async fn install_release<R: Runtime>(
 
     // 1. Бэкап данных перед понижением версии. Для отката это обязательно:
     //    после даунгрейда старая версия может не прочитать конфиг/сессии новее.
-    crate::updater_rollback::backup_before_rollback(&app).map_err(|e| {
+    updater_rollback::backup_before_rollback(&app).map_err(|e| {
         log::error!("[about-updates] бэкап перед откатом не удался: {}", e);
         format!("Не удалось создать бэкап перед откатом: {}", e)
     })?;
 
     // 2. Скачивание, отчёт, запуск инсталлера, выход приложения.
-    crate::installer::run_install(&app, InstallKind::Rollback, &version, &download_url).await
+    installer::run_install(
+        &app,
+        install_report::InstallKind::Rollback,
+        &version,
+        &download_url,
+    )
+    .await
 }
 
 /// Отчёт о последней установке (откат/обновление) с вердиктом.

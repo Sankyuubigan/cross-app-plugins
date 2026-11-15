@@ -1,0 +1,21 @@
+[package]
+name = "ytdlp-core"
+version = "0.1.0"
+edition = "2021"
+description = "Pure domain core of plugin-ytdlp-wrapper: install/update yt-dlp & Deno binaries (via downloader-core), config, video download subprocess with UI events via hook, YouTube VTT subtitles. No Tauri, no AppHandle - so a GPUI/native host can depend on it without dragging Tauri into the binary."
+license = "MIT"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+log = { workspace = true }
+# reqwest::blocking — только GET HLS-манифеста (10с таймаут, уточнение CDN-хоста
+# после сетевой ошибки). Скачивание бинарей — через downloader-core, не здесь.
+reqwest = { version = "0.12", features = ["json", "rustls-tls-native-roots", "stream", "blocking"], default-features = false }
+zip = { workspace = true }
+regex = "1"
+lazy_static = "1"
+json-store = { path = "../../json-store" }
+# Единый движок скачивания (ССОТ, Шаг 4d PRP 261115): установка бинарей
+# yt-dlp/Deno — chain фолбэков/stall/ретраи внутри ядра; свой reqwest-цикл удалён.
+downloader-core = { path = "../../plugin-downloader/core" }

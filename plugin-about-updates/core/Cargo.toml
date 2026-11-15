@@ -1,0 +1,29 @@
+[package]
+name = "about-updates-core"
+version = "0.1.0"
+edition = "2021"
+description = "Update check/install/report core (no Tauri): version compare, minisign verify, latest.json→GitHub fallback chain, NSIS installer, install report"
+license = "MIT"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+log = { workspace = true }
+# HTTP (GitHub API, latest.json): тот же профиль, что у downloader-core —
+# без дефолт-фич, rustls (правило хостов, native-tls не тащим).
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls-native-roots",
+] }
+# Проверка minisign-подписи установщика (эталон tauri-plugin-updater), pure Rust.
+minisign-verify = "0.3"
+# Внешний Base64-слой tauri-pubkey/.sig (упаковка Tauri v2 updater).
+base64 = "0.22"
+# Единый движок скачивания (SSOT) — установщик качается тем же движком, что и всё в проекте.
+downloader-core = { path = "../../plugin-downloader/core" }
+# Атомарные записи JSON (install_report.json) — PLUGIN_STANDARD §2.
+json-store = { path = "../../json-store" }
+
+[dev-dependencies]
+tokio = { workspace = true }

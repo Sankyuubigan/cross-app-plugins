@@ -1,12 +1,3 @@
-use serde::Serialize;
+//! Модель релиза — реэкспорт из ядра (единый тип для фасада и GPUI-хостов).
 
-/// Описание одного релиза из GitHub Releases (для истории/отката).
-#[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct ReleaseInfo {
-    pub version: String,
-    pub pub_date: Option<String>,
-    pub notes: Option<String>,
-    pub download_url: String,
-    pub is_current: bool,
-}
+pub use about_updates_core::models::ReleaseInfo;

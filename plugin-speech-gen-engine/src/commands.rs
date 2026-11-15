@@ -93,7 +93,7 @@ pub async fn tts_speak<R: Runtime>(
     if looks_path {
         if !std::path::Path::new(voice_input).exists() {
             let e = format!("файл голоса не найден: {voice_input}");
-            log::app_log(&app, &format!("ТТС ОШИБКА: {e}"));
+            log::app_log(&format!("ТТС ОШИБКА: {e}"));
             return Err(e);
         }
         clone_source = Some((
@@ -153,7 +153,7 @@ pub async fn tts_speak<R: Runtime>(
                         "для модели «{preset}» нужен транскрипт (ref-text) референса: создайте файл {src}.txt рядом с записью"
                     )
                 };
-                log::app_log(&app, &format!("ТТС ОШИБКА: {e}"));
+                log::app_log(&format!("ТТС ОШИБКА: {e}"));
                 return Err(e);
             }
             // Синхронизируем ref_text.txt, чтобы аплоад голоса (ensure_voice)
@@ -178,7 +178,7 @@ pub async fn tts_speak<R: Runtime>(
             &backend,
         )
         .map_err(|e| {
-            log::app_log(&app, &format!("ТТС ОШИБКА: {e}"));
+            log::app_log(&format!("ТТС ОШИБКА: {e}"));
             e
         })?;
         clone_ref_text = cr.ref_text;
@@ -215,13 +215,13 @@ pub async fn tts_speak<R: Runtime>(
     s.engine_backend = backend_id.clone();
     let _ = save_tts_settings(&app, &s);
 
-    log::app_log(&app, "ТТС: подготовка движка CrispASR...");
+    log::app_log("ТТС: подготовка движка CrispASR...");
     state
         .tts
-        .ensure(&app, &engine_exe_str, &backend, &s.models_dir, &preset, &startup_voice)
+        .ensure(&engine_exe_str, &backend, &s.models_dir, &preset, &startup_voice)
         .await
         .map_err(|e| {
-            log::app_log(&app, &format!("ТТС ОШИБКА: {e}"));
+            log::app_log(&format!("ТТС ОШИБКА: {e}"));
             e
         })?;
 
@@ -256,7 +256,7 @@ pub async fn tts_speak<R: Runtime>(
             .unwrap_or_default();
         let cr = clone::prepare_clone_reference(&s.models_dir, &src, &id, &backend)
             .map_err(|e| {
-                log::app_log(&app, &format!("ТТС ОШИБКА: {e}"));
+                log::app_log(&format!("ТТС ОШИБКА: {e}"));
                 e
             })?;
         if !cr.ref_text.trim().is_empty() {
@@ -264,10 +264,10 @@ pub async fn tts_speak<R: Runtime>(
         }
         let name = state
             .tts
-            .register_voice_file(&app, &cr.voice_path, &clone_ref_text, true)
+            .register_voice_file(&cr.voice_path, &clone_ref_text, true)
             .await
             .map_err(|e| {
-                log::app_log(&app, &format!("ТТС ОШИБКА: {e}"));
+                log::app_log(&format!("ТТС ОШИБКА: {e}"));
                 e
             })?;
         (name, true)
@@ -276,10 +276,10 @@ pub async fn tts_speak<R: Runtime>(
         // на сервер принудительно (?force=true).
         state
             .tts
-            .ensure_voice(&app, &s.models_dir, &body_voice, &backend)
+            .ensure_voice(&s.models_dir, &body_voice, &backend)
             .await
             .map_err(|e| {
-                log::app_log(&app, &format!("ТТС ОШИБКА: {e}"));
+                log::app_log(&format!("ТТС ОШИБКА: {e}"));
                 e
             })?
     };
@@ -296,16 +296,16 @@ pub async fn tts_speak<R: Runtime>(
     };
 
     let prep_secs = start.elapsed().as_secs_f64();
-    log::app_log(&app, &format!("ТТС: подготовка движка: {prep_secs:.2} с"));
+    log::app_log(&format!("ТТС: подготовка движка: {prep_secs:.2} с"));
 
-    log::app_log(&app, "ТТС: синтез речи...");
+    log::app_log("ТТС: синтез речи...");
     let synth_start = Instant::now();
     let (wav, timing) = state
         .tts
         .speak(&text, &server_voice, &body_instruct, &clone_ref_text, speed, clone, &language, "", None)
         .await
         .map_err(|e| {
-            log::app_log(&app, &format!("ТТС ОШИБКА: {e}"));
+            log::app_log(&format!("ТТС ОШИБКА: {e}"));
             e
         })?;
 
@@ -328,7 +328,7 @@ pub async fn tts_speak<R: Runtime>(
             audio_secs / gen_secs
         ));
     }
-    log::app_log(&app, &msg);
+    log::app_log(&msg);
     Ok(TtsSpeakResult {
         wav,
         seconds: gen_secs,
@@ -352,7 +352,7 @@ pub fn tts_capabilities<R: Runtime>(app: AppHandle<R>) -> Result<Value, String> 
 #[tauri::command]
 pub async fn tts_unload<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
     let state = app.state::<PluginState>();
-    log::app_log(&app, "ТТС: выгрузка движка (освобождение VRAM)...");
+    log::app_log("ТТС: выгрузка движка (освобождение VRAM)...");
     state.tts.stop().await;
     Ok(())
 }
@@ -378,30 +378,38 @@ pub async fn tts_download_engine<R: Runtime>(
     backend_id: String,
     dest: String,
 ) -> Result<String, String> {
-    log::app_log(&app, "ТТС: получаю список бинарей CrispASR...");
+    log::app_log("ТТС: получаю список бинарей CrispASR...");
     let backends = download::engine_backends().await.map_err(|e| {
-        log::app_log(&app, &format!("ТТС ОШИБКА: {e}"));
+        log::app_log(&format!("ТТС ОШИБКА: {e}"));
         e
     })?;
     let b = backends
         .iter()
         .find(|x| x.id == backend_id)
         .ok_or_else(|| format!("неизвестный бэкенд движка: {backend_id}"))?;
-    log::app_log(
-        &app,
-        &format!("ТТС: скачивание движка CrispASR ({}) в {}...", b.label, dest),
-    );
+    log::app_log(&format!(
+        "ТТС: скачивание движка CrispASR ({}) в {}...",
+        b.label, dest
+    ));
+    // Оверрайд `default_engine_dir` из конфига хоста — фасадная забота (Шаг 4e:
+    // ядро знает только exe-дефолт). Пустой dest от фронта резолвим здесь.
+    let dest = if dest.trim().is_empty() {
+        crate::engine_dir_override()
+            .unwrap_or_else(|| download::default_engine_dir().to_string_lossy().into_owned())
+    } else {
+        dest
+    };
     let path = download::download_engine(&dest, &backend_id, &b.url, &b.tag)
         .await
         .map_err(|e| {
-            log::app_log(&app, &format!("ТТС ОШИБКА загрузки движка: {e}"));
+            log::app_log(&format!("ТТС ОШИБКА загрузки движка: {e}"));
             e
         })?;
     let mut s = load_tts_settings(&app);
     s.engine_dir = dest.clone();
     s.engine_backend = backend_id.clone();
     let _ = save_tts_settings(&app, &s);
-    log::app_log(&app, &format!("ТТС: движок скачан: {path}"));
+    log::app_log(&format!("ТТС: движок скачан: {path}"));
     Ok(path)
 }
 
@@ -411,18 +419,25 @@ pub async fn tts_download_model<R: Runtime>(
     preset: String,
     dest: String,
 ) -> Result<Value, String> {
-    log::app_log(&app, &format!("ТТС: скачивание GGUF модели ({preset}) в {dest}..."));
+    log::app_log(&format!("ТТС: скачивание GGUF модели ({preset}) в {dest}..."));
+    // Оверрайд `default_models_dir` из конфига хоста — фасадная забота (Шаг 4e).
+    let dest = if dest.trim().is_empty() {
+        crate::models_dir_override()
+            .unwrap_or_else(|| download::default_models_dir().to_string_lossy().into_owned())
+    } else {
+        dest
+    };
     let res = download::download_model(&preset, &dest)
         .await
         .map_err(|e| {
-            log::app_log(&app, &format!("ТТС ОШИБКА загрузки модели: {e}"));
+            log::app_log(&format!("ТТС ОШИБКА загрузки модели: {e}"));
             e
         })?;
     let mut s = load_tts_settings(&app);
     s.models_dir = dest.clone();
     s.preset = preset.clone();
     let _ = save_tts_settings(&app, &s);
-    log::app_log(&app, "ТТС: модель скачана");
+    log::app_log("ТТС: модель скачана");
     Ok(res)
 }
 
@@ -442,8 +457,8 @@ pub async fn tts_list_voices(models_dir: String) -> Vec<voices::VoiceInfo> {
 }
 
 #[tauri::command]
-pub async fn tts_add_voice<R: Runtime>(
-    app: AppHandle<R>,
+pub async fn tts_add_voice(
+
     models_dir: String,
     name: String,
     src_audio: String,
@@ -453,7 +468,6 @@ pub async fn tts_add_voice<R: Runtime>(
     denoise_strength: f32,
 ) -> Result<voices::VoiceInfo, String> {
     voices::add_voice(
-        &app,
         &models_dir,
         &name,
         &src_audio,
@@ -470,8 +484,8 @@ pub async fn tts_delete_voice(models_dir: String, id: String) -> Result<(), Stri
 }
 
 #[tauri::command]
-pub async fn tts_update_voice<R: Runtime>(
-    app: AppHandle<R>,
+pub async fn tts_update_voice(
+
     models_dir: String,
     id: String,
     name: String,
@@ -482,7 +496,6 @@ pub async fn tts_update_voice<R: Runtime>(
     denoise_strength: f32,
 ) -> Result<voices::VoiceInfo, String> {
     voices::update_voice(
-        &app,
         &models_dir,
         &id,
         &name,
@@ -589,20 +602,17 @@ pub async fn tts_delete_engine<R: Runtime>(
         std::path::PathBuf::from(dest)
     };
     let engine_dir = engine_dir.to_string_lossy().to_string();
-    log::app_log(
-        &app,
-        &format!("ТТС: удаление движка «{backend_id}» из {engine_dir}..."),
-    );
+    log::app_log(&format!("ТТС: удаление движка «{backend_id}» из {engine_dir}..."));
 
     // Освобождаем файл движка: TTS и STT поднимают один и тот же crispasr.exe.
     {
         let state = app.state::<PluginState>();
         state.tts.stop().await;
-        state.stt.stop(&app).await;
+        state.stt.stop().await;
     }
 
     let (freed, path) = download::delete_engine(&engine_dir, &backend_id).map_err(|e| {
-        log::app_log(&app, &format!("ТТС ОШИБКА удаления движка: {e}"));
+        log::app_log(&format!("ТТС ОШИБКА удаления движка: {e}"));
         e
     })?;
 
@@ -610,7 +620,7 @@ pub async fn tts_delete_engine<R: Runtime>(
         Some(b) => format!(" ({:.1} МБ)", b as f64 / 1_048_576.0),
         None => String::new(),
     };
-    log::app_log(&app, &format!("ТТС: движок удалён: {path}{size_txt}"));
+    log::app_log(&format!("ТТС: движок удалён: {path}{size_txt}"));
     Ok(json!({ "freed_bytes": freed, "path": path }))
 }
 
@@ -635,18 +645,15 @@ pub async fn stt_get_settings() -> SttSettings {
 }
 
 #[tauri::command]
-pub async fn stt_save_settings<R: Runtime>(
-    app: AppHandle<R>,
+pub async fn stt_save_settings(
+
     settings: SttSettings,
 ) -> Result<(), String> {
     settings.save()?;
-    log::app_log(
-        &app,
-        &format!(
-            "[stt] горячая клавиша сохранена: {} (code {})",
-            settings.hotkey_name, settings.hotkey_code
-        ),
-    );
+    log::app_log(&format!(
+        "[stt] горячая клавиша сохранена: {} (code {})",
+        settings.hotkey_name, settings.hotkey_code
+    ));
     Ok(())
 }
 
@@ -654,14 +661,14 @@ pub async fn stt_save_settings<R: Runtime>(
 pub async fn stt_start<R: Runtime>(app: AppHandle<R>) -> Result<u16, String> {
     let state = app.state::<PluginState>();
     let settings = SttSettings::load();
-    let ws_port = state.stt.ensure(&app, &settings).await?;
+    let ws_port = state.stt.ensure(&crate::config_dir(&app), &settings).await?;
     Ok(ws_port)
 }
 
 #[tauri::command]
 pub async fn stt_stop<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
     let state = app.state::<PluginState>();
-    state.stt.stop(&app).await;
+    state.stt.stop().await;
     Ok(())
 }
 
@@ -692,12 +699,12 @@ pub async fn dialog_get_settings() -> DialogSettings {
 }
 
 #[tauri::command]
-pub async fn dialog_save_settings<R: Runtime>(
-    app: AppHandle<R>,
+pub async fn dialog_save_settings(
+
     settings: DialogSettings,
 ) -> Result<(), String> {
     settings.save()?;
-    log::app_log(&app, "[dialog] настройки сохранены");
+    log::app_log("[dialog] настройки сохранены");
     Ok(())
 }
 
@@ -716,7 +723,7 @@ pub async fn dialog_download_engine<R: Runtime>(
     };
     let dir_str = dir.to_string_lossy().to_string();
     let exe = crate::download::dialog_download_engine(&dir_str).await?;
-    log::app_log(&app, &format!("[dialog] движок speech.cpp установлен: {exe}"));
+    log::app_log(&format!("[dialog] движок speech.cpp установлен: {exe}"));
     Ok(exe)
 }
 
@@ -725,13 +732,13 @@ pub async fn dialog_download_engine<R: Runtime>(
 pub async fn dialog_start<R: Runtime>(app: AppHandle<R>) -> Result<u16, String> {
     let state = app.state::<PluginState>();
     let settings = DialogSettings::load();
-    state.dialog.ensure(&app, &settings).await
+    state.dialog.ensure(&crate::config_dir(&app), &settings).await
 }
 
 #[tauri::command]
 pub async fn dialog_stop<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
     let state = app.state::<PluginState>();
-    state.dialog.stop(&app).await;
+    state.dialog.stop().await;
     Ok(())
 }
 

@@ -2,7 +2,9 @@
 resolver = "2"
 members = [
     "plugin-about-updates",
+    "plugin-about-updates/core",
     "plugin-speech-gen-engine",
+    "plugin-speech-gen-engine/core",
     "plugin-log-collector",
     "plugin-log-collector/core",
     "plugin-llama-engine",
@@ -11,9 +13,13 @@ members = [
     "plugin-cloud-routers/crates/core",
     "plugin-cloud-routers/crates/gateway",
     "plugin-downloader",
+    "plugin-downloader/core",
     "plugin-media-gen-engine",
+    "plugin-media-gen-engine/core",
     "plugin-ytdlp-wrapper",
+    "plugin-ytdlp-wrapper/core",
     "plugin-ffmpeg-wrapper",
+    "plugin-ffmpeg-wrapper/core",
     "tauri-plugin-system1",
     "json-store",
     # gpui-kit — НЕ член workspace: его опциональные депы gpui-webview/lb-wry

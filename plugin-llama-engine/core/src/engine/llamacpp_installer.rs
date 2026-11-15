@@ -15,7 +15,7 @@
 //! 1) корень `<llamacpp_dir>/llama-server.exe` → `backends/ggml-org/<variant>/`;
 //! 2) старый плоский формат `backends/<variant>/` → `backends/ggml-org/<variant>/`.
 
-use crate::engine::downloader::{fallback_download, FallbackRequest};
+use downloader_core::DownloadOptions;
 use crate::engine::gpu_detector::GpuInfo;
 use crate::engine::sources::{self, SourceSpec};
 use serde::{Deserialize, Serialize};
@@ -981,17 +981,16 @@ async fn install_inner<L: Fn(String) + Send + Sync>(
     }
 
     let zip_path = staging.join("engine.zip");
-    fallback_download(
-        FallbackRequest {
-            url: asset.0.browser_download_url.clone(),
-            dest: zip_path.clone(),
+    downloader_core::download(
+        &asset.0.browser_download_url,
+        &zip_path,
+        DownloadOptions {
             label: format!("Движок {}", actual_variant),
             kind: "engine".into(),
-            magic: None,
-            min_size: None,
             expected_size: Some(asset.0.size),
+            ..Default::default()
         },
-        &on_log,
+        Some(&on_log),
     )
     .await?;
 
@@ -1043,17 +1042,16 @@ async fn install_inner<L: Fn(String) + Send + Sync>(
             fs::create_dir_all(&shared).map_err(|e| {
                 format!("Не удалось создать {}: {}", shared.display(), e)
             })?;
-            fallback_download(
-                FallbackRequest {
-                    url: cudart.0.browser_download_url.clone(),
-                    dest: cudart_zip.clone(),
+            downloader_core::download(
+                &cudart.0.browser_download_url,
+                &cudart_zip,
+                DownloadOptions {
                     label: format!("CUDA runtime {}", actual_variant),
                     kind: "engine".into(),
-                    magic: None,
-                    min_size: None,
                     expected_size: Some(cudart.0.size),
+                    ..Default::default()
                 },
-                &on_log,
+                Some(&on_log),
             )
             .await?;
             verify_sha256(&cudart_zip, cudart.0.digest.as_deref(), "CUDA-рантайма")?;

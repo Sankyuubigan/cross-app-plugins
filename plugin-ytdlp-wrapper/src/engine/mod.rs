@@ -1,81 +1,103 @@
-//! Движок yt-dlp: управление бинарником, конфиг, скачивание видео.
+//! Тонкий мост ядра `ytdlp-core` (ССОТ, Шаг 4d PRP 261115): вся логика живёт
+//! в `core/` (крейт ytdlp-core, без tauri). Путь `plugin_ytdlp_wrapper::engine::*`
+//! сохранён для хостов (KO infra/tools/youtube.rs: engine::subtitles;
+//! lib.rs фасада: engine::downloader::kill_active_downloads).
 
-pub mod downloader;
-pub mod net_errors;
-pub mod subtitles;
-pub mod ytdlp_manager;
-
-use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use tauri::AppHandle;
 use tauri::Manager;
 
-#[derive(Serialize, Deserialize, Clone, Default)]
-pub struct YtdlpConfig {
-    #[serde(default)]
-    pub ytdlp_dir: Option<String>,
-    #[serde(default)]
-    pub ffmpeg_path: Option<String>,
-    #[serde(default)]
-    pub deno_dir: Option<String>,
-    #[serde(default)]
-    pub download_path: Option<String>,
-    #[serde(default)]
-    pub auth_mode: Option<String>,
-    #[serde(default)]
-    pub auth_browser: Option<String>,
-    #[serde(default)]
-    pub cookies_file: Option<String>,
-    #[serde(default)]
-    pub download_format: Option<String>,
-    #[serde(default)]
-    pub download_quality: Option<String>,
-    #[serde(default)]
-    pub proxy: Option<String>,
-    /// Источник кукисов для anti-bot (механика dpi_gui): имя браузера или папка
-    /// User Data. Сохраняется командой grab_ytdlp_cookies для префилла UI.
-    #[serde(default)]
-    pub cookie_browser: Option<String>,
-    #[serde(default)]
-    pub cookie_profile_dir: Option<String>,
-}
+pub use ytdlp_core::{net_errors, subtitles};
+pub use ytdlp_core::{YtdlpConfig, YtdlpStatus};
 
-pub fn load_config(app: &AppHandle) -> YtdlpConfig {
-    let path = config_path(app);
-    match std::fs::read_to_string(&path) {
-        Ok(text) => {
-            let mut cfg: YtdlpConfig = serde_json::from_str(&text).unwrap_or_default();
-            // Merge defaults for missing fields
-            if cfg.auth_mode.is_none() { cfg.auth_mode = Some("none".to_string()); }
-            if cfg.auth_browser.is_none() { cfg.auth_browser = Some("chrome".to_string()); }
-            if cfg.download_format.is_none() { cfg.download_format = Some("mp4".to_string()); }
-            if cfg.download_quality.is_none() { cfg.download_quality = Some("max".to_string()); }
-            cfg
-        }
-        Err(_) => YtdlpConfig {
-            auth_mode: Some("none".to_string()),
-            auth_browser: Some("chrome".to_string()),
-            download_format: Some("mp4".to_string()),
-            download_quality: Some("max".to_string()),
-            ..Default::default()
-        },
+pub mod downloader {
+    use std::path::PathBuf;
+
+    pub use ytdlp_core::downloader::{cancel_active, fetch_info, kill_active_downloads};
+
+    /// Прежняя команда-сигнатура: мост в ядро (data_dir из AppHandle + хук,
+    /// эмитящий те же события `ytdlp:download-*`, что и раньше).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_download(
+        app: tauri::AppHandle,
+        dir: PathBuf,
+        url: String,
+        format: String,
+        quality: String,
+        output_dir: String,
+        auth_mode: String,
+        browser: Option<String>,
+        cookies_file: Option<String>,
+        proxy: Option<String>,
+    ) -> Result<(), String> {
+        use std::sync::Arc;
+        use ytdlp_core::downloader::{start_download as core_start, YtdlpEvent, YtdlpEventHook};
+
+        let data_dir = super::data_dir(&app);
+        let handle = app.clone();
+        let on_event: YtdlpEventHook = Arc::new(move |e: &YtdlpEvent| {
+            use tauri::Emitter;
+            match e {
+                YtdlpEvent::Progress(pct) => {
+                    let _ = handle.emit("ytdlp:download-progress", pct);
+                }
+                YtdlpEvent::Status(s) => {
+                    let _ = handle.emit("ytdlp:download-status", s.clone());
+                }
+                YtdlpEvent::Cancelled => {
+                    let _ = handle.emit("ytdlp:download-cancelled", ());
+                }
+                YtdlpEvent::Error(msg) => {
+                    let _ = handle.emit("ytdlp:download-error", msg.clone());
+                }
+                YtdlpEvent::Finished => {
+                    let _ = handle.emit("ytdlp:download-finished", ());
+                }
+            }
+        });
+        core_start(
+            data_dir,
+            dir,
+            url,
+            format,
+            quality,
+            output_dir,
+            auth_mode,
+            browser,
+            cookies_file,
+            proxy,
+            Some(on_event),
+        )
+        .await
     }
 }
 
-pub fn save_config(app: &AppHandle, cfg: &YtdlpConfig) -> Result<(), String> {
-    let path = config_path(app);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("Не удалось создать директорию: {e}"))?;
+pub mod ytdlp_manager {
+    use std::path::Path;
+    use super::YtdlpStatus;
+
+    pub use ytdlp_core::ytdlp_manager::{
+        check_update, default_dir, get_deno_path, get_exe_path, get_ffmpeg_path, get_version,
+        install_deno, install_or_update, is_installed,
+    };
+
+    /// Прежняя сигнатура: data_dir достаётся из AppHandle (в ядре — параметр).
+    pub fn get_status(dir: &Path, app: &tauri::AppHandle) -> Result<YtdlpStatus, String> {
+        ytdlp_core::ytdlp_manager::get_status(dir, &super::data_dir(app))
     }
-    let json = serde_json::to_string_pretty(cfg)
-        .map_err(|e| format!("Ошибка сериализации: {e}"))?;
-    json_store::write_atomic(&path, &json)
-        .map_err(|e| format!("Ошибка записи конфига: {e}"))
 }
 
-fn config_path(app: &AppHandle) -> PathBuf {
-    let base = app.path().app_data_dir()
-        .unwrap_or_else(|_| PathBuf::from("."));
-    base.join("ytdlp_config.json")
+/// Обёртки с прежней сигнатурой: команды фасада не меняются.
+pub fn load_config(app: &tauri::AppHandle) -> YtdlpConfig {
+    ytdlp_core::load_config(&data_dir(app))
+}
+
+pub fn save_config(app: &tauri::AppHandle, cfg: &YtdlpConfig) -> Result<(), String> {
+    ytdlp_core::save_config(&data_dir(app), cfg)
+}
+
+/// Папка данных хоста (в ядре — параметр `data_dir`).
+pub fn data_dir(app: &tauri::AppHandle) -> PathBuf {
+    app.path()
+        .app_data_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
 }

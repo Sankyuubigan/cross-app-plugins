@@ -36,7 +36,7 @@ fn exe_dir(app: &AppHandle) -> PathBuf {
 }
 
 fn engine_dir(app: &AppHandle) -> PathBuf {
-    let cfg = engine::load_image_config(app);
+    let cfg = engine::load_image_config();
     if let Some(p) = &cfg.sdcpp_dir {
         if !p.is_empty() {
             return PathBuf::from(p);
@@ -55,8 +55,8 @@ pub fn get_image_engine_dir(app: &AppHandle) -> PathBuf {
 /// пропускает существующее); per-bundle подпапки убраны 25.10.2026 —
 /// они порождали перекачку общих файлов и «3 файла есть, 1 нет» при
 /// переключении активного бандла.
-fn bundle_dir(app: &AppHandle) -> PathBuf {
-    let cfg = engine::load_image_config(app);
+fn bundle_dir() -> PathBuf {
+    let cfg = engine::load_image_config();
     if let Some(p) = &cfg.image_bundle_dir {
         if !p.is_empty() {
             return PathBuf::from(p);
@@ -65,8 +65,8 @@ fn bundle_dir(app: &AppHandle) -> PathBuf {
     engine::default_image_bundle_dir()
 }
 
-fn preferred_variant(app: &AppHandle) -> Option<String> {
-    engine::load_image_config(app).image_engine_variant
+fn preferred_variant() -> Option<String> {
+    engine::load_image_config().image_engine_variant
 }
 
 fn gpu_facts() -> (bool, String) {
@@ -84,7 +84,7 @@ pub fn get_image_engine_status(app: AppHandle) -> ImageEngineStatus {
     let dir = engine_dir(&app);
     let (has_nvidia, gpu_name) = gpu_facts();
     let source = "leejet";
-    let selected = preferred_variant(&app).unwrap_or_else(|| sdcpp_installer::VARIANT_AUTO.to_string());
+    let selected = preferred_variant().unwrap_or_else(|| sdcpp_installer::VARIANT_AUTO.to_string());
     let resolved = sdcpp_installer::resolve_variant(Some(&selected));
     let meta = sdcpp_installer::installed_meta(&dir, source, &resolved);
     let installed_variants = sdcpp_installer::list_installed_variants(&dir, source);
@@ -122,7 +122,7 @@ pub fn get_image_engine_status(app: AppHandle) -> ImageEngineStatus {
 pub async fn install_image_engine(app: AppHandle) -> Result<ImageEngineStatus, String> {
     let on_log = |msg: String| log::info!("[IMG-ENGINE] {}", msg);
     let dir = engine_dir(&app);
-    let selected = preferred_variant(&app).unwrap_or_else(|| sdcpp_installer::VARIANT_AUTO.to_string());
+    let selected = preferred_variant().unwrap_or_else(|| sdcpp_installer::VARIANT_AUTO.to_string());
     let variant = sdcpp_installer::resolve_variant(Some(&selected));
     on_log(format!("Вариант бекенда: {} ({})", variant, sdcpp_installer::variant_label(&variant)));
     let _meta = sdcpp_installer::install(&dir, "leejet", &variant, &on_log).await?;
@@ -135,9 +135,9 @@ pub async fn set_image_engine_variant(app: AppHandle, variant: String) -> Result
     if variant != sdcpp_installer::VARIANT_AUTO && !sdcpp_installer::is_known_variant(&variant) {
         return Err(format!("Неизвестный вариант бекенда: {}", variant));
     }
-    let mut cfg = engine::load_image_config(&app);
+    let mut cfg = engine::load_image_config();
     cfg.image_engine_variant = if variant == sdcpp_installer::VARIANT_AUTO { None } else { Some(variant.clone()) };
-    engine::save_image_config(&app, &cfg)?;
+    engine::save_image_config(&cfg)?;
 
     let dir = engine_dir(&app);
     let resolved = sdcpp_installer::resolve_variant(Some(&variant));
@@ -150,7 +150,7 @@ pub async fn set_image_engine_variant(app: AppHandle, variant: String) -> Result
 #[tauri::command]
 pub async fn check_image_engine_update(app: AppHandle) -> Result<Option<String>, String> {
     let dir = engine_dir(&app);
-    let selected = preferred_variant(&app).unwrap_or_else(|| sdcpp_installer::VARIANT_AUTO.to_string());
+    let selected = preferred_variant().unwrap_or_else(|| sdcpp_installer::VARIANT_AUTO.to_string());
     let variant = sdcpp_installer::resolve_variant(Some(&selected));
     let on_log = |msg: String| log::info!("[IMG-ENGINE] {}", msg);
     sdcpp_installer::check_update(&dir, "leejet", &variant, &on_log).await
@@ -164,7 +164,7 @@ pub async fn install_image_engine_update(app: AppHandle) -> Result<ImageEngineSt
 #[tauri::command]
 pub fn remove_image_engine(app: AppHandle) -> Result<ImageEngineStatus, String> {
     let dir = engine_dir(&app);
-    let selected = preferred_variant(&app).unwrap_or_else(|| sdcpp_installer::VARIANT_AUTO.to_string());
+    let selected = preferred_variant().unwrap_or_else(|| sdcpp_installer::VARIANT_AUTO.to_string());
     let variant = sdcpp_installer::resolve_variant(Some(&selected));
     let on_log = |msg: String| log::info!("[IMG-ENGINE] {}", msg);
     sdcpp_installer::remove(&dir, "leejet", &variant, &on_log)?;
@@ -173,9 +173,9 @@ pub fn remove_image_engine(app: AppHandle) -> Result<ImageEngineStatus, String> 
 
 #[tauri::command]
 pub fn set_image_engine_dir(app: AppHandle, path: String) -> Result<ImageEngineStatus, String> {
-    let mut cfg = engine::load_image_config(&app);
+    let mut cfg = engine::load_image_config();
     cfg.sdcpp_dir = Some(path);
-    engine::save_image_config(&app, &cfg)?;
+    engine::save_image_config(&cfg)?;
     Ok(get_image_engine_status(app))
 }
 
@@ -231,14 +231,13 @@ fn free_space_gb_for(path: &Path) -> u64 {
 /// Entry бандла для операции: явное имя → из каталога; без имени →
 /// активный (cfg.selected_bundle) → дефолт. Ошибка — честная, что где не так.
 pub fn bundle_entry(
-    app: &AppHandle,
     name: Option<&str>,
 ) -> Result<engine::ImageBundleEntry, String> {
     if let Some(n) = name.filter(|n| !n.is_empty()) {
         return engine::bundle_by_name(n)
             .ok_or_else(|| format!("Бандл «{}» отсутствует в каталоге плагина.", n));
     }
-    if let Some(ref sel) = engine::load_image_config(app).selected_bundle {
+    if let Some(ref sel) = engine::load_image_config().selected_bundle {
         if !sel.is_empty() {
             return engine::bundle_by_name(sel).ok_or_else(|| {
                 format!(
@@ -253,9 +252,9 @@ pub fn bundle_entry(
 }
 
 #[tauri::command]
-pub fn get_image_bundle_info(app: AppHandle, bundle_name: Option<String>) -> Result<ImageBundleInfo, String> {
-    let entry = bundle_entry(&app, bundle_name.as_deref())?;
-    let save_dir = bundle_dir(&app);
+pub fn get_image_bundle_info(_app: AppHandle, bundle_name: Option<String>) -> Result<ImageBundleInfo, String> {
+    let entry = bundle_entry(bundle_name.as_deref())?;
+    let save_dir = bundle_dir();
     let mut files = Vec::with_capacity(entry.files.len());
     let mut fully = true;
     for f in &entry.files {
@@ -337,9 +336,9 @@ pub fn set_selected_image_bundle(
     bundle_name: String,
 ) -> Result<ImageBundleInfo, String> {
     if bundle_name.trim().is_empty() {
-        let mut cfg = engine::load_image_config(&app);
+        let mut cfg = engine::load_image_config();
         cfg.selected_bundle = None;
-        engine::save_image_config(&app, &cfg)?;
+        engine::save_image_config(&cfg)?;
         return get_image_bundle_info(app, None);
     }
     let entry = engine::bundle_by_name(&bundle_name).ok_or_else(|| {
@@ -348,7 +347,7 @@ pub fn set_selected_image_bundle(
     // Гейт активации (решение юзера 25.10.2026): неполный бандл нельзя
     // сделать активным — иначе generate_image честно упадёт с «скачан
     // не полностью». Ошибка называет недостающие файлы.
-    let dir = bundle_dir(&app);
+    let dir = bundle_dir();
     let missing: Vec<&str> = entry
         .files
         .iter()
@@ -362,16 +361,16 @@ pub fn set_selected_image_bundle(
             missing.join(", ")
         ));
     }
-    let mut cfg = engine::load_image_config(&app);
+    let mut cfg = engine::load_image_config();
     cfg.selected_bundle = Some(bundle_name.clone());
-    engine::save_image_config(&app, &cfg)?;
+    engine::save_image_config(&cfg)?;
     log::info!("[IMG] Активный бандл: {}", entry.name);
     image_bundle_info_for(&app, &entry)
 }
 
 /// Сборка ImageBundleInfo для конкретного entry (общая для info/set_selected).
-fn image_bundle_info_for(app: &AppHandle, entry: &engine::ImageBundleEntry) -> Result<ImageBundleInfo, String> {
-    let save_dir = bundle_dir(app);
+fn image_bundle_info_for(_app: &AppHandle, entry: &engine::ImageBundleEntry) -> Result<ImageBundleInfo, String> {
+    let save_dir = bundle_dir();
     let mut files = Vec::with_capacity(entry.files.len());
     let mut fully = true;
     for f in &entry.files {
@@ -412,9 +411,9 @@ pub fn set_image_bundle_dir(app: AppHandle, path: String) -> Result<ImageBundleI
         std::fs::create_dir_all(p)
             .map_err(|e| format!("Не удалось создать папку {}: {}", p.display(), e))?;
     }
-    let mut cfg = engine::load_image_config(&app);
+    let mut cfg = engine::load_image_config();
     cfg.image_bundle_dir = Some(path);
-    engine::save_image_config(&app, &cfg)?;
+    engine::save_image_config(&cfg)?;
     get_image_bundle_info(app, None)
 }
 
@@ -424,7 +423,7 @@ pub async fn download_image_bundle(
     save_dir: String,
     bundle_name: Option<String>,
 ) -> Result<ImageBundleInfo, String> {
-    let entry = bundle_entry(&app, bundle_name.as_deref())?;
+    let entry = bundle_entry(bundle_name.as_deref())?;
     let dir = PathBuf::from(&save_dir);
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("Не удалось создать папку {}: {}", dir.display(), e))?;
@@ -472,10 +471,10 @@ pub async fn download_image_bundle(
                 }
             }
         }
-        plugin_downloader::download(
+        downloader_core::download(
             &f.download_url,
             &dest,
-            plugin_downloader::DownloadOptions {
+            downloader_core::DownloadOptions {
                 label: format!("{} ({})", f.filename, f.role),
                 kind: "image-model".into(),
                 expected_size: f.size_bytes,
@@ -494,9 +493,9 @@ pub async fn download_image_bundle(
         .map(|f| (f.filename.as_str(), f.size_bytes))
         .collect();
     crate::pool::verify_files(&refs, &dir)?;
-    let mut cfg = engine::load_image_config(&app);
+    let mut cfg = engine::load_image_config();
     cfg.image_bundle_dir = Some(save_dir);
-    engine::save_image_config(&app, &cfg)?;
+    engine::save_image_config(&cfg)?;
     on_log("Бандл скачан целиком.".to_string());
     get_image_bundle_info(app, bundle_name)
 }
@@ -513,8 +512,8 @@ fn catalog_filenames_except(except: &str) -> std::collections::HashSet<String> {
 
 #[tauri::command]
 pub fn remove_image_bundle(app: AppHandle, bundle_name: Option<String>) -> Result<ImageBundleInfo, String> {
-    let entry = bundle_entry(&app, bundle_name.as_deref())?;
-    let dir = bundle_dir(&app);
+    let entry = bundle_entry(bundle_name.as_deref())?;
+    let dir = bundle_dir();
     // Refcount-удаление (29.10.26): пул общий, файл, нужный ХОТЬ ОДНОМУ
     // другому бандлу каталога, остаётся — удаление одного из двух Qwen
     // больше не ломает второй (общие 8B-llm/mmproj/vae делятся).
@@ -535,19 +534,19 @@ pub fn remove_image_bundle(app: AppHandle, bundle_name: Option<String>) -> Resul
     }
     // Если удаляли активный бандл — снимаем выбор (иначе все операции будут
     // падать с «активный бандл отсутствует»).
-    if engine::load_image_config(&app).selected_bundle.as_deref() == Some(entry.name.as_str()) {
-        let mut cfg = engine::load_image_config(&app);
+    if engine::load_image_config().selected_bundle.as_deref() == Some(entry.name.as_str()) {
+        let mut cfg = engine::load_image_config();
         cfg.selected_bundle = None;
-        engine::save_image_config(&app, &cfg)?;
+        engine::save_image_config(&cfg)?;
     }
     Ok(get_image_bundle_info(app, None)?)
 }
 
 #[tauri::command]
 pub fn remove_image_bundle_from_list(app: AppHandle) -> Result<ImageBundleInfo, String> {
-    let mut cfg = engine::load_image_config(&app);
+    let mut cfg = engine::load_image_config();
     cfg.image_bundle_dir = None;
-    engine::save_image_config(&app, &cfg)?;
+    engine::save_image_config(&cfg)?;
     Ok(get_image_bundle_info(app, None)?)
 }
 
@@ -579,8 +578,8 @@ fn pool_orphans_info(dir: &Path) -> PoolOrphansInfo {
 /// любой сторонний мусор в корне пула). Ничего не удаляет — только
 /// перечисляет; удаление — отдельная явная команда по решению юзера.
 #[tauri::command]
-pub fn get_image_pool_orphans(app: AppHandle) -> Result<PoolOrphansInfo, String> {
-    Ok(pool_orphans_info(&bundle_dir(&app)))
+pub fn get_image_pool_orphans(_app: AppHandle) -> Result<PoolOrphansInfo, String> {
+    Ok(pool_orphans_info(&bundle_dir()))
 }
 
 /// Удалить перечисленные неиспользуемые файлы пула (явное действие юзера).
@@ -588,10 +587,10 @@ pub fn get_image_pool_orphans(app: AppHandle) -> Result<PoolOrphansInfo, String>
 /// каталогу и пути вне пула — отказ.
 #[tauri::command]
 pub fn remove_image_pool_orphans(
-    app: AppHandle,
+    _app: AppHandle,
     filenames: Vec<String>,
 ) -> Result<PoolOrphansInfo, String> {
-    let dir = bundle_dir(&app);
+    let dir = bundle_dir();
     let referenced: std::collections::HashSet<String> = engine::load_image_catalog()
         .iter()
         .flat_map(|e| e.files.iter().map(|f| f.filename.clone()))
@@ -670,7 +669,7 @@ pub async fn generate_image(
     lora_names: Option<Vec<String>>,
     lora_strength: Option<f32>,
 ) -> Result<engine::ImageGenResult, String> {
-    let entry = bundle_entry(&app, bundle_name.as_deref())?;
+    let entry = bundle_entry(bundle_name.as_deref())?;
     let (w, h, st, cfg, sd) = resolve_gen_params(&entry, width, height, steps, cfg_scale, seed);
     // LoRA-резолв по SSOT-плагиновому модулю (PRP 29.10.26): несуществующее
     // имя — честный отказ команды (текст включает папку и доступные стемы).
@@ -682,8 +681,8 @@ pub async fn generate_image(
         entry.lora_base.as_deref(),
     )?;
     let edir = engine_dir(&app);
-    let bdir = bundle_dir(&app);
-    let variant = preferred_variant(&app);
+    let bdir = bundle_dir();
+    let variant = preferred_variant();
     let out = out_path.map(PathBuf::from).unwrap_or_else(|| default_out_path(&bdir));
     let log_cb = |msg: String| log::info!("[IMG] {}", msg);
     tokio::task::spawn_blocking(move || {
@@ -711,7 +710,7 @@ pub async fn edit_image(
     if ref_paths.is_empty() {
         return Err("Для редактирования нужен хотя бы один референс (ref_paths пуст).".to_string());
     }
-    let entry = bundle_entry(&app, bundle_name.as_deref())?;
+    let entry = bundle_entry(bundle_name.as_deref())?;
     if !entry.files.iter().any(|f| f.role == "mmproj") {
         return Err(format!(
             "Edit требует mmproj (vision-энкодер). Бандл «{}» его не содержит — выберите полный набор в настройках image-engine.",
@@ -740,8 +739,8 @@ pub async fn edit_image(
         engine::RefEditPlan::Ready { loras, ref_image_args } => (loras, ref_image_args),
     };
     let edir = engine_dir(&app);
-    let bdir = bundle_dir(&app);
-    let variant = preferred_variant(&app);
+    let bdir = bundle_dir();
+    let variant = preferred_variant();
     let out = out_path.map(PathBuf::from).unwrap_or_else(|| default_out_path(&bdir));
     let log_cb = |msg: String| log::info!("[IMG] {}", msg);
     tokio::task::spawn_blocking(move || {
@@ -783,8 +782,8 @@ pub struct VideoBundleValidate {
 /// (25.10.2026): diffusion-файлы разных бандлов имеют разные имена, общие
 /// роли (llm/vae/audio_vae/lora_draft) — одинаковые, downloader пропускает
 /// существующее. Per-bundle подпапки порождали перекачку.
-fn video_bundle_dir(app: &AppHandle) -> PathBuf {
-    let cfg = engine::load_image_config(app);
+fn video_bundle_dir() -> PathBuf {
+    let cfg = engine::load_image_config();
     if let Some(p) = &cfg.video_bundle_dir {
         if !p.is_empty() {
             return PathBuf::from(p);
@@ -794,12 +793,12 @@ fn video_bundle_dir(app: &AppHandle) -> PathBuf {
 }
 
 /// Взять запись: имя → каталог; без имени → selected_video_bundle → дефолт.
-fn video_entry(app: &AppHandle, name: Option<&str>) -> Result<engine::VideoBundleEntry, String> {
+fn video_entry(name: Option<&str>) -> Result<engine::VideoBundleEntry, String> {
     if let Some(n) = name.filter(|n| !n.is_empty()) {
         return engine::video_bundle_by_name(n)
             .ok_or_else(|| format!("Видео-бандл «{}» отсутствует в каталоге плагина.", n));
     }
-    if let Some(ref sel) = engine::load_image_config(app).selected_video_bundle {
+    if let Some(ref sel) = engine::load_image_config().selected_video_bundle {
         if !sel.is_empty() {
             return engine::video_bundle_by_name(sel).ok_or_else(|| {
                 format!(
@@ -823,8 +822,8 @@ fn video_entry_from_name(name: Option<&str>) -> Result<engine::VideoBundleEntry,
     }
 }
 
-fn video_bundle_info_for(app: &AppHandle, entry: &engine::VideoBundleEntry) -> VideoBundleInfo {
-    let save_dir = video_bundle_dir(app);
+fn video_bundle_info_for(_app: &AppHandle, entry: &engine::VideoBundleEntry) -> VideoBundleInfo {
+    let save_dir = video_bundle_dir();
     let mut files = Vec::with_capacity(entry.files.len());
     let mut fully = true;
     for f in &entry.files {
@@ -886,7 +885,7 @@ pub fn get_video_bundle_info(
     app: AppHandle,
     bundle_name: Option<String>,
 ) -> Result<VideoBundleInfo, String> {
-    let entry = video_entry(&app, bundle_name.as_deref())?;
+    let entry = video_entry(bundle_name.as_deref())?;
     Ok(video_bundle_info_for(&app, &entry))
 }
 
@@ -896,16 +895,16 @@ pub fn set_selected_video_bundle(
     bundle_name: String,
 ) -> Result<VideoBundleInfo, String> {
     if bundle_name.trim().is_empty() {
-        let mut cfg = engine::load_image_config(&app);
+        let mut cfg = engine::load_image_config();
         cfg.selected_video_bundle = None;
-        engine::save_image_config(&app, &cfg)?;
+        engine::save_image_config(&cfg)?;
         return get_video_bundle_info(app, None);
     }
     let entry = engine::video_bundle_by_name(&bundle_name).ok_or_else(|| {
         format!("Видео-бандл «{}» отсутствует в каталоге плагина.", bundle_name)
     })?;
     // Гейт активации (зеркало image): неполный видео-бандл не активируется.
-    let dir = video_bundle_dir(&app);
+    let dir = video_bundle_dir();
     let missing: Vec<&str> = entry
         .files
         .iter()
@@ -919,9 +918,9 @@ pub fn set_selected_video_bundle(
             missing.join(", ")
         ));
     }
-    let mut cfg = engine::load_image_config(&app);
+    let mut cfg = engine::load_image_config();
     cfg.selected_video_bundle = Some(bundle_name.clone());
-    engine::save_image_config(&app, &cfg)?;
+    engine::save_image_config(&cfg)?;
     log::info!("[VIDEO] Активный видео-бандл: {}", entry.name);
     Ok(video_bundle_info_for(&app, &entry))
 }
@@ -939,7 +938,7 @@ pub fn validate_video_bundle_dir(
 /// текущего видео-бандла (add) или сбросить на дефолт (пустая строкa → None).
 #[tauri::command]
 pub fn set_video_bundle_dir(app: AppHandle, path: Option<String>) -> Result<VideoBundleInfo, String> {
-    let mut cfg = engine::load_image_config(&app);
+    let mut cfg = engine::load_image_config();
     match path.filter(|p| !p.trim().is_empty()) {
         Some(p) => {
             if !Path::new(&p).exists() {
@@ -949,8 +948,8 @@ pub fn set_video_bundle_dir(app: AppHandle, path: Option<String>) -> Result<Vide
         }
         None => cfg.video_bundle_dir = None,
     }
-    engine::save_image_config(&app, &cfg)?;
-    video_entry(&app, None).map(|e| video_bundle_info_for(&app, &e))
+    engine::save_image_config(&cfg)?;
+    video_entry(None).map(|e| video_bundle_info_for(&app, &e))
 }
 
 /// Удалить файлы видео-бандла на диске (зеркало `remove_image_bundle`):
@@ -960,8 +959,8 @@ pub fn set_video_bundle_dir(app: AppHandle, path: Option<String>) -> Result<Vide
 /// нужный другому видео-бандлу, остаётся в пуле.
 #[tauri::command]
 pub fn remove_video_bundle_files(app: AppHandle, bundle_name: Option<String>) -> Result<VideoBundleInfo, String> {
-    let entry = video_entry(&app, bundle_name.as_deref())?;
-    let dir = video_bundle_dir(&app);
+    let entry = video_entry(bundle_name.as_deref())?;
+    let dir = video_bundle_dir();
     let other_referenced: std::collections::HashSet<String> = engine::load_video_catalog()
         .iter()
         .filter(|e| e.name != entry.name)
@@ -981,16 +980,16 @@ pub fn remove_video_bundle_files(app: AppHandle, bundle_name: Option<String>) ->
             kept.join(", ")
         );
     }
-    if engine::load_image_config(&app)
+    if engine::load_image_config()
         .selected_video_bundle
         .as_deref()
         == Some(entry.name.as_str())
     {
-        let mut cfg = engine::load_image_config(&app);
+        let mut cfg = engine::load_image_config();
         cfg.selected_video_bundle = None;
-        engine::save_image_config(&app, &cfg)?;
+        engine::save_image_config(&cfg)?;
     }
-    let fresh = video_entry(&app, None)?;
+    let fresh = video_entry(None)?;
     Ok(video_bundle_info_for(&app, &fresh))
 }
 
@@ -1004,7 +1003,7 @@ pub async fn download_video_bundle(
     save_dir: String,
     bundle_name: Option<String>,
 ) -> Result<VideoBundleInfo, String> {
-    let entry = video_entry(&app, bundle_name.as_deref())?;
+    let entry = video_entry(bundle_name.as_deref())?;
     let dir = PathBuf::from(&save_dir);
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("Не удалось создать папку {}: {}", dir.display(), e))?;
@@ -1051,10 +1050,10 @@ pub async fn download_video_bundle(
                 }
             }
         }
-        plugin_downloader::download(
+        downloader_core::download(
             &f.download_url,
             &dest,
-            plugin_downloader::DownloadOptions {
+            downloader_core::DownloadOptions {
                 label: format!("{} ({})", f.filename, f.role),
                 kind: "video-model".into(),
                 expected_size: f.size_bytes,
@@ -1072,9 +1071,9 @@ pub async fn download_video_bundle(
         .map(|f| (f.filename.as_str(), f.size_bytes))
         .collect();
     crate::pool::verify_files(&refs, &dir)?;
-    let mut cfg = engine::load_image_config(&app);
+    let mut cfg = engine::load_image_config();
     cfg.video_bundle_dir = Some(save_dir);
-    engine::save_image_config(&app, &cfg)?;
+    engine::save_image_config(&cfg)?;
     on_log("Видео-бандл скачан целиком.".to_string());
     get_video_bundle_info(app, bundle_name)
 }
@@ -1125,10 +1124,10 @@ pub async fn generate_video(
     lora_names: Option<Vec<String>>,
     lora_strength: Option<f32>,
 ) -> Result<engine::VideoGenResult, String> {
-    let entry = video_entry(&app, bundle_name.as_deref())?;
-    let bdir = video_bundle_dir(&app);
+    let entry = video_entry(bundle_name.as_deref())?;
+    let bdir = video_bundle_dir();
     let edir = engine_dir(&app);
-    let variant = preferred_variant(&app);
+    let variant = preferred_variant();
 
     // Дефолты ИЗ ПРЕСЕТА КАТАЛОГА; явные аргументы переопределяют.
     let preset = &entry.preset;
@@ -1317,27 +1316,10 @@ fn loras_repo() -> String {
 #[tauri::command]
 pub async fn list_remote_loras() -> Result<RemoteLorasInfo, String> {
     let repo = loras_repo();
-    let url = format!(
-        "https://huggingface.co/api/models/{}/tree/main?recursive=true",
-        repo
-    );
     let dir = engine::lora_dir_early();
-    let body = tauri::async_runtime::spawn_blocking(move || -> Result<String, String> {
-        let resp = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .map_err(|e| e.to_string())?
-            .get(&url)
-            .send()
-            .map_err(|e| format!("Не удалось получить каталог LoRA: {}", e))?
-            .error_for_status()
-            .map_err(|e| {
-                format!(
-                    "Каталог LoRA недоступен (HTTP {}). Проверьте интернет или имя репозитория.",
-                    e.status().map(|s| s.as_u16()).unwrap_or(0)
-                )
-            })?;
-        resp.text().map_err(|e| e.to_string())
+    let repo_for_fetch = repo.clone();
+    let body = tauri::async_runtime::spawn_blocking(move || {
+        engine::lora::fetch_remote_loras_tree(&repo_for_fetch)
     })
     .await
     .map_err(|e| format!("Задача каталога LoRA прервана: {}", e))??;
@@ -1411,10 +1393,10 @@ pub async fn download_remote_lora(path: String) -> Result<(), String> {
         .map_err(|e| format!("Не удалось создать папку {}: {}", parent.display(), e))?;
     let on_log = |msg: String| log::info!("[LORA-DL] {}", msg);
     on_log(format!("Качаю {} → {}", url, dest.display()));
-    plugin_downloader::download(
+    downloader_core::download(
         &url,
         &dest,
-        plugin_downloader::DownloadOptions {
+        downloader_core::DownloadOptions {
             label: trimmed.to_string(),
             kind: "lora".into(),
             expected_size: None,

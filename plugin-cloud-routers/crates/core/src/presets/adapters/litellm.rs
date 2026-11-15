@@ -181,8 +181,12 @@ mod tests {
             .map(|i| format!("\"m{i:03}\":{{\"litellm_provider\":\"groq\",\"mode\":\"chat\"}}"))
             .collect();
         // Дубликат: JSON схлопывает одинаковые ключи, добавляем «dup» дважды.
+        // dup ВНАЧАЛЕ строки: serde_json::Map = BTreeMap (сортировка, «dup» < «m…»)
+        // или IndexMap (порядок вставки — фича preserve_order включается
+        // транзитивно, напр. rookie в графе хоста с ytdlp-плагином). Оба
+        // порядка кладут dup в лимит — тест не зависит от фич-унификации.
         let raw = format!(
-            "{{{entries},\"dup\":{{\"litellm_provider\":\"groq\",\"mode\":\"chat\"}},\"dup\":{{\"litellm_provider\":\"groq\",\"mode\":\"chat\"}}}}",
+            "{{\"dup\":{{\"litellm_provider\":\"groq\",\"mode\":\"chat\"}},\"dup\":{{\"litellm_provider\":\"groq\",\"mode\":\"chat\"}},{entries}}}",
             entries = entries.join(",")
         );
         let hints = parse_litellm_hints(&raw).expect("parse");
