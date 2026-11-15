@@ -83,7 +83,7 @@ fn budget_form_main_priority_and_total_cap() {
     // Превышение: главный (первый) полными пикселями — 1280×768 = 0.98 Мпикс
     // ≤ капа главного 2 Мпикс; остальные делят остаток пропорционально
     // (одинаковые источники → одинаковый share 736×544), Σ ≤ 4 Мпикс.
-    let big: Vec<_> = (0..8)
+    let _big: Vec<_> = (0..8)
         .map(|_| image::DynamicImage::new_rgb8(1152, 864))
         .collect();
     let mut big = vec![image::DynamicImage::new_rgb8(1280, 768)];
@@ -153,7 +153,7 @@ fn save_load_roundtrip_normalizes_frames() {
     // (3 993 600 px) → 2720x1440 (floor-сетка, площадь ≤ доли).
     let s2 = write_source(&src_dir, "b.png", 4096, 2160); // → 2720x1440
 
-    let (card, report) = save_refmod_card_in(&root, "test_char", "Тест Чар", "тестовое описание", &[
+    let (card, _report) = save_refmod_card_in(&root, "test_char", "Тест Чар", "тестовое описание", &[
         s1.clone(),
         s2.clone(),
     ])

@@ -287,7 +287,7 @@ mod tests {
 #[cfg(test)]
 mod download_tests {
     use super::{ensure_downloaded, paths, state, RUNTIME_DLL_SHA256, RUNTIME_ZIP_NAME};
-    use crate::catalog;
+    
 
     /// Корень данных для тест-бинарника: `current_exe()` у него — это
     /// `target/debug/deps`, а не папка приложения.

@@ -43,7 +43,7 @@
 //! позиция ссылается на строку пакета, которая её создаёт. Дублировать его по
 //! другим файлам плагина нельзя: список разъедется с пакетом при обновлении.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Пакеты, которые `postinstall` раскладывает в standalone-каталог
 /// копированием из `node_modules`.
@@ -295,6 +295,7 @@ fn verify_playwright_patch(dist: &Path, report: &mut ContractReport) -> Vec<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     struct TempDir(PathBuf);
 

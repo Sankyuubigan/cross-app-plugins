@@ -1,3 +1,6 @@
+// Заготовки Kiro-протокола: активная разработка (PRP 16.11.26), не мёртвый код.
+#![allow(dead_code)]
+
 //! Перевод Kiro EventStream → OpenAI SSE.
 //!
 //! События апстрима (подтверждено `transformEventStreamToSSE` 9Router):

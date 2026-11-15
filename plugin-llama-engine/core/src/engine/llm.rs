@@ -913,7 +913,7 @@ impl LlamaEngine {
         // 2) mmproj: проектор повреждён/несовместим → рестарт БЕЗ mmproj
         //    (текстовый режим), вместо падения всего чата.
         // 3) VL-модель требует проектор, а мы его не передали → рестарт С ним.
-        let mut engine_child: Option<std::process::Child> = None;
+        let engine_child: Option<std::process::Child>;
         let mut tried_no_reasoning = false;
         let mut tried_no_mmproj = false;
         let mut tried_with_mmproj = false;
@@ -936,7 +936,7 @@ impl LlamaEngine {
                 spawn_stderr_reader(stderr);
             }
 
-            let mut deadline = Instant::now() + HEALTH_TIMEOUT;
+            let deadline = Instant::now() + HEALTH_TIMEOUT;
             let mut last_progress_log = Instant::now();
             let mut exit_code: Option<i32> = None;
             let mut healthy = false;
@@ -1076,7 +1076,7 @@ impl LlamaEngine {
 
         let child = engine_child.expect("engine child after successful launch");
 
-        let mut engine = Self {
+        let engine = Self {
             global_ctx_limit,
             model_path: model_path.clone(),
             mmproj_path: if attempt_mmproj { mmproj_orig.clone() } else { None },
@@ -3558,7 +3558,7 @@ mod tests {
             .build()
             .expect("client");
 
-        let mut resp = client
+        let resp = client
             .get(format!("http://{}/v1/chat/completions", addr))
             .send()
             .expect("send");

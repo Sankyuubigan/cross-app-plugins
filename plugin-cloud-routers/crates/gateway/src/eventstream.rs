@@ -1,3 +1,6 @@
+// Заготовки Kiro-протокола: активная разработка (PRP 16.11.26), не мёртвый код.
+#![allow(dead_code)]
+
 //! Декодер бинарного AWS EventStream (ответ Kiro-инференса).
 //!
 //! Формат фрейма (подтверждено `open-sse/utils/awsEventStream.js` 9Router):

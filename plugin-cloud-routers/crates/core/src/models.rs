@@ -300,7 +300,7 @@ mod tests {
 
     #[test]
     fn resolve_combo_rejects_provider_without_models() {
-        let mut ps = vec![provider("groq", &[])];
+        let ps = vec![provider("groq", &[])];
         assert!(resolve_combo(&ps, "groq/m1").is_none());
     }
 

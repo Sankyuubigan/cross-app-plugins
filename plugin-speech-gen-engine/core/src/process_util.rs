@@ -6,6 +6,9 @@
 //!    гарантирующий, что ОС сама убьёт дерево при насильственном закрытии/краше.
 //! 3. [`kill_active_engines`] — глобальная зачистка зомби при старте и выходе.
 
+// Зеркало Win32-структур (JOBOBJECT/IO_COUNTERS): имена полей фиксированы WinAPI, не snake_case.
+#![allow(non_snake_case)]
+
 use std::process::Child;
 
 #[cfg(windows)]

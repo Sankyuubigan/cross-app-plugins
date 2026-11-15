@@ -75,7 +75,7 @@ fn generate_text_blocking(app: &AppHandle, req: GenerateTextRequest) -> Result<S
     ));
 
     let engine_dir = commands::get_engine_dir(app);
-    let mut engine = engine::LlamaEngine::new(
+    let engine = engine::LlamaEngine::new(
         &engine_dir,
         &model_path,
         ctx_limit,

@@ -235,7 +235,7 @@ fn copy_voice_inherits_and_skips_cleanly() {
 fn declared_voice_without_file_degrades_not_breaks() {
     let root = voice_root("degrade");
     let src = png_source(&root, "s.png", 64, 64);
-    let card = save_refmod_card_in(&root, "test_char", "Тест", "", &[src]).unwrap();
+    let _card = save_refmod_card_in(&root, "test_char", "Тест", "", &[src]).unwrap();
     set_card_voice_in(&root, "test_char", &sine_wav_bytes(44_100, 1, 0.02),
         Some("пропавший".to_string()))
     .unwrap();

@@ -399,6 +399,8 @@ mod tests {
     }
 
     #[test]
+    // oldText — точное имя параметра API, оставляю в названии теста.
+    #[allow(non_snake_case)]
     fn edit_file_empty_oldText_rejected_in_edits() {
         let d = tmpdir("fs", "edit_empty");
         fs::write(d.join("v.txt"), "x").unwrap();

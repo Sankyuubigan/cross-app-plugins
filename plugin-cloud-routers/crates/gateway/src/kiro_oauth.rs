@@ -1,3 +1,6 @@
+// Заготовки Kiro-протокола: активная разработка (PRP 16.11.26), не мёртвый код.
+#![allow(dead_code)]
+
 //! OAuth Device Flow для Kiro (AWS Builder ID / IAM Identity Center).
 //!
 //! Спека — `docs/kiro-protocol.md`. Поток (подтверждено кодом 9Router):
