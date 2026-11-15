@@ -30,9 +30,9 @@
 
 | Плагин | Идентификатор | Назначение | Web Component |
 |--------|---------------|------------|---------------|
-| `tauri-plugin-logs` | `logs` | Единый `log::Log`: файл лога + `test/last_logs.txt` + UI-вкладка + опц. аналитика | `<logs-panel>` |
-| `tauri-plugin-about-updates` | `about-updates` | Версия, проверка обновлений, история релизов GitHub, откат | `<about-updates-panel>` |
-| `tauri-plugin-speech` | `speech` | TTS/STT (движок CrispASR, голоса, модели) | да |
+| `plugin-log-collector` | `logs` | Единый `log::Log`: файл лога + `test/last_logs.txt` + UI-вкладка + опц. аналитика | `<logs-panel>` |
+| `plugin-about-updates` | `about-updates` | Версия, проверка обновлений, история релизов GitHub, откат | `<about-updates-panel>` |
+| `plugin-speech-gen-engine` | `speech` | TTS/STT (движок CrispASR, голоса, модели) | да |
 
 `tauri-build-toolkit/` — отдельный Node-CLI пакет для сборки/препа/релиза хост-проектов
 (не плагин; дока — `tauri-build-toolkit/docs/README.md`).
@@ -74,7 +74,7 @@
 
 ## Сборка артефактов плагина
 
-В папке конкретного плагина (пример `tauri-plugin-logs`):
+В папке конкретного плагина (пример `plugin-log-collector`):
 
 ```bash
 npm install              # один раз (devDeps: typescript, esbuild)
@@ -90,7 +90,7 @@ JS из корня плагина.
 ```toml
 # src-tauri/Cargo.toml
 [dependencies]
-tauri-plugin-logs = { path = "../../cross-app-plugins/tauri-plugin-logs" }
+plugin-log-collector = { path = "../../cross-app-plugins/plugin-log-collector" }
 ```
 
 ```json

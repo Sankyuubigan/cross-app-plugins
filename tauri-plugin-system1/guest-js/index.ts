@@ -137,7 +137,7 @@ export function decide(request: DecisionRequest): Promise<DecisionResult> {
   return invoke<DecisionResult>('plugin:system1|decide', { request })
 }
 
-/** Событие прогресса скачивания (от `tauri-plugin-downloader`). */
+/** Событие прогресса скачивания (от `plugin-downloader`). */
 export interface DownloadProgress {
   url?: string
   dest?: string

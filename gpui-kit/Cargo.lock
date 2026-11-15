@@ -4223,7 +4223,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "logs-core"
+name = "log-collector-core"
 version = "0.1.0"
 dependencies = [
  "chrono",
@@ -4587,7 +4587,7 @@ dependencies = [
  "lb-wry",
  "llama-engine-core",
  "log",
- "logs-core",
+ "log-collector-core",
 ]
 
 [[package]]

@@ -6,10 +6,10 @@
 > так, чтобы по этой доке архитектуру можно было **один-в-один повторить в любом другом
 > Rust/Tauri-проекте**.
 >
-> **Эталонная реализация ( reference implementation ):** `tauri-plugin-logs` (модуль «Логи»:
+> **Эталонная реализация ( reference implementation ):** `plugin-log-collector` (модуль «Логи»:
 > один `log::Log`, файл лога + зеркало `test/last_logs.txt`, UI-вкладка через web-component
 > `<logs-panel>`) — первый плагин, доведённый до стандарта BOTH-канала (npm **и** vanilla).
-> `tauri-plugin-about-updates` и `tauri-plugin-speech` следуют тому же стандарту.
+> `plugin-about-updates` и `plugin-speech-gen-engine` следуют тому же стандарту.
 >
 > **Ключевой принцип:** модуль переиспользуется как **compile-time зависимость** (path-зависимость
 > в `Cargo.toml`), GUI переиспользуется через **Web Component** (фреймворк-агностично). JS-сторона
@@ -23,7 +23,7 @@
 cross-app-plugins/                      ← отдельный git-репозиторий (НЕ внутри хост-проекта)
 ├─ Cargo.toml                          ← workspace: members + [workspace.dependencies]
 ├─ PLUGIN_STANDARD.md                  ← эта дока (SSOT инженерного стандарта)
-└─ tauri-plugin-logs/                  ← один плагин = крейт + npm-пакет + iife-глобал
+└─ plugin-log-collector/                  ← один плагин = крейт + npm-пакет + iife-глобал
    ├─ Cargo.toml                       ← links + build-dep tauri-plugin
    ├─ build.rs                         ← COMMANDS + Bundle.New(COMMANDS).global_api_script_path(...)
    ├─ src/                             ← Rust: lib.rs, commands.rs, models.rs, logger.rs, path.rs ...
@@ -39,8 +39,8 @@ cross-app-plugins/                      ← отдельный git-репози�
 
 repos-control/                         ← ХОСТ (vanilla, без npm/бандлера)
 ├─ src-tauri/
-│  ├─ Cargo.toml                       ← path = "../../cross-app-plugins/tauri-plugin-logs"
-│  ├─ main.rs                          ← .plugin(tauri_plugin_logs::init())
+│  ├─ Cargo.toml                       ← path = "../../cross-app-plugins/plugin-log-collector"
+│  ├─ main.rs                          ← .plugin(plugin_log_collector::init())
 │  ├─ tauri.conf.json                  ← "plugins": { "logs": {...} }, "withGlobalTauri": true
 │  └─ capabilities/default.json        ← "logs:default"
 └─ ui/index.html                       ← <logs-panel></logs-panel> — и всё (JS плагина вшит Tauri)
@@ -49,10 +49,52 @@ repos-control/                         ← ХОСТ (vanilla, без npm/бан�
 **Три имени плагина (важно не путать):**
 | Что | Пример | Где используется |
 |-----|--------|-------------------|
-| Cargo-пакет | `tauri-plugin-logs` | имя папки/крейта, `links` в `Cargo.toml` |
-| Rust-lib ( crate name ) | `tauri_plugin_logs` | `tauri_plugin_logs::init()` в хосте |
+| Cargo-пакет | `plugin-log-collector` | имя папки/крейта, `links` в `Cargo.toml` |
+| Rust-lib ( crate name ) | `plugin_log_collector` | `plugin_log_collector::init()` в хосте |
 | plugin-identifier | `logs` | `Builder::new("logs")` → invoke `plugin:logs\|<cmd>` и capability `logs:default` |
 | npm-пакет | `@my-tauri-plugins/plugin-logs` | `import` во фронтенде bundler-хоста |
+
+---
+
+## 0.1 Универсальный плагин (ОБЯЗАТЕЛЬНЫЙ стандарт, 15.11.26)
+
+**Каждый новый плагин обязан быть универсальным:** работать и в Tauri-хостах (King Orch, vanilla/bundler),
+и в не-Tauri фронтендах (GPUI/egui — VibeBridge). Плагин, вызываемый только через `AppHandle`,
+универсальным не считается.
+
+Структура (на примере любого плагина):
+
+```
+plugin-<domain>/                  ← фасад (крейт с tauri)
+├─ Cargo.toml                     ← links = "tauri-plugin-<старый-id>" (см. §4.1 — НЕ имя пакета!)
+├─ core/                          ← ЯДРО: крейт <domain>-core БЕЗ tauri (SSOT всей логики)
+│  ├─ Cargo.toml                  ← никаких tauri/tauri-plugin-зависимостей
+│  └─ src/                        ← вся бизнес-логика + юнит-тесты
+└─ src/                           ← тонкий фасад: pub use core::* + AppHandle-мосты
+```
+
+Правила:
+
+1. **Ядро (`core/`) без tauri.** Вся логика, команды-«рабочие лошадки», конфиг-работа — в ядре.
+   Вместо `AppHandle` — инъекции: колбэки/хуки (`set_progress_hook`, `set_emit_hook`,
+   `set_fallback_downloader`, `set_track_hook`), пути параметром (`data_dir: &Path`).
+   Тесты ядра не требуют Tauri-окружения.
+2. **Фасад тонкий:** `pub use core::*;` + `#[tauri::command]`-обёртки + AppHandle-мосты.
+   Мост обязан давать **ОБЕ сигнатуры**: старую с `AppHandle` (Tauri-хосты не переписываются) и
+   новую без (GPUI-хосты зовут ядро напрямую). Явные `pub fn` затеняют glob-реэкспорт —
+   glob + явные мосты в одном модуле работают (прецедент: `engine::config::load_config`).
+   Одинаковые имена/форматы событий (emit `x:progress` и т.п.) сохраняются — JS-канал не меняется.
+3. **Фронтенд — два носителя из одного стандарта:**
+   - Tauri-хосты: Web Component (`guest-js/` + `api-iife.js`, §5) — как раньше;
+   - GPUI-хосты: карточка в `gpui-kit` за фичей (`log-collector`, `llama`, `about-updates`, …),
+     реэкспорт через `my-gpui-kit` — хост не линкует tauri.
+   Логика UI дублируется минимально: WC — рендер, GPUI-карточка — рендер; состояние/вызовы — ядро.
+4. **Событие/конфиг/пути**: конфиг-значения ядро принимает параметрами; фасад достаёт их из
+   `tauri.conf.json` (`api.config()`) и передаёт в ядро. Дефолты — в ядре.
+5. **Что НЕ переносить в ядро:** `app.exit()`, диалоги окна, реєстрацию плагина, emit-протокол —
+   фасад (3-5 строк на мост).
+6. **Эталоны паттерна:** `plugin-llama-engine` и `plugin-log-collector` (ядро+фасад+мосты),
+   `gpui-kit` — носитель GPUI-фронтенда. Новые плагины делать строго по ним.
 
 ---
 
@@ -65,7 +107,7 @@ repos-control/                         ← ХОСТ (vanilla, без npm/бан�
 ```toml
 [workspace]
 resolver = "2"
-members = ["tauri-plugin-about-updates", "tauri-plugin-speech", "tauri-plugin-logs", "json-store"]
+members = ["plugin-about-updates", "plugin-speech-gen-engine", "plugin-log-collector", "json-store"]
 
 [workspace.dependencies]
 tauri = { version = "2", features = [] }
@@ -124,25 +166,32 @@ json-store = { path = "../json-store" }
 
 ```toml
 [package]
-name = "tauri-plugin-logs"
+name = "plugin-log-collector"
 version = "0.1.0"
 edition = "2021"
-links = "tauri-plugin-logs"        # ← ОБЯЗАТЕЛЬНО (без пробелов, с дефисами)
+links = "tauri-plugin-logs"           # ← ОБЯЗАТЕЛЬНО; идентификатор-namespace, а НЕ имя пакета!
 
 [dependencies]
 tauri = { workspace = true }
 # ...
 
 [lib]
-name = "tauri_plugin_logs"
+name = "plugin_log_collector"
 path = "src/lib.rs"
 
 [build-dependencies]
 tauri-plugin = { version = "2", features = ["build"] }   # ← для permissions + глobal-скрипта
 ```
 
-> ⚠️ Без `links`/`build.rs` permissions не сгенерятся → хост упадёт с
-> `permission "logs:default" not found`. Без `global_api_script_path` не будет vanilla-канала.
+> ⚠️ **`links` — НЕ имя крейта, а ключ линковки + namespace permissions.** Cargo строит из него
+> env `DEP_{LINKS}_PERMISSION_FILES_PATH`, а `tauri-build` хоста, разобрав имя, выводит из links
+> plugin-identifier (для `links = "tauri-plugin-logs"` → `logs`). Capability `logs:default`,
+> invoke `plugin:logs|...` и runtime `Builder::new("logs")` завязаны на этот identifier.
+> **При переименовании пакета `links` НЕ меняется** (универсальность: имя плагина может быть
+> `plugin-log-collector`, но links остаётся `tauri-plugin-logs`). Смена links на имя пакета
+> → сборка хоста падает: `Permission logs:default not found` (verified 15.11.26).
+> Без `links`/`build.rs` permissions не сгенерятся вообще. Без `global_api_script_path`
+> не будет vanilla-канала.
 
 ### 4.2 `build.rs` — команды + `global_api_script_path` (vanilla-канал)
 
@@ -165,8 +214,8 @@ fn main() {
 `#[derive(Deserialize)]` паникует на старте хоста:
 `invalid type: null, expected struct Config`. Поэтому **всегда** пишем
 кастомный `Deserialize`, который через `Option::<...>::deserialize`
-трактует `null` как `Default::default()` (см. `tauri-plugin-cloud-routers` /
-`tauri-plugin-downloader`). Не добавляйте плагин в хост без этой защиты.
+трактует `null` как `Default::default()` (см. `plugin-cloud-routers` /
+`plugin-downloader`). Не добавляйте плагин в хост без этой защиты.
 
 ```rust
 use serde::Deserialize;
@@ -186,7 +235,7 @@ impl<'de> Deserialize<'de> for Config {
     // Для конфига с полями: Option::<ConfigInner>::deserialize → map → unwrap_or_default
 }
 
-/// Вызывается из хоста: `.plugin(tauri_plugin_logs::init())`.
+/// Вызывается из хоста: `.plugin(plugin_log_collector::init())`.
 pub fn init<R: Runtime>() -> TauriPlugin<R, Config> {
     Builder::<R, Config>::new("logs")
         .setup(|app, api| { /* инициализация состояния, log::Log, путь last_logs */ Ok(()) })
@@ -354,7 +403,7 @@ permissions = [ "allow-get-last-logs-path", /* ... */ ]
 
 ```toml
 [dependencies]
-tauri-plugin-logs = { path = "../../cross-app-plugins/tauri-plugin-logs" }
+plugin-log-collector = { path = "../../cross-app-plugins/plugin-log-collector" }
 ```
 Плюс зависимости `package.json`/npm НЕ нужны — они только для bundler-хостов (см. §7.5).
 
@@ -362,7 +411,7 @@ tauri-plugin-logs = { path = "../../cross-app-plugins/tauri-plugin-logs" }
 
 ```rust
 // в цепочке .plugin(...):
-.plugin(tauri_plugin_logs::init())
+.plugin(plugin_log_collector::init())
 // УБРАТЬ из invoke_handler дублирующие команды, которые теперь в плагине.
 ```
 
@@ -386,7 +435,7 @@ tauri-plugin-logs = { path = "../../cross-app-plugins/tauri-plugin-logs" }
 ### 7.5 Фронтенд — ДВА канала (выбери один для своего хоста)
 
 **A. Хост с npm/бандлером** — npm-канал: `package.json` хоста
-`"@my-tauri-plugins/plugin-logs": "file:../cross-app-plugins/tauri-plugin-logs"`, затем
+`"@my-tauri-plugins/plugin-logs": "file:../cross-app-plugins/plugin-log-collector"`, затем
 `import "@my-tauri-plugins/plugin-logs";` (side-effect → регистрация WC). Официальный путь для
 bundler-проектов.
 
@@ -411,20 +460,26 @@ JS плагина вшит в бинарник Тauri и вставлен до �
 
 ## 9. Чек-лист создания/переноса плагина
 
-1. Создать папку `tauri-plugin-<name>/` как member workspace `cross-app-plugins`.
-2. `Cargo.toml`: `links` + `[build-dependencies] tauri-plugin`.
+1. Создать папку `plugin-<name>/` как member workspace `cross-app-plugins`
+   (+ `plugin-<name>/core/` — ядро `<name>-core` без tauri, §0.1).
+2. `Cargo.toml`: `links = "tauri-plugin-<id>"` (namespace, НЕ имя пакета!) +
+   `[build-dependencies] tauri-plugin`; деп ядра `core` path.
 3. `build.rs`: `COMMANDS` + `.global_api_script_path("./api-iife.js")` + `.build()`.
 4. `lib.rs`: `Config`, `PluginState`, `init<R: Runtime>()`, `generate_handler!`.
-5. Команды — строго `pub fn cmd<R: Runtime>(app: AppHandle<R>, ...)`.
+5. Команды — строго `pub fn cmd<R: Runtime>(app: AppHandle<R>, ...)`; логика — в ядре,
+   фасад только мосты с ОБЕИМИ сигнатурами (§0.1 п.2).
 6. `permissions/default.toml`: `allow-*` на каждую команду + все в `[default]`.
 7. `package.json`/`tsconfig.json`: scripts `build` (tsc) + `build:global` (esbuild), devDeps
    `typescript` + `esbuild`.
 8. `guest-js/index.ts` (`plugin:<id>|<cmd>`) + `web-components.ts` (WC, `var(--token)`).
 9. `guest-js/iife-entry.ts` + шимы `@tauri-apps/*` (глобалы `window.__TAURI__.*`) — §5.4, §10.3.
 10. Собрать и закоммитить `dist-js/` И `api-iife.js`.
-11. Хост: path-зависимость `../../`, `.plugin(...)`, capability `<id>:default`, `plugins.<id>`
-    в конфиге; фронтенд — тег WC (vanilla) или `import` (npm).
-12. `npm install` + `npm run build` + `npm run build:global` в плагине → `.bat` хоста.
+11. GPUI-фронтенд: карточка в `gpui-kit` за фичей + реэкспорт из `my-gpui-kit` (§0.1 п.3).
+12. Хост: path-зависимость `../../`, `.plugin(...)`, capability `<id>:default`, `plugins.<id>`
+    в конфиге; фронтенд — тег WC (vanilla) или `import` (npm); GPUI-хост — ядро напрямую + кит.
+13. `npm install` + `npm run build` + `npm run build:global` в плагине → `.bat` хоста.
+14. Валидация универсальности: `cargo check` ядра отдельно (0 tauri-символов) + тесты ядра +
+    `build.bat` обоих типов хостов (Tauri и GPUI).
 
 ---
 
@@ -434,7 +489,11 @@ JS плагина вшит в бинарник Тauri и вставлен до �
 - **Debug-бинарь грузит `devUrl`, а не `frontendDist`** — standalone только через `tauri build`
   (фича `custom-protocol`). В этом проекте dev-режим вообще запрещён.
 - **`sccache` ломает C-сборку** — чисти `CC`/`CXX`/`rustc-wrapper` (см. `desktop_rust_tauri_rules.md` §5.1).
-- **«permission not found»** → нет `links`/`build.rs` ИЛИ команда не во всех трёх местах.
+- **«permission not found»** → нет `links`/`build.rs` ИЛИ команда не во всех трёх местах, ИЛИ
+  `links` ≠ `tauri-plugin-<id>` (переименование пакета с правкой links ломает namespace — §4.1).
+- **Переименование папки/пакета плагина — править ВСЕ path-ссылки**: Cargo path-депы хостов,
+  **npm `file:`-пути в `package.json` bundler-хостов** (vite: `Rollup failed to resolve import`),
+  gpui-kit-депы, workspace members. Опущенный npm `file:`-путь ловится только на сборке хоста.
 - **`E0277: AppHandle: CommandArg`** → команда не `<R: Runtime>`-дженерик.
 - **`config().version` — `Option<String>`** → `app.package_info().version`.
 - **Неверный путь зависимости** → от `src-tauri/` пиши `../../cross-app-plugins/...`, не `../`.
@@ -447,6 +506,9 @@ JS плагина вшит в бинарник Тauri и вставлен до �
   `global_api_script_path`, ИЛИ у хоста выключен `withGlobalTauri`.
 - **Порядок iife при связанных плагинах** (напр. logs зависит от dialog): главный скрипт биндится на
   глобал зависимого плагина **в момент вызова**, а не при загрузке → связь по порядку не критична.
+- **Facades: glob-реэкспорт + явные мосты** (`pub use core::*` + `pub fn load_config(&AppHandle)…`)
+  — легально: явные items затеняют glob. НО следи, чтобы мосты не потеряли старые сигнатуры —
+  Tauri-хосты падают с `E0061` (аргументов больше, чем у ядра).
 
 ---
 
@@ -542,7 +604,7 @@ function logPlugin(msg: string): void {
 
 ## 11. Планы (следующие модули)
 
-`tauri-plugin-llama-engine` (GUI + логика движка llama.cpp) и др. — те же принципы: Rust-крейт +
+`plugin-llama-engine` (GUI + логика движка llama.cpp) и др. — те же принципы: Rust-крейт +
 Web Component + **два JS-канала** (npm `dist-js` + vanilla `api-iife.js`).
 
 ---

@@ -1,12 +1,12 @@
 @echo off
 setlocal enableextensions
 set PLUGIN=%1
-if "%PLUGIN%"=="" set PLUGIN=tauri-plugin-llama-engine
+if "%PLUGIN%"=="" set PLUGIN=plugin-llama-engine
 shift
 
 rem Цели cargo test. Без второго аргумента — только unit-тесты крейта (--lib)
 rem с 4 потоками. Со вторым аргументом — цели и флаги тестов передаются как есть:
-rem   test-plugin.bat tauri-plugin-about-updates --test rollback_download -- --ignored --nocapture
+rem   test-plugin.bat plugin-about-updates --test rollback_download -- --ignored --nocapture
 rem (shift в bat не меняет %*, поэтому позиционные аргументы собираем явно)
 set CUSTOM=%1 %2 %3 %4 %5 %6 %7 %8 %9
 

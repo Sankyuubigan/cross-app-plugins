@@ -16,8 +16,8 @@ license = "MIT"
 
 [features]
 default = []
-# Логи: LogsPanel — хвост лог-файла (logs-core) + arboard-копирование.
-logs = ["dep:logs-core", "dep:arboard"]
+# Логи: LogsPanel — хвост лог-файла (log-collector-core) + arboard-копирование.
+log-collector = ["dep:log-collector-core", "dep:arboard"]
 # llama-engine: LlamaSettingsCard — выбор модели из конфига движка.
 llama = ["dep:llama-engine-core"]
 # LegacyWebViewHost: gpui-webview (тот же пин семьи 0.9.1) + lb-wry builder.
@@ -30,9 +30,9 @@ webview = ["dep:gpui-webview", "dep:wry"]
 gpui-kit = { version = "=0.9.1" }
 log = { version = "0.4", features = ["std"] }
 # Чистые ядра плагинов (без tauri) — под фичами, чтобы базовый кит не тянул тяжёлое.
-logs-core = { path = "../tauri-plugin-logs/core", optional = true }
+log-collector-core = { path = "../plugin-log-collector/core", optional = true }
 arboard = { version = "3", optional = true }
-llama-engine-core = { path = "../tauri-plugin-llama-engine/core", optional = true }
+llama-engine-core = { path = "../plugin-llama-engine/core", optional = true }
 # LegacyWebViewHost (фича webview): gpui-webview — тот же репо longbridge,
 # семья 0.9.1 едет вместе с gpui-kit — обновлять синхронно тем же циклом.
 gpui-webview = { version = "=0.9.1", optional = true }

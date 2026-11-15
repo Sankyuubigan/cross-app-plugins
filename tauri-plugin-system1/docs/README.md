@@ -72,9 +72,9 @@ KingOrchData/system1/runtime/onnxruntime.dll
 
 - `<exe>/laya/` ставился установщиком через `bundle.resources`, а глобальная
   документация требует обратного: движок «**не бандлится** в приложение, он
-  скачивается пользователем» (`tauri-plugin-llama-engine/docs/llama_cpp_engine.md §1`, `tauri-plugin-speech/docs/crispasr_engine.md §1`),
+  скачивается пользователем» (`plugin-llama-engine/docs/llama_cpp_engine.md §1`, `plugin-speech-gen-engine/docs/crispasr_engine.md §1`),
   и `bundle.resources` «бандлит только `agents/`, `mcp_servers/`, каталоги и
-  `*.json`» (`tauri-plugin-llama-engine/docs/llama_cpp_engine.md §1`, `tauri-plugin-speech/docs/crispasr_engine.md §1`);
+  `*.json`» (`plugin-llama-engine/docs/llama_cpp_engine.md §1`, `plugin-speech-gen-engine/docs/crispasr_engine.md §1`);
 - `%SystemRoot%\System32` проверяться не должен: там встречается посторонняя
   `onnxruntime.dll`, не экспортирующая `OrtGetApiBase`, и её загрузка дала бы
   пользователю «сломано» вместо внятного «не найдено, вот путь»
@@ -90,13 +90,13 @@ KingOrchData/system1/runtime/onnxruntime.dll
 Модель весит 646 870 871 байт, ONNX Runtime — 15 809 848. Ни то, ни другое не
 едет в инсталлер: каждое обновление приложения тащило бы их заново. Оба
 скачиваются по требованию в `KingOrchData/system1/` — так же, как
-`tauri-plugin-llama-engine` скачивает движок и `.gguf`.
+`plugin-llama-engine` скачивает движок и `.gguf`.
 
 Каталог с ревизией и контрольными суммами — `src/catalog.rs`. Ревизия
 закреплена коммитом `d9d003d5…`, а не веткой `main`: ветка может уехать под тем
 же именем, и проверка целостности станет ложной.
 
-Скачивание идёт через `tauri-plugin-downloader` — единый движок хоста (multi-chunk,
+Скачивание идёт через `plugin-downloader` — единый движок хоста (multi-chunk,
 resume, зеркало HuggingFace, событие `downloader:progress`). Свой загрузчик
 означал бы второй механизм доставки файлов в том же приложении.
 

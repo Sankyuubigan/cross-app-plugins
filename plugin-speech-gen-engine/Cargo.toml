@@ -1,0 +1,56 @@
+[package]
+name = "plugin-speech-gen-engine"
+version = "0.1.0"
+edition = "2021"
+links = "tauri-plugin-speech"
+description = "Reusable CrispASR TTS/STT engine (prebuilt subprocess + HTTP/WS) with settings panels for Tauri apps"
+license = "MIT"
+
+[dependencies]
+tauri = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+zip = { workspace = true }
+
+# Проверка SHA256SUMS релиза speech.cpp (движок диалога)
+sha2 = { workspace = true }
+
+# Скачивание файлов — ЕДИНЫЙ движок проекта (core §2.1 SSOT).
+# Раньше плагин держал свою копию на голом reqwest: без stall-детекта, без
+# таймаутов и без фолбэков. Из-за этого один зависший ответ CDN (0 байт по
+# 2+ минуты) навечно блокировал tts_download_engine — команда не возвращалась,
+# прогресс не показывался, в логах было пусто. Здесь stall 60с + 6 уровней
+# фолбэка (reqwest → curl → PowerShell → bitsadmin → MCP → Chrome) + логи.
+plugin-downloader = { path = "../plugin-downloader" }
+
+# Аудио: декод ogg/vorbis/wav/flac/mp3/opus, шумоподавление RNNoise, ресемплинг
+symphonia = { workspace = true }
+hound = { workspace = true }
+opus = { workspace = true }
+ogg = { workspace = true }
+nnnoiseless = { workspace = true }
+rubato = { workspace = true }
+audioadapter-buffers = { workspace = true }
+
+# STT WebSocket клиент + инжекция текста
+tungstenite = { workspace = true }
+arboard = { workspace = true }
+windows = { workspace = true }
+
+# Логи: через log! макросы в единый кастомный log::Log логгер хоста (core rules §2.5)
+log = { workspace = true }
+
+# Сохранение озвучки в MP3 (команда `tts_save_mp3`).
+# Pure Rust, ноль зависимостей, без build.rs — сборка хоста не компилирует C++.
+rusty_mp3 = { workspace = true }
+
+[lib]
+name = "plugin_speech_gen_engine"
+path = "src/lib.rs"
+
+[build-dependencies]
+tauri-plugin = { version = "2", features = ["build"] }

@@ -185,7 +185,7 @@ pub async fn download_all<R: Runtime>(app: AppHandle<R>) -> Result<ModelState, S
 /// Отдельная команда сохранена для сценария «модель удалили, рантайм на месте».
 /// Для установки с нуля панель зовёт [`download_all`].
 ///
-/// Прогресс идёт через `tauri-plugin-downloader` (единый движок скачивания
+/// Прогресс идёт через `plugin-downloader` (единый движок скачивания
 /// хоста), поэтому UI получает `downloader:progress` без собственной реализации.
 #[tauri::command]
 pub async fn download_model<R: Runtime>(

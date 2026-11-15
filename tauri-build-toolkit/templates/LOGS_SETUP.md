@@ -1,7 +1,7 @@
-# Подключение tauri-plugin-logs (единый лог вывода приложения)
+# Подключение plugin-log-collector (единый лог вывода приложения)
 
-Виджет «Логи» вынесен в переиспользуемый плагин `tauri-plugin-logs`
-(репозиторий: `D:\Projects\cross-app-plugins\tauri-plugin-logs`).
+Виджет «Логи» вынесен в переиспользуемый плагин `plugin-log-collector`
+(репозиторий: `D:\Projects\cross-app-plugins\plugin-log-collector`).
 Плагин: один `log::Log` (включая host RSL при дебаге), файл `king_orch.log` рядом
 с exe, dev-зеркало `test/last_logs.txt`, «Последние логи» в Store, опциональный
 облачный репорт и аналитика Aptabase (поле `project`).
@@ -10,7 +10,7 @@
 
 ### 1. Rust-зависимость (`src-tauri/Cargo.toml`)
 ```toml
-tauri-plugin-logs = { path = "../../cross-app-plugins/tauri-plugin-logs" }
+plugin-log-collector = { path = "../../cross-app-plugins/plugin-log-collector" }
 log = "0.4"
 ```
 
@@ -39,11 +39,11 @@ log = "0.4"
 Плагин Wry-only: `init()` не-generic.
 ```rust
 tauri::Builder::default()
-    .plugin(tauri_plugin_logs::init())
+    .plugin(plugin_log_collector::init())
     .setup(|app| {
         // выключить облако, пока не зарегистрирован app_key
-        tauri_plugin_logs::set_reporting_enabled(false);
-        tauri_plugin_logs::track_event("app_started", None);
+        plugin_log_collector::set_reporting_enabled(false);
+        plugin_log_collector::track_event("app_started", None);
         Ok(())
     })
     .run(tauri::generate_context!())
@@ -53,12 +53,12 @@ tauri::Builder::default()
 ### 5. Логирование на бэкенде
 ```rust
 log::info!/warn!/error!("...")                    // локально
-tauri_plugin_logs::track_event("имя", Some(json!({...})))  // локально + облако
+plugin_log_collector::track_event("имя", Some(json!({...})))  // локально + облако
 ```
 
 ### 6. Фронтенд (`package.json`)
 ```json
-"dependencies": { "@my-tauri-plugins/plugin-logs": "file:../cross-app-plugins/tauri-plugin-logs" }
+"dependencies": { "@my-tauri-plugins/plugin-logs": "file:../cross-app-plugins/plugin-log-collector" }
 ```
 ```ts
 import "@my-tauri-plugins/plugin-logs";           // side-effect: ловит ошибки UI

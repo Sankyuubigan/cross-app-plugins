@@ -109,7 +109,7 @@ export declare function removeModel(modelId?: string): Promise<void>;
  * Плагин не решает, какой вердикт «правильный» — пороги и критерии живут в хосте.
  */
 export declare function decide(request: DecisionRequest): Promise<DecisionResult>;
-/** Событие прогресса скачивания (от `tauri-plugin-downloader`). */
+/** Событие прогресса скачивания (от `plugin-downloader`). */
 export interface DownloadProgress {
     url?: string;
     dest?: string;

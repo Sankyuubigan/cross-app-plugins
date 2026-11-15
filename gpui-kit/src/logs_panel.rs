@@ -1,9 +1,9 @@
 //! LogsPanel — вкладка «Логи» кита (фича `logs`): хвост лог-файла (последние
-//! 400 строк, паритет egui/веб-компонентов tauri-plugin-logs) + кнопки
+//! 400 строк, паритет egui/веб-компонентов plugin-log-collector) + кнопки
 //! Копировать / Сохранить… / Очистить / Обновить.
 //!
 //! Панель самодостаточна: в дефолтном режиме она сама читает хвост и путь
-//! из `logs-core` при каждом рендере. Хост, ведущий drain-цикл (VibeBridge),
+//! из `log-collector-core` при каждом рендере. Хост, ведущий drain-цикл (VibeBridge),
 //! передаёт хвост через [`LogsPanel::tail`] — тогда чтение отключается, а
 //! кнопка «Обновить» вызывает [`LogsPanel::on_refresh`].
 //!
@@ -26,7 +26,7 @@ use gpui_kit::{
     App, InteractiveElement as _, IntoElement, ParentElement as _, RenderOnce, SharedString,
     StatefulInteractiveElement as _, Styled, StyleRefinement, Window, div, px,
 };
-use logs_core::logger;
+use log_collector_core::logger;
 
 /// Сколько последних строк лога показываем (паритет egui logs_view.rs).
 const LOG_TAIL_LINES: usize = 400;
@@ -67,7 +67,7 @@ impl LogsPanel {
         self
     }
 
-    /// Явный путь лог-файла (иначе — `logs_core::logger::log_file_path()`).
+    /// Явный путь лог-файла (иначе — `log_collector_core::logger::log_file_path()`).
     pub fn path(mut self, path: PathBuf) -> Self {
         self.path = Some(path);
         self

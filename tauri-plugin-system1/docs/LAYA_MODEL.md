@@ -1568,7 +1568,7 @@ System-1 — это отдельная переиспользуемая спос
 | Модель | `model.onnx`, 646 870 871 Б, sha256 `0b095e00…8310c` |
 | Токенизатор | `tokenizer.json`, `tokenizer_config.json` — оба с sha256 |
 | Где живёт | `KingOrchData/system1/models/laya-multilingual-onnx/` |
-| Скачивание | `tauri-plugin-downloader` хоста (multi-chunk + `downloader:progress`) |
+| Скачивание | `plugin-downloader` хоста (multi-chunk + `downloader:progress`) |
 | CPU | `ort` с `load-dynamic`, EP по умолчанию |
 
 **Модель не бандлится в инсталлер** (+646 МБ к каждому обновлению) — она живёт в
@@ -1591,12 +1591,12 @@ DLL **не** линкуется статически и **не** едет в и�
 так же, как движки llama.cpp и CrispASR.
 
 Основание в глобальной документации:
-- `tauri-plugin-llama-engine/docs/llama_cpp_engine.md §1` — движок «**не собирается** и **не бандлится** в
+- `plugin-llama-engine/docs/llama_cpp_engine.md §1` — движок «**не собирается** и **не бандлится** в
   приложение. Он скачивается **пользователем**»;
-- `tauri-plugin-llama-engine/docs/llama_cpp_engine.md §1` — «**В `tauri.conf.json` движок не прописан** —
+- `plugin-llama-engine/docs/llama_cpp_engine.md §1` — «**В `tauri.conf.json` движок не прописан** —
   `bundle.resources` бандлит только `agents/`, `mcp_servers/`, каталоги и
   `*.json`»;
-- `tauri-plugin-speech/docs/crispasr_engine.md §1` — то же для CrispASR: «не бандлится», «это НЕ
+- `plugin-speech-gen-engine/docs/crispasr_engine.md §1` — то же для CrispASR: «не бандлится», «это НЕ
   Tauri sidecar, бинарь ищется в рантайме по пути».
 
 Доставка: zip `onnxruntime-win-x64-1.28.0.zip` с официального релиза Microsoft →

@@ -21,7 +21,7 @@ const EXCLUDE_EXTENSIONS = ['.png', '.jpg', '.jpeg', '.ico', '.exe', '.sys', '.d
 // Файлы-логи сборки: сюда попадает перенаправленный stdout/stderr, их кодировка
 // не имеет отношения к исходникам и всегда будет битой из-за консоли Windows.
 const EXCLUDE_FILES = ['build_out.txt', 'build_err.txt', 'npm-debug.log', 'yarn-error.log',
-    // Зеркало лога приложения (tauri-plugin-logs). Содержит stdout/stderr
+    // Зеркало лога приложения (plugin-log-collector). Содержит stdout/stderr
     // внешних процессов — llama-server печатает ANSI-цветом, и escape-последовательности
     // попадают в файл как есть. Это вывод программы, а не исходник:
     // кодировка тут не имеет отношения к тому, что проверяем.

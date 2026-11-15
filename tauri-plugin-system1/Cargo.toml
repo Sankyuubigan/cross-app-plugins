@@ -25,7 +25,7 @@ tokenizers = { workspace = true }
 ndarray = { workspace = true }
 
 # Единый движок скачивания хоста (SSOT): multi-chunk + прогресс `downloader:progress`.
-tauri-plugin-downloader = { path = "../tauri-plugin-downloader" }
+plugin-downloader = { path = "../plugin-downloader" }
 
 [build-dependencies]
 tauri-plugin = { version = "2", features = ["build"] }

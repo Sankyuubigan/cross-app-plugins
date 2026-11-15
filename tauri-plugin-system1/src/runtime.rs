@@ -4,9 +4,9 @@
 //!
 //! Оба нативных движка проекта так устроены и это зафиксировано в глобальной
 //! документации: движок «**не собирается и не бандлится** в приложение, он
-//! скачивается пользователем» (`tauri-plugin-llama-engine/docs/llama_cpp_engine.md §1`,
-//! `tauri-plugin-speech/docs/crispasr_engine.md §1`), а `bundle.resources` «бандлит только `agents/`,
-//! `mcp_servers/`, каталоги и `*.json`» (`tauri-plugin-llama-engine/docs/llama_cpp_engine.md §1`).
+//! скачивается пользователем» (`plugin-llama-engine/docs/llama_cpp_engine.md §1`,
+//! `plugin-speech-gen-engine/docs/crispasr_engine.md §1`), а `bundle.resources` «бандлит только `agents/`,
+//! `mcp_servers/`, каталоги и `*.json`» (`plugin-llama-engine/docs/llama_cpp_engine.md §1`).
 //! ONNX Runtime — такой же движок, поэтому ставится тем же способом: с сервера,
 //! в данные пользователя, со сверкой хэша.
 
@@ -15,7 +15,7 @@ use std::sync::OnceLock;
 
 use crate::catalog;
 use crate::paths;
-use tauri_plugin_downloader::{download as download_file, DownloadOptions};
+use plugin_downloader::{download as download_file, DownloadOptions};
 
 /// Версия ONNX Runtime.
 ///

@@ -1,7 +1,7 @@
 VS=D:\Programs\Microsoft Visual Studio\2022\BuildTools
-   Compiling tauri-plugin-llama-engine v0.1.0 (D:\Projects\my-tauri-plugins\tauri-plugin-llama-engine)
+   Compiling plugin-llama-engine v0.1.0 (D:\Projects\my-tauri-plugins\plugin-llama-engine)
 warning: value assigned to `engine_child` is never read
-   --> tauri-plugin-llama-engine\src\engine\llm.rs:620:17
+   --> plugin-llama-engine\src\engine\llm.rs:620:17
     |
 620 |         let mut engine_child: Option<std::process::Child> = None;
     |                 ^^^^^^^^^^^^
@@ -10,7 +10,7 @@ warning: value assigned to `engine_child` is never read
     = note: `#[warn(unused_assignments)]` on by default
 
 warning: variable does not need to be mutable
-   --> tauri-plugin-llama-engine\src\engine\llm.rs:643:17
+   --> plugin-llama-engine\src\engine\llm.rs:643:17
     |
 643 |             let mut deadline = Instant::now() + HEALTH_TIMEOUT;
     |                 ----^^^^^^^^
@@ -20,7 +20,7 @@ warning: variable does not need to be mutable
     = note: `#[warn(unused_mut)]` on by default
 
 warning: variable does not need to be mutable
-   --> tauri-plugin-llama-engine\src\engine\llm.rs:742:13
+   --> plugin-llama-engine\src\engine\llm.rs:742:13
     |
 742 |         let mut engine = Self {
     |             ----^^^^^^
@@ -28,16 +28,16 @@ warning: variable does not need to be mutable
     |             help: remove this `mut`
 
 warning: variable does not need to be mutable
-  --> tauri-plugin-llama-engine\src\generate.rs:62:9
+  --> plugin-llama-engine\src\generate.rs:62:9
    |
 62 |     let mut engine = engine::LlamaEngine::new(
    |         ----^^^^^^
    |         |
    |         help: remove this `mut`
 
-warning: `tauri-plugin-llama-engine` (lib test) generated 4 warnings (run `cargo fix --lib -p tauri-plugin-llama-engine --tests` to apply 3 suggestions)
+warning: `plugin-llama-engine` (lib test) generated 4 warnings (run `cargo fix --lib -p plugin-llama-engine --tests` to apply 3 suggestions)
     Finished `test` profile [unoptimized + debuginfo] target(s) in 4.14s
-     Running unittests src\lib.rs (target\debug\deps\tauri_plugin_llama_engine-ed05ea201fee6da7.exe)
+     Running unittests src\lib.rs (target\debug\deps\plugin_llama_engine-ed05ea201fee6da7.exe)
 
 running 106 tests
 test engine::detokenizer::tests::both_empty ... ok

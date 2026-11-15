@@ -8,7 +8,7 @@
 //!
 //! Состав (фичи — чтобы хост тянул только нужное):
 //! - default: тема [`setup_theme`] + SSOT-палитра [`palette`] (Шаг 1);
-//! - `"logs"`: LogsPanel (Шаг 3); `"llama"`: LlamaSettingsCard (Шаг 3);
+//! - `"log-collector"`: LogsPanel (Шаг 3); `"llama"`: LlamaSettingsCard (Шаг 3);
 //!   `"webview"`: LegacyWebViewHost (Шаг 4) — добавляются по мере реализации.
 //!
 //! Ключевое правило темы (урок VibeBridge): `Theme::change` сбрасывает colors
@@ -20,14 +20,14 @@ pub mod palette;
 pub mod shell;
 pub mod theme;
 
-#[cfg(feature = "logs")]
+#[cfg(feature = "log-collector")]
 pub mod logs_panel;
 #[cfg(feature = "llama")]
 pub mod llama_settings;
 #[cfg(feature = "webview")]
 pub mod webview_host;
 
-#[cfg(feature = "logs")]
+#[cfg(feature = "log-collector")]
 pub use logs_panel::LogsPanel;
 #[cfg(feature = "llama")]
 pub use llama_settings::{LlamaModelItem, LlamaSettingsCard};

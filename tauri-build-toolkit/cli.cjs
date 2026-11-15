@@ -9,7 +9,7 @@
 //   version    - bump version only (YY.M.P) and print
 //   doctor     - print resolved project settings + git safety checks (read-only)
 //   init       - scaffold .bat templates + .build-config.json into a project
-//                (--with-logs — вложить в проект гайд подключения tauri-plugin-logs)
+//                (--with-logs — вложить в проект гайд подключения plugin-log-collector)
 
 const { loadProjectConfig } = require('./lib/config.cjs');
 const { isolateBuildTemp, SPAWNING_COMMANDS } = require('./lib/scratch.cjs');

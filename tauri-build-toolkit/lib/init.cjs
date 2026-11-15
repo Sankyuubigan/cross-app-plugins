@@ -1,6 +1,6 @@
 // init: скопировать .bat-шаблоны в корень проекта + создать .build-config.json
 // из примера (если ещё нет). Шаблоны разворачиваются с CRLF (окончания Windows).
-// Опция --with-logs: вложить LOGS_SETUP.md (гайд подключения tauri-plugin-logs).
+// Опция --with-logs: вложить LOGS_SETUP.md (гайд подключения plugin-log-collector).
 
 const fs = require('fs');
 const path = require('path');
@@ -80,14 +80,14 @@ function run(cfg, opts = {}) {
             console.log('exists, skip        :', guideDest);
         } else {
             fs.writeFileSync(guideDest, asCrlf(fs.readFileSync(guideSrc, 'utf8')), 'utf8');
-            console.log('wrote               :', guideDest, '(гайд tauri-plugin-logs)');
+            console.log('wrote               :', guideDest, '(гайд plugin-log-collector)');
         }
     }
 
     if (withLogs) {
         console.log('\n[logs] Инструкция подключения: ' + LOGS_GUIDE_NAME);
     } else {
-        console.log('\n(подсказка: `init --with-logs` вложит гайд подключения tauri-plugin-logs)');
+        console.log('\n(подсказка: `init --with-logs` вложит гайд подключения plugin-log-collector)');
     }
     console.log('\nNext: edit .build-config.json, then run build.bat.');
     return true;

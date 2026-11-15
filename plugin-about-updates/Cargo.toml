@@ -1,0 +1,30 @@
+[package]
+name = "plugin-about-updates"
+version = "0.1.0"
+edition = "2021"
+links = "tauri-plugin-about-updates"
+description = "Reusable About/Updates panel (GitHub Releases history + rollback) as a Tauri plugin"
+license = "MIT"
+
+[dependencies]
+tauri = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+# Единый движок скачивания (SSOT) для установщиков/откатов версий.
+plugin-downloader = { path = "../plugin-downloader" }
+# Атомарные записи JSON в app_data_dir (отчёт об установке) — PLUGIN_STANDARD §2.
+json-store = { path = "../json-store" }
+
+[lib]
+name = "plugin_about_updates"
+path = "src/lib.rs"
+
+[build-dependencies]
+tauri-plugin = { version = "2", features = ["build"] }
+
+[dev-dependencies]
+tokio = { workspace = true }

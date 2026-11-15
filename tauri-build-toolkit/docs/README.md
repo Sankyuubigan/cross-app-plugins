@@ -19,7 +19,7 @@
 | `version`   | только бамп версии по схеме `YY.M.P` и печать                                                                                                 |
 | `doctor`    | read-only диагностика: конфиг, git origin, repo-guard, путь ключа подписи                                                                     |
 | `init`      | раскладка `.bat`-шаблонов и `.build-config.json` в корень проекта                                                                            |
-| `init --with-logs` | то же + вкладывает `LOGS_SETUP.md` — пошаговый гайд подключения `tauri-plugin-logs` (вкладка «Логи», `log::Log`, файл лога рядом с exe)      |
+| `init --with-logs` | то же + вкладывает `LOGS_SETUP.md` — пошаговый гайд подключения `plugin-log-collector` (вкладка «Логи», `log::Log`, файл лога рядом с exe)      |
 
 ## Подключение к проекту (механизм интеграции)
 
@@ -27,7 +27,7 @@
 2. **Раскидай `.bat`-обёртки** (одним из способов):
    ```powershell
    node <toolkit>\cli.cjs init --project "D:\Projects\<my_app>"
-   node <toolkit>\cli.cjs init --with-logs --project "D:\Projects\<my_app>"   # + гайд подключения tauri-plugin-logs
+   node <toolkit>\cli.cjs init --with-logs --project "D:\Projects\<my_app>"   # + гайд подключения plugin-log-collector
    ```
    Либо скопируй `templates\build.bat`, `generate_installer.bat`, `release.bat`, `test.bat` в корень проекта вручную. Окончания строк — CRLF, кодировка ASCII.
 3. **Создай `.build-config.json`** в корне проекта (см. `.build-config.example.json`). Минимум обязателен `repo`; остальное либо опционально, либо автодетектится:

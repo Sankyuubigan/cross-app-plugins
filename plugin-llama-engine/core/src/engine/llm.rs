@@ -1,0 +1,3676 @@
+#![allow(deprecated)]
+
+//! LlamaEngine — управление движком llama.cpp как ОТДЕЛЬНЫМ ПРОЦЕССОМ (llama-server).
+//!
+//! Новая архитектура (как в Jan): приложение не линкует llama.cpp (нет PE-импортов,
+//! нет DLL рядом с exe). При каждом запросе движок запускается как subprocess,
+//! общение — по HTTP (localhost):
+//!   - GET  /health   — проверка готовности
+//!   - POST /completion (stream) — генерация (текст и мультимодалка через multimodal_data)
+//!   - POST /tokenize — точный подсчёт токенов
+//! Процесс гарантированно убивается при Drop (drop(self.child) в конце запроса).
+
+use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use reqwest::blocking::Client;
+use reqwest::header::AUTHORIZATION;
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+
+use crate::engine::config::ModelParams;
+use crate::engine::detokenizer::compute_stream_diff;
+use crate::engine::stream_diagnostics::{
+    ResponseMeta, ServerHealth, ServerProcessSnapshot, ServerProcessState, ServerTrace,
+    StreamDiagnostics, StreamReaderError,
+};
+
+pub use super::llm_types::{ChatAttachment, PromptFormat, LlmMessage, extract_model_filename, GenerationResult, LlmMetrics, GrammarSpec, build_base_grammar, build_json_only_grammar, build_json_object_grammar_with_keys, get_hybrid_grammar, get_hybrid_grammar_with_think_budget, get_json_contract_grammar, auto_think_budget_chars, auto_think_budget_chars_with_envelope, strict_json_string_rules, ENVELOPE_TOKENS, CHARS_PER_TOKEN, THINK_BODY_RULE, ToolDefinition, FunctionDef, ToolCall};
+pub use super::llm_gguf::{extract_string_from_gguf, extract_f32_from_gguf, extract_u32_from_gguf, extract_gguf_arch, extract_u32_with_arch};
+
+/// Таймаут ожидания готовности движка (загрузка модели в память)
+const HEALTH_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Таймауты фаз HTTP-обмена с `llama-server`.
+///
+/// Раньше стоял один `READ_TIMEOUT = 120 с`, но он НИКОГДА не срабатывал по
+/// назначению: ниже по умолчанию у `reqwest::blocking` лежит собственный
+/// таймаут 30 с (`Timeout::default()` в `reqwest/src/blocking/client.rs`),
+/// и он обрывает тело ответа в `Response::read` раньше нашего watchdog.
+/// Итог: на слабой машине (префилл промпта > 30 с) любой запрос падал с
+/// «operation timed out» задолго до первого токена — при живом, работающем
+/// движке. Поэтому дефолт reqwest отключается явно (см. `Client::builder`),
+/// а сторожевые таймеры ведёт сам движок — по фазам, у каждой своя семантика:
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamTimeouts {
+    /// Фаза A: от отправки POST до HTTP-статуса ответа. Движок может
+    /// молча ждать свободный слот, пока обслуживает чужой запрос.
+    pub headers: Duration,
+    /// Фаза B: от HTTP-200 до первого байта SSE. Это ВЕСЬ prompt eval:
+    /// `llama-server` не отдаёт ни одного байта, пока считает промпт, поэтому
+    /// бюджет должен покрывать префилл всей истории, а не «секунду-две».
+    pub first_token: Duration,
+    /// Фаза C: между соседними строками SSE после первого байта. Генерация
+    /// идёт — значит, движок жив; 60 с тишины это уже реальный завис.
+    pub inter_token: Duration,
+}
+
+impl Default for StreamTimeouts {
+    fn default() -> Self {
+        Self {
+            headers: Duration::from_secs(300),
+            // 10 минут: с запасом на префилл ~20k токенов на медленном CPU/GPU.
+            first_token: Duration::from_secs(600),
+            inter_token: Duration::from_secs(60),
+        }
+    }
+}
+
+impl StreamTimeouts {
+    /// Таймаут ожидания следующей строки SSE для текущей фазы стрима.
+    /// `seen_any_line` — пришло ли хоть что-то от сервера.
+    pub fn wait_for(&self, seen_any_line: bool) -> Duration {
+        if seen_any_line {
+            self.inter_token
+        } else {
+            self.first_token
+        }
+    }
+}
+
+const STREAM_RETRY_MARKER: &str = "[stream-retry-before-first-token]";
+
+/// Свежесть stderr-прогресса движка для liveness-сторожа: `print_timing`
+/// печатается каждые ~3 сек (лог 30.10.26: n_gen = 100→302 с шагом 3 сек),
+/// порог 10 сек — ~3-кратный запас на jitter планировщика.
+const STREAM_LIVENESS_FRESH_MS: u64 = 10_000;
+/// Жёсткий кап ожидания от старта генерации, даже если stderr показывает
+/// свежий прогресс. Ограничивает патологию «сервер генерирует, SSE не отдаёт
+/// ничего» навсегда (незакрытый think/tool-call). 600 сек больше худшего
+/// легитимного молчания на целевой машине: think до 1500 токенов при 3 t/s
+/// = 500 сек + префилл ~20 сек. Совпадает с бюджетом `first_token`, поэтому
+/// кап ничего не урезает по сравнению с прежним поведением префилла.
+const STREAM_LIVENESS_HARD_CAP: Duration = Duration::from_secs(600);
+
+/// stderr-строка означает «движок занят работой» (префилл или генерация).
+/// llama-server (verbosity 3) печатает `slot print_timing` каждые ~3 сек:
+/// префилл — `prompt processing, n_tokens = …, progress = 0.77`, генерация —
+/// `n_gen = 302, tg = 5.09 t/s`. Старые сборки вместо этого печатают
+/// `prompt eval progress` / `eval progress`. Оба класса строк появляются
+/// ТОЛЬКО пока движок реально считает.
+fn stderr_line_shows_progress(line: &str) -> bool {
+    line.contains("print_timing") || line.contains("eval progress")
+}
+
+/// Зеркалить ли строку stderr движка в лог приложения. Строки прогресса
+/// (`print_timing` / `eval progress`) — рутинный тайминг, а не ошибки: в лог
+/// приложения они не идут (спам «slot print_timing», решение владельца
+/// 14.11.26), но остаются доступными сторожу живости
+/// (`engine_last_progress_ms`) и диагностике падений (`server_trace`).
+/// Гейт использует ТОТ ЖЕ классификатор, что и сторож, — разойтись они
+/// не могут (инцидент 30.10.26: сторож и зеркало читают одни и те же строки).
+fn stderr_line_mirrors_to_log(line: &str) -> bool {
+    !stderr_line_shows_progress(line)
+}
+
+/// Мс-таймштап «сейчас» (unix epoch) — единая шкала для stderr-насосов и сторожа.
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Решение сторожа при таймауте SSE: ждать ли дальше.
+/// Свежий stderr-прогресс при недостижимом капе = движок генерирует, но
+/// SSE-буферизация (дифф-парсер llama.cpp молчит, пока не закрыт `<think>`,
+/// ggml-org/llama.cpp#15000) — обрывать нельзя (инцидент 30.10.26: 4 стрима
+/// убиты на 60-й сек, stderr при этом печатал n_gen каждые 3 сек).
+/// Тишина движка (прогресса нет ≥ 10 сек) или превышен кап — обрыв/ретрай.
+fn stream_timeout_should_wait(total_elapsed: Duration, progress_age_ms: u64) -> bool {
+    total_elapsed < STREAM_LIVENESS_HARD_CAP && progress_age_ms < STREAM_LIVENESS_FRESH_MS
+}
+
+/// Диапазон портов для локального сервера
+const PORT_MIN: u16 = 17800;
+const PORT_RANGE: u16 = 1500;
+
+/// Резерв ОЗУ для системы/приложения при прогнозе pinned-буферов BeeLlama.
+const BEE_LLAMA_RAM_RESERVE_MB: f64 = 2048.0;
+
+/// Оценка pinned-потребности BeeLlama в ОЗУ (МБ) по размеру контекста.
+/// Замеры крэшей 30.10.26 (ctx=20390, дословно из лога): 4 811 427 936 Б =
+/// 4588 МиБ и 5 650 288 736 Б = 5388 МиБ → 236-277 КиБ/токен. Берём верхнюю
+/// границу 280 КиБ/токен: прогноз завышает, но не пропускает реальный отказ.
+/// Это ОЦЕНКА, а не точная формула — решение по ней принимает только прогноз
+/// (ram_forecast_notice), отказ ловит детектор текстов (is_host_memory_oom_text).
+fn beellama_pinned_ram_need_mb(ctx_tokens: u32) -> f64 {
+    ctx_tokens as f64 * 280.0 / 1024.0
+}
+
+/// Базовые стоп-слова, одинаковые для всех моделей
+const DEFAULT_STOP_WORDS: &[&str] = &[
+    "<|im_end|>", "<end_of_turn>", "</s>", "<|eot_id|>",
+    "<turn>", "<|eot|>", "User:", "System:", "<eos>",
+    "<turn|>", "/end_of_turn>", "<step>", "<|end_of_text|>", "<｜end of sentence｜>",
+    "</start_of_turn>", "<|channel|>",
+];
+
+/// Прогноз потребления VRAM для заданного размера контекста:
+/// размер файла модели + KV-кэш (зависит от архитектуры GGUF и n_ctx).
+///
+/// KV-кэш считается по реальным параметрам архитектуры из метаданных GGUF
+/// Единственная точка расчёта VRAM — `infra::vram_estimate` (SSOT, см. модуль).
+/// Все формульные фрагменты здесь запрещены: расхождение между UI и логом — баг.
+///
+/// Legacy-флаги `kv_quant_*` уточняют q8_0 для источников БЕЗ своего runtime;
+/// runtime источника (BeeLlama KVarN + tail) их ПЕРЕКРЫВАЕТ (`current_kv_spec`).
+pub fn estimate_vram_mb(model_path: &str, ctx_size: u32, kv_quant_keys: bool, kv_quant_values: bool) -> f64 {
+    let spec = crate::engine::vram_estimate::current_kv_spec(kv_quant_keys, kv_quant_values);
+    crate::engine::vram_estimate::estimate_vram_with_spec(model_path, ctx_size, &spec).total_mb
+}
+
+/// Прогноз VRAM с ЯВНЫМ KV-spec (когда `SourceSpec` уже в скоупе — pre-flight).
+pub fn estimate_vram_mb_with_spec(model_path: &str, ctx_size: u32, spec: &crate::engine::vram_estimate::KvQuantSpec) -> f64 {
+    crate::engine::vram_estimate::estimate_vram_with_spec(model_path, ctx_size, spec).total_mb
+}
+
+pub struct LlamaEngine {
+    pub global_ctx_limit: u32,
+    pub model_path: String,
+    pub mmproj_path: Option<String>,
+    /// true = движок запущен с mmproj (может принимать изображения)
+    pub is_multimodal_engine: bool,
+    stream_cb: Arc<dyn Fn(String) + Send + Sync>,
+    /// Канал размышлений модели (`reasoning_content` в SSE). Отдельный от
+    /// `stream_cb` намеренно: у llama.cpp с `--reasoning-format deepseek`
+    /// мысли приходят отдельным полем и НЕ являются частью ответа — смешивать
+    /// их с текстом значит испортить разбор JSON-envelope у агентов Method 3.
+    /// RefCell: меняется через setter после создания (метод на &self).
+    /// Дефолт — no-op, поэтому хост, которому показывать мысли не нужно,
+    /// ничего не меняет.
+    reasoning_cb: std::cell::RefCell<Arc<dyn Fn(String) + Send + Sync>>,
+    /// Канал логов движка (нужен для stderr-ридера при перезапуске из-за CUDA OOM)
+    log_cb: Arc<dyn Fn(String) + Send + Sync>,
+    client: Client,
+    server_log: PathBuf,
+    server_trace: ServerTrace,
+    /// Форматированный счётчик уже обработанных строк llama_server.log
+    /// (дигностика: привязка LCP/граф-строк сервера к запросу клиента).
+    server_log_line_count: std::sync::Mutex<usize>,
+    port: u16,
+    api_key: String,
+    child: std::sync::Mutex<Option<Child>>,
+    /// Текущее значение -ngl (оффлоад). Меняется на меньшее при автоперезапуске
+    /// после CUDA OOM (внутренняя изменяемость — генерация идёт через &self).
+    current_ngl: std::cell::Cell<u32>,
+    /// Параметры, достаточные для перезапуска llama-server с новым -ngl (после OOM).
+    respawn_ctx: Option<Box<RespawnCtx>>,
+    /// Режим работы: "gpu" (модель реально загружена в VRAM) или "cpu".
+    /// RefCell — режим меняется при автоперезапуске после OOM (метод на &self).
+    engine_mode: std::cell::RefCell<String>,
+    /// Причина CPU-режима (пустая строка, если режим GPU)
+    engine_mode_detail: std::cell::RefCell<String>,
+    /// Занятая VRAM (байты, device-level) ДО старта движка — база для дельты пиков
+    vram_before: u64,
+    /// Скорость последней генерации (tok/s)
+    last_tok_per_sec: std::cell::Cell<f64>,
+    /// Грамматика для СЛЕДУЮЩЕГО вызова generate_chat (consume-and-clear).
+    /// Per-node/per-agent грамматика задаётся через set_grammar() перед вызовом;
+    /// если не задана — generate_chat подставляет базовую (текст|JSON).
+    pending_grammar: std::sync::Mutex<Option<GrammarSpec>>,
+    /// Инструменты (OpenAI tools[]) для СЛЕДУЮЩЕГО вызова generate_chat/
+    /// generate_chat_multimodal (consume-and-clear, как pending_grammar).
+    /// Задаются через set_tools() перед вызовом; если заданы — грамматика
+    /// (GBNF/JSON-schema) принудительно гасится: llama.cpp запрещает кастомную
+    /// грамматику вместе с tools[] (HTTP 400).
+    pending_tools: std::sync::Mutex<Option<Vec<ToolDefinition>>>,
+    /// Мс-таймштап (unix) последнего признака генеративного прогресса движка
+    /// в stderr. Обновляют оба stderr-насоса (старт + respawn), читает сторож
+    /// стрима: отличает «движок считает, но SSE буферизует» от «движок умер».
+    engine_last_progress_ms: Arc<AtomicU64>,
+}
+
+/// Снимок параметров запуска llama-server, достаточных для авто-перезапуска
+/// с меньшим -ngl при CUDA OOM (см. respawn_with_ngl). Хранится в движке один раз.
+struct RespawnCtx {
+    server_exe: PathBuf,
+    engine_dir: PathBuf,
+    threads: i32,
+    reasoning_budget: u32,
+    kv_quant_keys: bool,
+    kv_quant_values: bool,
+    /// KV-spec источника (KVarN/tail BeeLlama) — для оценок OOM-ретрая и peak-line.
+    kv_spec: crate::engine::vram_estimate::KvQuantSpec,
+    /// Финальные флаги запуска ПОСЛЕ фолбэков цикла запуска (реально применились).
+    reasoning_enabled: bool,
+    is_pre_hopper: bool,
+    /// PATH с общей папкой CUDA-рантайма (`backends/_cudart/<семейство>/`).
+    /// None для CPU/Vulkan/HIP и старых установок, где DLL лежат рядом с exe.
+    cudart_path: Option<String>,
+}
+
+// ─── Простой ГПСЧ для порта/ключа (без внешних зависимостей) ───
+struct Prng(u64);
+impl Prng {
+    fn new() -> Self {
+        let t = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        let pid = std::process::id() as u64;
+        let mut seed = t ^ (pid << 32) ^ (pid.rotate_left(17));
+        if seed == 0 { seed = 0x9E3779B97F4A7C15; }
+        Prng(seed)
+    }
+    fn next(&mut self) -> u64 {
+        // xorshift64*
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x.wrapping_mul(0x2545F4914F6CDD1D)
+    }
+}
+
+impl LlamaEngine {
+    pub fn new<L, S>(engine_dir: &Path, model_path: &str, global_ctx_limit: u32, kv_quant_keys: bool, kv_quant_values: bool, reasoning_budget: u32, log_cb: L, stream_cb: S) -> Result<Self, String>
+    where L: Fn(String) + Send + Sync + 'static, S: Fn(String) + Send + Sync + 'static
+    {
+        Self::new_with_mmproj(engine_dir, model_path, None, global_ctx_limit, kv_quant_keys, kv_quant_values, reasoning_budget, log_cb, stream_cb)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_mmproj<L, S>(engine_dir: &Path, model_path: &str, mmproj_path: Option<&str>, global_ctx_limit: u32, kv_quant_keys: bool, kv_quant_values: bool, reasoning_budget: u32, log_cb: L, stream_cb: S) -> Result<Self, String>
+    where L: Fn(String) + Send + Sync + 'static, S: Fn(String) + Send + Sync + 'static
+    {
+        let log_cb: std::sync::Arc<dyn Fn(String) + Send + Sync> = std::sync::Arc::new(log_cb);
+        log_cb("⚡ Запуск движка llama.cpp (llama-server)...".to_string());
+
+        // ── Логирование аппаратного обеспечения ──
+        log_cb("🖥️ Аппаратное обеспечение:".to_string());
+        let mut sys = sysinfo::System::new_all();
+        if let Some(cpu) = sys.cpus().first() {
+            let total_ram_mb = sys.total_memory() / 1024 / 1024;
+            log_cb(format!("   CPU: {} | RAM: {} MB", cpu.brand(), total_ram_mb));
+        }
+
+        let gpu_info = crate::engine::gpu_detector::detect_gpu();
+        log_cb(format!("   GPU: {}", crate::engine::gpu_detector::describe_gpu(&gpu_info)));
+
+        let vram_before = match nvml_wrapper::Nvml::init() {
+            Ok(nvml) => {
+                match nvml.device_by_index(0) {
+                    Ok(device) => {
+                        match device.memory_info() {
+                            Ok(mem) => {
+                                let total_vram_mb = mem.total / 1024 / 1024;
+                                let used_vram_mb = mem.used / 1024 / 1024;
+                                let free_vram_mb = total_vram_mb - used_vram_mb;
+                                let name = device.name().unwrap_or_else(|_| "NVIDIA GPU".to_string());
+                                log_cb(format!("   GPU: {} | VRAM: {} MB (Свободно: {} MB)", name, total_vram_mb, free_vram_mb));
+                                mem.used
+                            },
+                            Err(e) => { log_cb(format!("   GPU: NVML memory_info error: {}", e)); 0 }
+                        }
+                    },
+                    Err(e) => { log_cb(format!("   GPU: NVML device error: {}", e)); 0 }
+                }
+            },
+            Err(e) => {
+                log_cb(format!("   GPU: NVIDIA драйверы не найдены (NVML ошибка: {}).", e));
+                0
+            }
+        };
+
+        let model_size_mb = std::fs::metadata(model_path).map(|m| m.len() as f64 / (1024.0 * 1024.0)).unwrap_or(0.0);
+        log_cb(format!("💽 Файл модели: ~{:.1} МБ.", model_size_mb));
+
+        // ── Единая точка выхода с ошибкой: пишем в лог-файл + телеметрию ──
+        let fail = |msg: String| -> Result<Self, String> {
+            log::error!("LlamaEngine::new: {}", msg);
+            Err(msg)
+        };
+
+        // ── 🛡 mmproj-гард: проектор нельзя запускать как -m ──
+        // add_model и хостовые команды выбора уже отклоняют mmproj
+        // (см. is_mmproj_file),
+        // но легаси-конфиги («отравленные» списки моделей) могут содержать
+        // проектор как путь к модели. Запуск mmproj как LLM роняет llama-server
+        // при обработке промпта. Восстанавливаемся:
+        //   1) обратный маппинг mmproj_files (модель → её проектор);
+        //   2) «братская» LLM в той же папке (единственный не-mmproj .gguf).
+        // Затеняем model_path на String — ниже он может быть подменён.
+        let mut model_path = model_path.to_string();
+        if crate::engine::is_mmproj_file(&model_path) {
+            let cfg_early0 = crate::engine::config::load_config_early();
+            let via_config = cfg_early0
+                .mmproj_files
+                .iter()
+                .find(|(_, v)| v.as_str() == model_path)
+                .map(|(m, _)| m.clone());
+            let resolved = via_config.or_else(|| {
+                crate::engine::find_sibling_llm_for_mmproj(&model_path, &[])
+            });
+            match resolved {
+                Some(llm) => {
+                    let fname = std::path::Path::new(&model_path)
+                        .file_name()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_else(|| model_path.clone());
+                    log::warn!(
+                        "LlamaEngine::new: mmproj «{}» подменён на братскую LLM «{}»",
+                        model_path, llm
+                    );
+                    log_cb(format!(
+                        "⚠️ «{}» — это mmproj (мультимодальный проектор), а не языковая модель. Используется братская LLM «{}».",
+                        fname, llm
+                    ));
+                    model_path = llm;
+                }
+                None => return fail(format!(
+                    "Файл «{}» — это mmproj (мультимодальный проектор для изображений), \
+                     а не языковая модель. Запускать его как LLM нельзя: движок не сможет \
+                     обработать промпт.\n\nРядом не найдена основная LLM (другой .gguf в той же папке).",
+                    model_path
+                )),
+            }
+        }
+
+        // ── Проверка целостности GGUF-файла модели ──
+        // Объективные дефекты файла по спецификации GGUF — фатальная ошибка с
+        // понятным текстом вместо хвоста лога llama-server. Замечания
+        // (например, block_count больше числа blk.N у MTP-моделей Qwen3.5)
+        // запуск не блокируют: единственный источник истины о загружаемости —
+        // сам llama-server.
+        match crate::engine::llm_gguf::validate_gguf_detailed(&model_path) {
+            Err(msg) => return fail(format!("Файл модели повреждён.\n{}", msg)),
+            Ok(warnings) => {
+                for w in warnings {
+                    log::warn!("GGUF-валидация: {}", w);
+                }
+            }
+        }
+
+        // ── Проверка установки движка ──
+        // Бекенд выбирается юзером в настройках (engine_variant в app_config.json,
+        // "auto" → подбор по GPU). Источник бинарей — engine_source
+        // ("ggml-org" / "beellama"). Каждый вариант живёт в backends/<source>/<variant>/.
+        let cfg_early = crate::engine::config::load_config_early();
+        let source_id = crate::engine::sources::resolve_source(cfg_early.engine_source.as_deref());
+        let source_spec = crate::engine::sources::source_spec(&source_id);
+        // Ярлык источника нужен в тексте диагностики ошибки запуска (см. ниже),
+        // а `source_spec` после этого уходит в замыкание `build_cmd` — держим
+        // копию строки, чтобы не зависеть от владения Option.
+        let source_label = source_spec
+            .as_ref()
+            .map(|s| s.label.clone())
+            .unwrap_or_else(|| source_id.clone());
+        let pref = cfg_early.engine_variant.as_deref();
+        let selected_variant = crate::engine::llamacpp_installer::resolve_variant(pref);
+        let installed_family = crate::engine::llamacpp_installer::EngineFamily::from_variant(&selected_variant);
+
+        let mut server_exe = crate::engine::llamacpp_installer::variant_dir(engine_dir, &source_id, &selected_variant).join("llama-server.exe");
+        if !server_exe.exists() {
+            // Legacy-фолбэк: бинарь в корне папки движка (старый формат до миграции)
+            server_exe = engine_dir.join("llama-server.exe");
+        }
+        if !server_exe.exists() {
+            return fail(format!(
+                "Движок llama.cpp не установлен (llama-server.exe не найден для источника «{}», варианта «{}» в {}).\nОткройте Настройки → «Движок запуска нейромоделей» и установите движок.",
+                source_id,
+                crate::engine::llamacpp_installer::variant_label(&selected_variant),
+                engine_dir.display()
+            ));
+        }
+
+        // ── Гарантия рантайма VC++ рядом с движком ──
+        // llama-server.exe (MSVC-сборка llama.cpp) требует VCRUNTIME140.dll. Без неё
+        // процесс падает с 0xC0000135 («система не обнаружила VCRUNTIME140.dll»).
+        // Копируем рантайм из бандла приложения (папка redist рядом с exe) рядом с
+        // движком — чтобы работало «из коробки» без ручной установки VC++ Redistributable.
+        let server_dir = std::path::Path::new(&server_exe)
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| engine_dir.to_path_buf());
+        let vc_log = |s: String| log_cb(s);
+        crate::engine::llamacpp_installer::ensure_vc_redist(&server_dir, &vc_log);
+        let has_runtime = server_dir.join("VCRUNTIME140.dll").exists()
+            || std::path::Path::new(r"C:\Windows\System32\VCRUNTIME140.dll").exists();
+        if !has_runtime {
+            return fail(format!(
+                "Не найден рантайм Visual C++ (VCRUNTIME140.dll) рядом с llama-server.exe и в System32.\n\
+                 Движок llama.cpp не запустится (ошибка 0xC0000135).\n\
+                 Решение: переустановите движок (Настройки → «Движок запуска нейромоделей» → «Переустановить») — установщик автоматически добавит нужные DLL рантайма."
+            ));
+        }
+
+        // ── Предлётная проверка CUDA-рантайма ──
+        // В релизах llama.cpp b10275+ cublas64_*.dll вынесены из архива движка
+        // в отдельный архив cudart. Мы держим их ОДИН раз в `backends/_cudart/`
+        // и подкладываем процессу через PATH. Без них ggml-cuda.dll не грузится
+        // и движок ТИХО уходит в CPU — проверяем заранее и говорим явно.
+        if let Err(msg) = crate::engine::llamacpp_installer::cudart_ready(
+            engine_dir,
+            installed_family,
+            &server_dir,
+        ) {
+            return fail(msg);
+        }
+
+        // ── Совместимость выбранного бекенда с GPU ──
+        // Раньше несовместимость (cuda-12.4 на RTX 50xx) была жёсткой ошибкой.
+        // Теперь выбор бекенда — осознанное решение юзера: предупреждаем, но
+        // запускаем (llama-server сам упадёт в CPU, а VRAM-проверка ниже это
+        // поймает и объяснит причину).
+        let required_gen = crate::engine::gpu_detector::required_cuda_gen(&gpu_info);
+        let required_label = required_gen.map(|g| g.label().to_string()).unwrap_or_else(|| "cpu".to_string());
+        // То же имя, что и в дропдауне Настроек: юзер должен находить нужный
+        // вариант в списке по точному названию из текста ошибки.
+        let recommended_variant = required_gen
+            .map(crate::engine::llamacpp_installer::cuda_gen_variant)
+            .unwrap_or(crate::engine::llamacpp_installer::VARIANT_CPU)
+            .to_string();
+        let recommended_variant_label =
+            crate::engine::llamacpp_installer::variant_label(&recommended_variant).to_string();
+        if required_gen.is_some() {
+            // ── Несовместимость состава сборки с архитектурой видеокарты ──
+            // Жёсткая в обе стороны, потому что в обоих случаях падение
+            // гарантированное и одинаково непонятное юзеру
+            // (`CUDA error: no kernel image is available for execution on the device`):
+            //   • cuda-12.x на Blackwell (sm_120) — в сборке нет ядер sm_120;
+            //   • cuda-13.x на Maxwell/Pascal/Volta — в сборке нет ядер младше
+            //     sm_75 (см. MIN_COMPUTE_MAJOR_CUDA13).
+            // Для 40xx cuda-13.x — лишь предпочтение свежего драйвера,
+            // cuda-12.x при этом работает нормально, поэтому там только лог.
+            if let Some((required_variant, _)) =
+                crate::engine::llamacpp_installer::arch_incompatibility(&gpu_info, &selected_variant)
+            {
+                log_cb(format!(
+                    "❌ Бекенд «{}» не содержит вычислительных ядер для вашей видеокарты {} ({}). \
+                     Модель не сможет работать на GPU.\n\
+                     Решение: Настройки → «Движок запуска нейромоделей» → выберите «{}» и нажмите «Установить».",
+                    crate::engine::llamacpp_installer::variant_label(&selected_variant),
+                    gpu_info.gpu_name,
+                    crate::engine::gpu_detector::compute_label(&gpu_info),
+                    crate::engine::llamacpp_installer::variant_label(required_variant),
+                ));
+            }
+            if installed_family == crate::engine::llamacpp_installer::EngineFamily::Cpu {
+                log_cb(format!(
+                    "ℹ️ Выбран CPU-бекенд, хотя на компьютере есть NVIDIA GPU ({}). GPU-ускорение не будет использоваться. Выбрать CUDA можно в Настройках → «Движок запуска нейромоделей».",
+                    gpu_info.gpu_name
+                ));
+            }
+        }
+
+        let use_gpu = installed_family.is_gpu();
+        let mut gpu_layers: u32 = if use_gpu { 999 } else { 0 };
+
+        // ── Pre-flight VRAM: модель не влезает в GPU? ──
+        // Ступенчатый авто-offload («сколько влезет»), БЕЗ блокирующего диалога:
+        // считаем честную оценку (единый `infra::vram_estimate` — та же формула,
+        // что у счётчика под полем ввода), и если не влезает — урезаем -ngl ровно
+        // до максимального числа слоёв, помещающихся в свободную VRAM. Остальные
+        // слои пойдут в ОЗУ. Юзеру шлём неблокирующее окно-уведомление с фактами
+        // (одна кнопка «ОК»). Враньё «запуск с меньшим -ngl происходит автоматически»
+        // из cuda_oom_friendly_reason тут не нужно — offload честно выполняем ДО старта.
+        // KV-spec = runtime источника (BeeLlama kvarn5/kvarn4+tail) или legacy-чекбоксы:
+        // без этого оценка завышала KV в ~3 раза и -ngl занижался до уровня vanilla.
+        let kv_spec = crate::engine::vram_estimate::kv_spec_from_source(
+            source_spec.as_ref(),
+            kv_quant_keys,
+            kv_quant_values,
+        );
+        // ── Превентивная проверка совместимости движка с архитектурой модели ──
+        // Некоторые движки (BeeLlama с режимом KVarN) не умеют работать с моделями,
+        // у которых часть слоёв делит KV-кэш с предыдущими (Cross-Layer Attention).
+        // Признак берём из метаданных GGUF (`*.attention.shared_kv_layers`), а не из
+        // имени файла — правило универсально и не привязано к конкретным моделям.
+        // Проверка ДО spawn: иначе юзер платит два неудачных запуска (~3 с) и сырой
+        // трейс в логах, а получает тот же текст только постфактум.
+        let diag_ctx = crate::engine::startup_diagnosis::build_context(
+            &gpu_info,
+            &selected_variant,
+            &crate::engine::llamacpp_installer::variant_label(&selected_variant),
+            &source_id,
+            &source_label,
+            kv_spec.tail_tokens,
+            &recommended_variant_label,
+            &model_path,
+        );
+        if let Some(diag) = crate::engine::startup_diagnosis::diagnose_shared_kv_before_spawn(
+            &model_path,
+            &diag_ctx,
+        ) {
+            log::error!("[llama-engine] startup failure (preflight {:?}): {}", diag.kind, diag.log_hint);
+            log_cb(format!("❌ {}", diag.log_hint));
+            return fail(diag.user_message);
+        }
+
+        let mut vram_notice: Option<String> = None;
+        if use_gpu && vram_before > 0 {
+            if let Ok(nvml) = nvml_wrapper::Nvml::init() {
+                if let Ok(device) = nvml.device_by_index(0) {
+                    if let Ok(mem) = device.memory_info() {
+                        let total_vram_mb = mem.total / 1024 / 1024;
+                        let free_vram_mb = mem.free as f64 / (1024.0 * 1024.0);
+                        let est = crate::engine::vram_estimate::estimate_vram_with_spec(
+                            &model_path, global_ctx_limit, &kv_spec,
+                        );
+                        // Запас сверх оценки на фрагментацию/пиковые compute-тензоры
+                        // + CUDA-контекст/драйвер (в breakdown llama это «unaccounted»,
+                        // ~1.3 GiB на RTX; llama-fit-params по умолчанию резервирует 1024 MiB).
+                        // SAFETY_FACTOR митигейт incidents, когда линейная оценка
+                        // «веса + KV» занижает реальный пик (буферы промпт-процессинга
+                        // под ubatch 512 на 12B-моделях заведомо > 256 МБ; на карте
+                        // с двумя параллельными инференсами пик доходил до 98% VRAM
+                        // при расчётных ~60%, после чего драйвер сбрасывал GPU — TDR).
+                        //
+                        // Резерв снижен 1024 → 512 МБ (31.10.26, tasks/31.10.26):
+                        // SAFETY_FACTOR и резерв страхуют ОДНУ И ТУ ЖЕ остаточную
+                        // погрешность, двойной стек на 8 ГБ карте урезал оффлоад
+                        // Орнита до 26-28/32 слоёв → 5 t/s, хотя полный оффлоад
+                        // влезал (замер лога: использовано 4899 МБ, свободно
+                        // осталось ~2800 МБ). Страховка от реальной нехватки —
+                        // существующий respawn по факту отказа аллокации
+                        // (respawn_with_ngl), он честнее прогноза.
+                        const VRAM_RESERVE_MB: f64 = 512.0;
+                        // Решение о резке — ТОЛЬКО по факту (§00.2): измеренные
+                        // компоненты (файл + KV + буферы) + резерв, БЕЗ множителя.
+                        // Инцидент 01.11.26 (лог юзера, 8 ГБ, сборка уже
+                        // с резервом 512): (5167+768+256)×1.25+512 = 8251 МБ >
+                        // свободно 7697 урезало Орнита до 29/32 слоёв → 5 t/s →
+                        // два сгоревших факт-экстрактора = «14 минут юзера».
+                        // Реальный пик VRAM по тому же логу — 5822 МБ, полный
+                        // оффлоад влезал. SAFETY_FACTOR в резку не входит:
+                        // TDR-кейс (два параллельных инференса) закрыт гейтом
+                        // движка (локальные ходы сериализованы), а факт нехватки
+                        // ловит respawn_with_ngl по отказу аллокации — это и есть
+                        // «страховка по факту», признанная в комментарии выше.
+                        const VRAM_SAFETY_FACTOR: f64 = 1.25;
+                        let need_factual_mb = crate::engine::vram_estimate::vram_for_ngl_safe(
+                            &est,
+                            est.num_layers,
+                            VRAM_RESERVE_MB,
+                            1.0,
+                        );
+                        if need_factual_mb > free_vram_mb {
+                            // Ступенчатый offload: максимальное число слоёв из бюджета
+                            // (по той же фактической формуле — фактор в резку не входит).
+                            let new_ngl = crate::engine::vram_estimate::max_fitting_ngl_safe_with_spec(
+                                &model_path, global_ctx_limit, &kv_spec,
+                                free_vram_mb, VRAM_RESERVE_MB, 1.0,
+                            );
+                            let was_ngl = gpu_layers;
+                            gpu_layers = new_ngl.min(gpu_layers);
+                            let components = format!(
+                                "файл {:.0} МБ + KV {:.0} МБ + буферы {:.0} МБ + запас {:.0} МБ",
+                                est.model_mb, est.kv_mb, est.buffers_mb, VRAM_RESERVE_MB
+                            );
+                            let note = format!(
+                                "Pre-flight VRAM: модели по оценке нужно ~{:.0} МБ ({}) — свободно {:.0} МБ из {:.0} МБ. \
+                                 Оффлоад урезан с {} до {} слоёв на GPU, остальные — в ОЗУ (медленнее, но модель запустится).",
+                                need_factual_mb, components, free_vram_mb, total_vram_mb, was_ngl, gpu_layers
+                            );
+                            log_cb(format!("⚠️ {}", note));
+                            log::warn!("{}", note);
+                            // Прогноз, а не факт (G4, tasks/31.10.26): pre-flight
+                            // ОЦЕНИВАЕТ потребность до запуска, и оценка бывала
+                            // завышена (юзер с 8 ГБ: окно заявляло «Не хватает»,
+                            // а модель полностью загрузилась). Формулировка
+                            // живёт в vram::vram_forecast_notice — там же тест,
+                            // запрещающий «Не хватает» в прогнозе. Факт нехватки
+                            // сообщает сам движок отказом аллокации: тот путь
+                            // эмитит vram::vram_oom_fact_notice через notify_vram.
+                            vram_notice = Some(crate::engine::vram::vram_forecast_notice(&note));
+                        } else {
+                            // По фактической формуле влезает — полный оффлоад, резать
+                            // нельзя: множитель — прогнозная перестраховка, а не факт.
+                            // Если даже оценка с фактором не влезает — предупреждение
+                            // ТОЛЬКО в лог (не резка и не уведомление в чат: ложные
+                            // тревоги по прогнозу — анти-паттерн G4). Реальную
+                            // нехватку поймает respawn_with_ngl по факту отказа.
+                            let need_padded_mb = crate::engine::vram_estimate::vram_for_ngl_safe(
+                                &est,
+                                est.num_layers,
+                                VRAM_RESERVE_MB,
+                                VRAM_SAFETY_FACTOR,
+                            );
+                            if need_padded_mb > free_vram_mb {
+                                log::warn!(
+                                    "Pre-flight VRAM: оценка с надёжностью ×{:.2} ~{:.0} МБ превышает свободные {:.0} МБ, но по фактическим компонентам (~{:.0} МБ) влезает — запускаем полный оффлоад; при отказе аллокации движок урежет слои и перезапустится.",
+                                    VRAM_SAFETY_FACTOR, need_padded_mb, free_vram_mb, need_factual_mb
+                                );
+                            }
+                            log_cb(format!(
+                                "💾 Pre-flight VRAM: файл {:.0} МБ + KV {:.0} МБ + буферы {:.0} МБ (итого ~{:.0} МБ с запасом) — свободно {:.0} МБ из {:.0} МБ, полный оффлоад.",
+                                est.model_mb, est.kv_mb, est.buffers_mb, need_factual_mb, free_vram_mb, total_vram_mb
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        let engine_mode = if use_gpu { "gpu".to_string() } else { "cpu".to_string() };
+        // Неблокирующее уведомление юзеру (если pre-flight урезал оффлоад).
+        if let Some(note) = vram_notice {
+            crate::engine::notify_vram(note);
+        }
+
+        // ── RAM-гейт ДО спавна: конфигурация, заведомо не помещающаяся в
+        // системную память, не запускается вовсе. Мгновенная смерть
+        // llama-server посреди работы от исчерпания RAM (os error 10054 без
+        // единой ошибки в stderr — лог юзера, tasks/01.11.26) делается
+        // невозможной у истока, а не лечится ретраем/респауном.
+        // Порядок рычагов: оффлоад уже на потолке VRAM (префлайт выше; поднять
+        // выше нельзя — CUDA OOM, в CPU-режиме GPU нет вообще) → урезание
+        // контекста (KV CPU-слоёв масштабируется от ctx) → честный отказ.
+        const RAM_RESERVE_MB: f64 = 1536.0; // ОС + UI/WebView2 + запас
+        const RAM_MIN_CTX: u32 = 4096;
+        let ram_base_ctx = global_ctx_limit;
+        let mut global_ctx_limit = global_ctx_limit;
+        sys.refresh_memory();
+        let avail_ram_mb = sys.available_memory() as f64 / (1024.0 * 1024.0) - RAM_RESERVE_MB;
+        let ram_est = crate::engine::vram_estimate::estimate_vram_with_spec(&model_path, ram_base_ctx, &kv_spec);
+        let ram_need_mb = crate::engine::vram_estimate::ram_for_ngl_mb(&ram_est, gpu_layers);
+        let ram_need_final_mb = if ram_need_mb > avail_ram_mb {
+            let ctx_new = crate::engine::vram_estimate::max_fitting_ctx_estimate(
+                &ram_est, gpu_layers, ram_base_ctx, avail_ram_mb,
+            );
+            if ctx_new < RAM_MIN_CTX {
+                return fail(format!(
+                    "❌ Запуск отменён: модели с контекстом {} нужно ~{:.0} МБ ОЗУ, доступно ~{:.0} МБ — не хватает даже при минимальном контексте {} токенов. \
+                     Освободите память (закройте другие программы), уменьшите размер контекста в настройках или выберите модель поменьше.",
+                    ram_base_ctx, ram_need_mb, avail_ram_mb, RAM_MIN_CTX
+                ));
+            }
+            let note = format!(
+                "RAM-гейт: контекст урезан {} → {} токенов (доступно ~{:.0} МБ, нужно было ~{:.0} МБ)",
+                ram_base_ctx, ctx_new, avail_ram_mb, ram_need_mb
+            );
+            log_cb(format!("⚠️ {}", note));
+            log::warn!("{}", note);
+            // Симметрично VRAM-notice: урезание RAM-гейта доводится до юзера
+            // (факт — урезание уже свершилось), а не остаётся невидимым в логе.
+            crate::engine::vram::notify_vram(note.clone());
+            global_ctx_limit = ctx_new;
+            crate::engine::vram_estimate::ram_for_ngl_ctx_mb(&ram_est, gpu_layers, ctx_new, ram_base_ctx)
+        } else {
+            ram_need_mb
+        };
+
+        let variant_source = if cfg_early.engine_variant.as_deref().map(|v| v == "auto" || v.is_empty()).unwrap_or(true) {
+            format!("авто-подбор по GPU → {}", required_label)
+        } else {
+            format!("выбран вручную (рекомендация авто-подбора: {})", required_label)
+        };
+        log_cb(format!(
+            "⚙️ Бекенд: {} ({}; {}) | GPU-слои: {} ({})",
+            crate::engine::llamacpp_installer::variant_label(&selected_variant),
+            selected_variant,
+            variant_source,
+            gpu_layers,
+            if use_gpu { "оффлоуд на GPU" } else { "CPU-режим" }
+        ));
+
+        let logical_cores = std::thread::available_parallelism().map(|n| n.get() as i32).unwrap_or(8);
+        let threads = (logical_cores / 2).max(4);
+
+        // ── Случайные порт и ключ ──
+        let mut rng = Prng::new();
+        let mut port = 0u16;
+        for _ in 0..5 {
+            let candidate = PORT_MIN + (rng.next() % PORT_RANGE as u64) as u16;
+            if std::net::TcpListener::bind(("127.0.0.1", candidate)).is_ok() {
+                port = candidate;
+                break;
+            }
+        }
+        if port == 0 {
+            return fail("Не удалось найти свободный порт для движка llama.cpp".to_string());
+        }
+        let api_key: String = (0..32).map(|_| {
+            const HEX: &[u8] = b"0123456789abcdef";
+            HEX[(rng.next() % 16) as usize] as char
+        }).collect();
+
+        let server_log = engine_dir.join("llama_server.log");
+        let _ = std::fs::remove_file(&server_log);
+
+        let use_reasoning_default = reasoning_budget > 0;
+        // mmproj передаётся в llama-server ТОЛЬКО когда он реально нужен
+        // (запрос с изображениями) и файл проектора валиден. Если проектор
+        // битый/несовместимый — движок не должен ронять весь чат: делаем
+        // фолбэк в текстовый режим без mmproj (см. цикл запуска ниже).
+        let mmproj_orig: Option<String> = mmproj_path.map(|s| s.to_string());
+        let mut attempt_mmproj = mmproj_orig.is_some();
+        let mut attempt_reasoning = use_reasoning_default;
+        let auth_value = format!("Bearer {}", api_key);
+        // PDL (Programmatic Dependent Launch) работает только на Hopper (sm_90+).
+        // На Pascal/Turing/Ampere ядро ggml_cuda_kernel_can_use_pdl падает с
+        // "invalid device function" из-за бага в llama.cpp (проверяет ptxVersion,
+        // но не compute capability). Отключаем через env-var.
+        let is_pre_hopper = gpu_info.compute_major > 0 && gpu_info.compute_major < 9;
+
+        // CUDA-DLL лежат ОДИН раз в `backends/_cudart/<семейство>/`, а не рядом
+        // с exe каждого варианта. Windows ищет библиотеки: папка exe → System32 →
+        // PATH, поэтому подкладываем общую папку в PATH дочернего процесса.
+        // None для CPU/Vulkan/HIP и старых установок — тогда PATH не трогаем.
+        let cudart_path =
+            crate::engine::llamacpp_installer::child_path_with_cudart(engine_dir, installed_family);
+        // Клон для замыкания спавна: оригинал ещё нужен для RespawnCtx (перезапуск).
+        let cudart_path_env = cudart_path.clone();
+
+        let build_cmd = {
+            let server_exe = server_exe.clone();
+            let server_log = server_log.clone();
+            let api_key = api_key.clone();
+            let model_path = model_path.clone();
+            move |use_reasoning: bool, use_mmproj: bool| {
+                let mut c = Command::new(&server_exe);
+                if let Some(p) = &cudart_path_env {
+                    c.env("PATH", p);
+                }
+                c.current_dir(engine_dir)
+                    .arg("-m").arg(&model_path)
+                    .arg("--host").arg("127.0.0.1")
+                    .arg("--port").arg(port.to_string())
+                    .arg("--api-key").arg(&api_key)
+                    .arg("--ctx-size").arg(global_ctx_limit.to_string())
+                // Один слот: приложение выполняет запросы строго последовательно,
+                // а llama-server умножает -c на число слотов. Без этого флага
+                // движок брал дефолт n_parallel=4 и резервировал вчетверо больший
+                // KV-кэш (см. SERVER_N_PARALLEL в vram_estimate).
+                .arg("--parallel").arg(crate::engine::vram_estimate::SERVER_N_PARALLEL.to_string())
+                .arg("-t").arg(threads.to_string())
+                .arg("-ngl").arg(gpu_layers.to_string())
+                .arg("--flash-attn").arg("on")
+                .arg("--no-webui")
+                .arg("--jinja")
+                .arg("--log-file").arg(&server_log);
+                if is_pre_hopper {
+                    c.env("GGML_CUDA_PDL", "0");
+                }
+                if use_mmproj {
+                    if let Some(mmp) = mmproj_path {
+                        c.arg("--mmproj").arg(mmp);
+                    }
+                }
+            // KV-квант: дефолт — чекбоксы kv_quant_* → q8_0. Если у источника
+            // задан свой runtime (напр. BeeLlama KVarN) — он ПЕРЕКРЫВАЕТ чекбокс
+            // (передаём ровно один --cache-type-k/v).
+            let src_k = source_spec.as_ref().and_then(|s| s.runtime.cache_type_k.clone());
+            let src_v = source_spec.as_ref().and_then(|s| s.runtime.cache_type_v.clone());
+            if let Some(ck) = src_k {
+                c.arg("--cache-type-k").arg(ck);
+            } else if kv_quant_keys {
+                c.arg("--cache-type-k").arg("q8_0");
+            }
+            if let Some(cv) = src_v {
+                c.arg("--cache-type-v").arg(cv);
+            } else if kv_quant_values {
+                c.arg("--cache-type-v").arg("q8_0");
+            }
+            if let Some(tail) = source_spec.as_ref().and_then(|s| s.runtime.kv_tail_tokens) {
+                c.arg("--kv-tail-tokens").arg(tail.to_string());
+            }
+            if use_reasoning {
+                // Думатель выносится в отдельное поле reasoning_content, ограничен
+                // бюджетом и НЕ сохраняется в истории слота. Если старая версия
+                // движка не знает этих флагов — fallback-перезапуск без них (ниже).
+                c.arg("--reasoning-format").arg("deepseek");
+                c.arg("--reasoning-budget").arg(reasoning_budget.to_string());
+                c.arg("--no-reasoning-preserve");
+            }
+            #[cfg(target_os = "windows")]
+            { use std::os::windows::process::CommandExt; c.creation_flags(0x08000000); }
+            // CUDA/ggml-ошибки идут в stderr (не в --log-file) — захватываем их
+            c.stderr(std::process::Stdio::piped());
+            c
+            }
+        };
+
+        log_cb(format!(
+            "🚀 Запуск llama-server: порт {}, контекст {} токенов, потоков {}, mmproj={}, думатель={}",
+            port,
+            global_ctx_limit,
+            threads,
+            if attempt_mmproj { mmproj_orig.as_deref().unwrap_or("да") } else { "нет" },
+            if use_reasoning_default { format!("до {} токенов (deepseek-формат)", reasoning_budget) } else { "выключен".to_string() }
+        ));
+
+        let client = match Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .tcp_keepalive(Some(Duration::from_secs(30)))
+            .tcp_keepalive_interval(Some(Duration::from_secs(10)))
+            .tcp_nodelay(true)
+            .pool_idle_timeout(Some(Duration::from_secs(300)))
+            // Движок всегда на 127.0.0.1 — системный прокси (Kaspersky/VPN,
+            // detect_and_set_proxy в приложении ставит HTTP(S)_PROXY без
+            // NO_PROXY для localhost) не должен выступать посредником SSE:
+            // буферизация прокси — тот же класс «тихой порчи стрима», что и
+            // think-буфер.
+            .no_proxy()
+            // КРИТИЧНО: у `reqwest::blocking` есть СКРЫТЫЙ таймаут 30 с
+            // (`Timeout::default()`), который обрывает тело ответа в
+            // `Response::read`. На локальном `llama-server` он срабатывал
+            // всегда, когда prompt eval длился дольше 30 с, и обрывал стрим
+            // с «operation timed out» при полностью живом движке — из-за чего
+            // наш собственный watchdog ниже не мог сработать никогда.
+            // Отключаем дефолт: временем жизни обмена управляет `StreamTimeouts`.
+            .timeout(None)
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => return fail(format!("Ошибка создания HTTP-клиента: {}", e)),
+        };
+
+        let server_trace = ServerTrace::new();
+        // Общая ячейка «движок показывает прогресс» — пишут stderr-насосы
+        // (старт + respawn), читает сторож стрима в run_chat_completions.
+        let engine_last_progress_ms = Arc::new(AtomicU64::new(now_unix_ms()));
+        let spawn_stderr_reader = {
+            let log_cb = log_cb.clone();
+            let server_trace = server_trace.clone();
+            let engine_last_progress_ms = engine_last_progress_ms.clone();
+            move |stderr: std::process::ChildStderr| {
+                let log_cb = log_cb.clone();
+                let server_trace = server_trace.clone();
+                let engine_last_progress_ms = engine_last_progress_ms.clone();
+                std::thread::spawn(move || {
+                    use std::io::BufRead;
+                    let reader = std::io::BufReader::new(stderr);
+                    for line in reader.lines() {
+                        let line = match line {
+                            Ok(l) => l,
+                            Err(_) => break,
+                        };
+                        let line = line.trim();
+                        if !line.is_empty() {
+                            if stderr_line_shows_progress(line) {
+                                engine_last_progress_ms.store(now_unix_ms(), Ordering::Relaxed);
+                            }
+                            server_trace.push_stderr(line.to_string());
+                            if stderr_line_mirrors_to_log(line) {
+                                log_cb(format!("[llama-server] {}", line));
+                            }
+                        }
+                    }
+                });
+            }
+        };
+
+        // ── Цикл запуска с фолбэками ──
+        // 1) reasoning-флаги: старая сборка движка не знает --reasoning-* →
+        //    рестарт без них (уже было).
+        // 2) mmproj: проектор повреждён/несовместим → рестарт БЕЗ mmproj
+        //    (текстовый режим), вместо падения всего чата.
+        // 3) VL-модель требует проектор, а мы его не передали → рестарт С ним.
+        let mut engine_child: Option<std::process::Child> = None;
+        let mut tried_no_reasoning = false;
+        let mut tried_no_mmproj = false;
+        let mut tried_with_mmproj = false;
+
+        'launch: loop {
+            let mut c = build_cmd(attempt_reasoning, attempt_mmproj);
+            let mut child = match c.spawn() {
+                Ok(c) => c,
+                Err(e) => return fail(format!("Ошибка запуска llama-server: {}", e)),
+            };
+            server_trace.begin_process(child.id());
+            // ── Гарантия зачистки при выходе из приложения ──
+            // Регистрируем PID (для докиля в обработчике выхода main.rs) и назначаем
+            // процесс в Windows Job Object с KILL_ON_JOB_CLOSE — тогда ОС убьёт
+            // сервер даже при насильственном закрытии приложения.
+            crate::engine::process_util::register_engine_pid(child.id());
+            #[cfg(windows)]
+            crate::engine::process_util::assign_child_to_kill_job(&child);
+            if let Some(stderr) = child.stderr.take() {
+                spawn_stderr_reader(stderr);
+            }
+
+            let mut deadline = Instant::now() + HEALTH_TIMEOUT;
+            let mut last_progress_log = Instant::now();
+            let mut exit_code: Option<i32> = None;
+            let mut healthy = false;
+            loop {
+                match child.try_wait() {
+                    Ok(state) => {
+                        if let Some(status) = state {
+                            exit_code = Some(status.code().unwrap_or(-1));
+                            break;
+                        }
+                    }
+                    Err(e) => return fail(format!("Ошибка ожидания llama-server: {}", e)),
+                }
+                if engine_health_check(&client, port, &auth_value) {
+                    healthy = true;
+                    break;
+                }
+                if Instant::now() > deadline {
+                    let _ = child.kill();
+                    return fail(format!(
+                        "Таймаут запуска движка llama.cpp ({} сек). Модель не загрузилась. {}",
+                        HEALTH_TIMEOUT.as_secs(),
+                        read_log_tail(&server_log)
+                    ));
+                }
+                if last_progress_log.elapsed() >= Duration::from_secs(5) {
+                    last_progress_log = Instant::now();
+                    log_cb(format!(
+                        "⏳ Загрузка модели в память... ({} сек)",
+                        deadline.duration_since(Instant::now()).as_secs().min(HEALTH_TIMEOUT.as_secs())
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            }
+
+            if healthy {
+                engine_child = Some(child);
+                break 'launch;
+            }
+
+            // ── Сервер завершился с ошибкой при старте ──
+            let code = exit_code.unwrap_or(-1);
+            let log = read_log_tail(&server_log);
+
+            // Фолбэк 1: движок не понимает флаги reasoning (старая сборка)
+            if attempt_reasoning && !tried_no_reasoning && !is_mmproj_load_error(&log) {
+                log_cb(format!(
+                    "⚠️ llama-server завершился при запуске (код {}) — перезапуск БЕЗ reasoning-флагов (движок их не поддерживает). Думатель будет отключён.",
+                    code
+                ));
+                attempt_reasoning = false;
+                tried_no_reasoning = true;
+                crate::engine::process_util::unregister_engine_pid(child.id());
+                continue 'launch;
+            }
+
+            // Фолбэк 2: битый/несовместимый проектор mmproj → текстовый режим
+            if attempt_mmproj && is_mmproj_load_error(&log) && !tried_no_mmproj {
+                log_cb(format!(
+                    "⚠️ Проектор mmproj '{}' не загрузился (вероятно повреждён или несовместим с этой сборкой llama.cpp): {}. Запуск в текстовом режиме без vision.",
+                    mmproj_orig.as_deref().unwrap_or(""),
+                    mmproj_error_detail(&log)
+                ));
+                attempt_mmproj = false;
+                tried_no_mmproj = true;
+                crate::engine::process_util::unregister_engine_pid(child.id());
+                continue 'launch;
+            }
+
+            // Фолбэк 3: VL-модель требует проектор, а мы его не передали
+            if !attempt_mmproj && mmproj_orig.is_some() && !tried_with_mmproj && is_mmproj_required_error(&log) {
+                log_cb("ℹ️ Модель мультимодальная и требует проектор — подключаем mmproj.".to_string());
+                attempt_mmproj = true;
+                tried_with_mmproj = true;
+                crate::engine::process_util::unregister_engine_pid(child.id());
+                continue 'launch;
+            }
+
+            // ── Финальная ошибка ──
+            let msg = if is_mmproj_load_error(&log) || is_mmproj_required_error(&log) {
+                let path = mmproj_orig.as_deref().unwrap_or("<не указан>");
+                format!(
+                    "Ошибка загрузки мультимодального проектора (mmproj) для модели.\nФайл: {}\nПричина: {}\n\nВероятно файл повреждён или собран для несовместимой версии llama.cpp. Скачайте корректный mmproj, соответствующий вашей сборке движка (например cuda-13.x).",
+                    path,
+                    mmproj_error_detail(&log)
+                )
+            } else if let Some(diag) = {
+                // stderr — второй источник диагностики наряду с log-файлом,
+                // поэтому читаем его один раз и переиспользуем в лог.
+                let stderr_lines = server_trace.diagnostic_lines();
+                crate::engine::startup_diagnosis::diagnose_startup_failure(
+                    &log,
+                    &stderr_lines,
+                    code,
+                    &diag_ctx,
+                )
+                .map(|d| (d, stderr_lines))
+            } {
+                // Полный технический след — в лог приложения (вкладка «Логи»),
+                // юзеру — расшифровка с конкретным действием. Раньше здесь
+                // отдавался сырой хвост ggml-лога, и юзер делал вывод,
+                // что «сломалась программа».
+                let (diag, stderr_lines) = diag;
+                crate::engine::startup_diagnosis::log_full_trace(
+                    &server_log,
+                    &log,
+                    &stderr_lines,
+                    &diag,
+                );
+                log_cb(format!("❌ {}", diag.log_hint));
+                // Факт нехватки памяти — от самого движка (тексты отказа в
+                // диагнозе). Эмитим в чат: «не хватило» здесь подкреплено
+                // отказом аллокации, в отличие от pre-flight-прогноза (G4).
+                if matches!(diag.kind, crate::engine::startup_diagnosis::StartupFailureKind::CudaOom | crate::engine::startup_diagnosis::StartupFailureKind::HostRamOom) {
+                    let (what, action) = match diag.kind {
+                        crate::engine::startup_diagnosis::StartupFailureKind::CudaOom => (
+                            "видеопамять при загрузке модели (CUDA OOM)",
+                            "Уменьшите контекст или возьмите модель полегче — подсказки в сообщении ошибки.",
+                        ),
+                        _ => (
+                            "оперативная память (ОЗУ) при загрузке модели (pinned-буферы)",
+                            "Закройте другие программы или уменьшите контекст — подсказки в сообщении ошибки.",
+                        ),
+                    };
+                    crate::engine::notify_vram(crate::engine::vram::vram_oom_fact_notice(what, action));
+                }
+                diag.user_message
+            } else {
+                format!(
+                    "Движок llama-server завершился при запуске (код {}). {}",
+                    code,
+                    log
+                )
+            };
+            return fail(msg);
+        }
+
+        let child = engine_child.expect("engine child after successful launch");
+
+        let mut engine = Self {
+            global_ctx_limit,
+            model_path: model_path.clone(),
+            mmproj_path: if attempt_mmproj { mmproj_orig.clone() } else { None },
+            is_multimodal_engine: attempt_mmproj,
+            stream_cb: Arc::new(stream_cb),
+            reasoning_cb: std::cell::RefCell::new(Arc::new(|_chunk: String| {})),
+            log_cb: log_cb.clone(),
+            client,
+            server_log,
+            server_trace,
+            server_log_line_count: std::sync::Mutex::new(0),
+            port,
+            api_key,
+            child: std::sync::Mutex::new(Some(child)),
+            current_ngl: std::cell::Cell::new(gpu_layers),
+            respawn_ctx: Some(Box::new(RespawnCtx {
+                server_exe: server_exe.clone(),
+                engine_dir: engine_dir.to_path_buf(),
+                threads,
+                reasoning_budget,
+                kv_quant_keys,
+                kv_quant_values,
+                kv_spec,
+                reasoning_enabled: attempt_reasoning,
+                is_pre_hopper,
+                cudart_path: cudart_path.clone(),
+            })),
+            engine_mode: std::cell::RefCell::new(engine_mode.clone()),
+            engine_mode_detail: std::cell::RefCell::new(String::new()),
+            vram_before,
+            last_tok_per_sec: std::cell::Cell::new(0.0),
+            pending_grammar: std::sync::Mutex::new(None),
+            pending_tools: std::sync::Mutex::new(None),
+            engine_last_progress_ms,
+        };
+
+        log_cb(format!(
+            "✅ Движок llama-server запущен: {} (режим {}), порт {}",
+            engine.model_path, engine.engine_mode.borrow(), engine.port
+        ));
+
+        // ── Проверка: реально ли модель ушла в VRAM? ──
+        // Честная сверка фактического прироста VRAM с ОЖИДАЕМЫМИ весами оффлоада.
+        // Порог «>100 МБ» сам по себе врёт (буферы CUDA ~400 МБ даже при ngl=0) —
+        // сравниваем с долей весов, которую должны были загрузить в VRAM.
+        if vram_before > 0 {
+            let vram_after = nvml_wrapper::Nvml::init().ok().and_then(|nvml| {
+                nvml.device_by_index(0)
+                    .ok()
+                    .and_then(|device| device.memory_info().ok().map(|mem| mem.used))
+            }).unwrap_or(0);
+
+            let diff = vram_after as i64 - vram_before as i64;
+            let est = crate::engine::vram_estimate::estimate_vram_with_spec(&model_path, global_ctx_limit, &kv_spec);
+            let layers = est.num_layers.max(1);
+            let frac = (gpu_layers.min(est.num_layers) as f64) / layers as f64;
+            let expected_weights_mb = est.model_mb * frac;
+            let diff_mb = diff as f64 / (1024.0 * 1024.0);
+            if use_gpu && gpu_layers > 0 && expected_weights_mb > 100.0 && diff_mb >= expected_weights_mb * 0.4 {
+                engine.engine_mode.replace("gpu".to_string());
+                log_cb(format!(
+                    "✅ GPU: модель загружена в VRAM. Прирост {} МБ (оффлоад {} слоёв, ожидалось ~{:.0} МБ весов).",
+                    diff_mb.round() as i64, gpu_layers, expected_weights_mb
+                ));
+            } else if use_gpu {
+                // Намерение было GPU, но VRAM выросла заметно меньше ожидаемого —
+                // llama-server тихо ушёл в CPU (или оффлоад почти весь в ОЗУ).
+                // Сообщаем ПРИЧИНУ (из лога сервера), а не выдуманный диагноз.
+                engine.engine_mode.replace("cpu".to_string());
+                let diag = diagnose_cuda_fallback(&engine.server_log);
+                engine.engine_mode_detail.replace(if !diag.is_empty() {
+                    format!("Модель не попала в VRAM: {}", diag)
+                } else {
+                    format!(
+                        "Модель не попала в VRAM: бекенд ({}) не смог использовать GPU {} (драйвер CUDA {}.{}, compute {}.{}). Подробности — в хвосте llama_server.log.",
+                        selected_variant, gpu_info.gpu_name, gpu_info.cuda_major, gpu_info.cuda_minor,
+                        gpu_info.compute_major, gpu_info.compute_minor
+                    )
+                });
+                log_cb(format!(
+                    "❌ ВНИМАНИЕ: VRAM выросла лишь на {} МБ при оффлоаде {} слоёв (ожидалось ~{:.0} МБ весов) — модель работает на CPU!",
+                    diff_mb.round() as i64, gpu_layers, expected_weights_mb
+                ));
+                log_cb(format!("❌ Диагноз: {}", engine.engine_mode_detail.borrow()));
+                log_cb("❌ Решение: Настройки → «Движок запуска нейромоделей» → выберите подходящий бекенд.".to_string());
+            } else {
+                log_cb("ℹ️ GPU-ускорение не используется (CPU-режим) — VRAM не занята. Это ожидаемо.".to_string());
+            }
+        }
+
+        // ── Информация о RAM (решение принимает RAM-гейт ДО спавна выше) ──
+        // Старый warn «модели с контекстом нужно ~X, свободно всего Y» после
+        // уже успешного старта удалён: он предупреждал ровно о том отказе,
+        // который гейт теперь предотвращает конструктивно (запуск обречённой
+        // конфигурации стал невозможным). Осталась информационная строка на
+        // вычисленных гейтом числах + свежая доступность после загрузки.
+        sys.refresh_memory();
+        let free_ram_mb = sys.available_memory() as f64 / (1024.0 * 1024.0);
+        log_cb(format!(
+            "ℹ️ RAM: след движка на старте ~{:.0} МБ (контекст {} токенов), сейчас доступно ~{:.0} МБ.",
+            ram_need_final_mb, global_ctx_limit, free_ram_mb
+        ));
+
+        // ── BeeLlama: прогноз ОЗУ под pinned-буферы (не блокирует запуск) ──
+        // BeeLlama (KVarN) держит KV/compute в pinned CUDA_Host — на машинах с
+        // малой ОЗУ это отказ ДО старта генерации (инцидент 30.10.26: 4.6-5.4 ГБ
+        // не выделились на 16 ГБ ОЗУ). Точную формулу из двух крэшей не вывести
+        // (разброс 236-277 КиБ/токен при одном ctx), поэтому это ПРОГНОЗ по
+        // верхней границе, а факт-диагноз даёт startup_diagnosis по текстам.
+        if source_id == "beellama" {
+            let pinned_need_mb = beellama_pinned_ram_need_mb(global_ctx_limit);
+            let free_now_mb = sys.free_memory() as f64 / (1024.0 * 1024.0);
+            if pinned_need_mb > free_now_mb - BEE_LLAMA_RAM_RESERVE_MB {
+                let note = format!(
+                    "BeeLlama держит KV-кэш и вычисления в обычной памяти (pinned ~{:.1} ГБ при контексте {} токенов), свободно {:.1} ГБ (минус {} ГБ резерва для системы). Запуск может упасть с ошибкой аллокации — сократите контекст в настройках или используйте исходный движок llama.cpp.",
+                    pinned_need_mb / 1024.0,
+                    global_ctx_limit,
+                    free_now_mb / 1024.0,
+                    BEE_LLAMA_RAM_RESERVE_MB as i64 / 1024,
+                );
+                log_cb(format!("⚠️ {}", note));
+                log::warn!("{}", note);
+                crate::engine::notify_vram(crate::engine::vram::ram_forecast_notice(&note));
+            }
+        }
+
+        let mut gguf_params = Vec::new();
+        if let Some(v) = extract_f32_from_gguf(&model_path, "tokenizer.ggml.temp") { gguf_params.push(format!("Temp={:.2}", v)); }
+        if let Some(v) = extract_u32_from_gguf(&model_path, "tokenizer.ggml.top_k") { gguf_params.push(format!("Top_K={}", v)); }
+        if let Some(v) = extract_f32_from_gguf(&model_path, "tokenizer.ggml.top_p") { gguf_params.push(format!("Top_P={:.2}", v)); }
+        if let Some(v) = extract_f32_from_gguf(&model_path, "tokenizer.ggml.min_p") { gguf_params.push(format!("Min_P={:.2}", v)); }
+        if let Some(v) = extract_f32_from_gguf(&model_path, "tokenizer.ggml.repetition_penalty") { gguf_params.push(format!("Rep_Pen={:.2}", v)); }
+
+        if !gguf_params.is_empty() {
+            log_cb(format!("📦 Вшитые параметры GGUF: {}", gguf_params.join(", ")));
+        } else {
+            log_cb("📦 Вшитые параметры GGUF: отсутствуют".to_string());
+        }
+
+        if let Some(mmp) = &engine.mmproj_path {
+            log_cb(format!("✅ mmproj передан движку: {} (изображения поддерживаются)", mmp));
+        }
+
+        Ok(engine)
+    }
+
+    /// Режим движка: "gpu" (модель в VRAM) или "cpu" (fallback)
+    pub fn engine_mode(&self) -> String {
+        self.engine_mode.borrow().clone()
+    }
+
+    /// Причина CPU-режима (пусто, если GPU)
+    pub fn engine_mode_detail(&self) -> String {
+        self.engine_mode_detail.borrow().clone()
+    }
+
+    /// Скорость последней генерации (tok/s), 0 до первой генерации
+    pub fn tok_per_sec(&self) -> f64 {
+        self.last_tok_per_sec.get()
+    }
+
+    pub fn build_prompt(&self, messages: &[LlmMessage], format_type: &str, log_cb: &impl Fn(String)) -> (String, PromptFormat) {
+        let pf = PromptFormat::from_str(format_type);
+        let actual_format = if pf == PromptFormat::Auto {
+            PromptFormat::detect_from_gguf(&self.model_path)
+        } else {
+            pf.clone()
+        };
+
+        let mut full_prompt = String::new();
+        if pf == PromptFormat::Auto {
+            if let Some(template) = extract_string_from_gguf(&self.model_path, "tokenizer.chat_template") {
+                if let Some(rendered) = PromptFormat::format_messages_jinja(&template, messages) {
+                    full_prompt = rendered;
+                    log_cb("✨ Использован Jinja шаблон из GGUF".to_string());
+                } else {
+                    log_cb("⚠️ Не удалось применить Jinja шаблон, используется фолбэк ручной склейки.".to_string());
+                }
+            }
+        }
+
+        if full_prompt.is_empty() {
+             full_prompt = actual_format.format_messages(messages);
+        }
+
+        (full_prompt, actual_format)
+    }
+
+    pub fn get_tokens_count(&self, messages: &[LlmMessage], format_type: &str) -> Result<usize, String> {
+        let (full_prompt, _) = self.build_prompt(messages, format_type, &|_|{});
+        let tokens = self.tokenize(&full_prompt)?;
+        Ok(tokens.len())
+    }
+
+    // ─── HTTP-примитивы ───
+
+    fn auth_header(&self) -> String {
+        format!("Bearer {}", self.api_key)
+    }
+
+    fn url(&self, path: &str) -> String {
+        format!("http://127.0.0.1:{}{}", self.port, path)
+    }
+
+    pub fn is_alive(&self) -> bool {
+        self.is_healthy()
+    }
+
+    fn is_healthy(&self) -> bool {
+        let resp = self.client
+            .get(self.url("/health"))
+            .header(AUTHORIZATION, self.auth_header())
+            .timeout(Duration::from_secs(3))
+            .send();
+        match resp {
+            Ok(r) => r.status().is_success(),
+            Err(_) => false,
+        }
+    }
+
+    /// Фаза A запроса генерации: отправка POST и ожидание HTTP-статуса.
+    ///
+    /// Дефолт reqwest отключён (иначе он рвёт обмен на 30-й секунде), поэтому
+    /// заголовки ждём в отдельном потоке под своим таймаутом. Без этого
+    /// освобождённое время превратилось бы в бесконечное ожидание.
+    ///
+    /// Принимает уже сериализованное тело: хелпер не зависит от локального
+    /// типа запроса, который живёт внутри `run_chat_completions`.
+    fn send_with_timeout(
+        &self,
+        body: Vec<u8>,
+        timeout: Duration,
+    ) -> Result<reqwest::blocking::Response, String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let url = self.url("/v1/chat/completions");
+        let auth = self.auth_header();
+        let client = self.client.clone();
+        std::thread::spawn(move || {
+            let sent = client
+                .post(url)
+                .header(AUTHORIZATION, auth)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(body)
+                .send();
+            let _ = tx.send(sent);
+        });
+        match rx.recv_timeout(timeout) {
+            Ok(Ok(resp)) => Ok(resp),
+            Ok(Err(e)) => Err(format!(
+                "Ошибка отправки запроса генерации: {}.{}",
+                chain_err(&e, 3),
+                read_log_tail(&self.server_log)
+            )),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(format!(
+                "Движок не ответил HTTP-статусом за {} сек (слот занят очередью).{}",
+                timeout.as_secs(),
+                read_log_tail(&self.server_log)
+            )),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(
+                "Поток отправки запроса генерации оборвался до получения ответа.".to_string(),
+            ),
+        }
+    }
+
+    fn post_json<T: Serialize, R: DeserializeOwned>(&self, path: &str, body: &T) -> Result<R, String> {
+        let resp = self.client
+            .post(self.url(path))
+            .header(AUTHORIZATION, self.auth_header())
+            .json(body)
+            // Дефолт reqwest отключён ради стрима генерации, поэтому у всех
+            // служебных запросов таймаут проставляется явно — иначе зависший
+            // движок будет блокировать вызывающий поток навсегда.
+            .timeout(StreamTimeouts::default().inter_token)
+            .send()
+            .map_err(|e| format!("Ошибка HTTP {}: {}", path, e))?;
+        let status = resp.status();
+        let text = resp.text().map_err(|e| format!("Ошибка чтения ответа {}: {}", path, e))?;
+        if !status.is_success() {
+            return Err(format!("llama-server: HTTP {} на {}: {}", status, path, truncate_str(&text, 300)));
+        }
+        serde_json::from_str(&text).map_err(|e| format!("Ошибка парсинга ответа {}: {}", path, e))
+    }
+
+    pub(crate) fn tokenize(&self, text: &str) -> Result<Vec<i64>, String> {
+        #[derive(Serialize)]
+        struct TokenizeReq<'a> {
+            content: &'a str,
+            add_special: bool,
+            parse_special: bool,
+        }
+        #[derive(Deserialize)]
+        struct TokenizeResp {
+            tokens: Vec<i64>,
+        }
+        let resp: TokenizeResp = self.post_json("/tokenize", &TokenizeReq {
+            content: text,
+            add_special: true,
+            parse_special: true,
+        })?;
+        Ok(resp.tokens)
+    }
+
+    // ─── Диагностика ошибок генерации ───
+
+    /// Полный текст ошибки генерации: причина + пики памяти + хвост лога
+    /// llama-server. Пики берутся из `MemReport` (см. err path).
+    fn err_details(&self, report: &crate::engine::mem_profiler::MemReport, reason: &str) -> String {
+        let mem = if report.samples > 0 {
+            format!(
+                " | пик памяти: llama-server RSS={} МБ, приложение RSS={} МБ, VRAM={} МБ",
+                report.rss_server_peak / (1024 * 1024),
+                report.rss_app_peak / (1024 * 1024),
+                report.vram_used_peak / (1024 * 1024),
+            )
+        } else {
+            String::new()
+        };
+        // CUDA OOM — юзеру нужен ГЛАВНЫЙ совет, а не хвост лога ggml.
+        let log_tail = read_log_tail(&self.server_log);
+        let reason = cuda_oom_friendly_reason(&log_tail, reason);
+        format!("{}{}.{}", reason, mem, log_tail)
+    }
+
+    fn capture_server_snapshot(&self) -> ServerProcessSnapshot {
+        let process = match self.child.lock() {
+            Ok(mut child) => match child.as_mut() {
+                Some(child) => match child.try_wait() {
+                    Ok(Some(status)) => ServerProcessState::Exited(status.code()),
+                    Ok(None) => ServerProcessState::Running,
+                    Err(error) => ServerProcessState::Unknown(error.to_string()),
+                },
+                None => ServerProcessState::Missing,
+            },
+            Err(error) => ServerProcessState::Unknown(error.to_string()),
+        };
+        let health = match process {
+            ServerProcessState::Running => {
+                if engine_health_check(&self.client, self.port, &self.auth_header()) {
+                    ServerHealth::Healthy
+                } else {
+                    ServerHealth::Unavailable
+                }
+            }
+            _ => ServerHealth::NotChecked,
+        };
+        ServerProcessSnapshot {
+            pid: self.server_trace.pid(),
+            process,
+            health,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn capture_stream_diagnostics(
+        &self,
+        reason: String,
+        response: ResponseMeta,
+        reader_error: Option<StreamReaderError>,
+        gen_start: Instant,
+        first_event_at: Option<Instant>,
+        first_token_at: Option<Instant>,
+        last_data_at: Option<Instant>,
+        raw_lines: u64,
+        events: u64,
+        bytes: u64,
+        output_tokens: u32,
+        reasoning_tokens: u32,
+        finish_reason: String,
+    ) -> StreamDiagnostics {
+        let elapsed_ms = gen_start.elapsed().as_millis();
+        let first_event_ms = first_event_at.map(|at| at.duration_since(gen_start).as_millis());
+        let first_token_ms = first_token_at.map(|at| at.duration_since(gen_start).as_millis());
+        let last_data_age_ms = last_data_at.map(|at| at.elapsed().as_millis());
+        StreamDiagnostics {
+            reason,
+            response,
+            reader_error,
+            server: self.capture_server_snapshot(),
+            elapsed_ms,
+            first_event_ms,
+            first_token_ms,
+            last_data_age_ms,
+            raw_lines,
+            events,
+            bytes,
+            output_tokens,
+            reasoning_tokens,
+            finish_reason,
+            stderr_lines: self.server_trace.diagnostic_lines(),
+        }
+    }
+
+    /// Ошибка генерации гарантированно уходит в единый лог (log::Log) и телеметрию.
+    fn report_generation_error(&self, ctx_label: &str, report: &crate::engine::mem_profiler::MemReport, message: &str) {
+        log::error!("LLM генерация [{}]: {}", ctx_label, message);
+        let primary_error = message.lines().next().unwrap_or("generation failed");
+        let primary_error = primary_error.split(" | reader=").next().unwrap_or(primary_error);
+        crate::engine::analytics::track_event(
+            "llm_error",
+            Some(json!({
+                "ctx": ctx_label,
+                "model": extract_model_filename(&self.model_path),
+                "mode": self.engine_mode.borrow().clone(),
+                "samples": report.samples,
+                "error": primary_error,
+            })),
+        );
+    }
+
+    // ─── Генерация ───
+
+    /// Общий цикл генерации через OpenAI-совместимый `/v1/chat/completions`.
+    /// Промпт рендерит САМ движок (llama.cpp: jinja-интерпретатор + GGUF
+    /// chat_template) — клиент передаёт только `messages[]`. Вложения
+    /// (`attachments`) превращаются в image-части последнего user-сообщения.
+    /// `ctx_label` — контекст вызова для лога пиков памяти ("legacy:агент#N" / "graph:узел").
+    pub fn run_chat_completions<F, L>(
+        &self,
+        messages: &[LlmMessage],
+        attachments: Option<&[ChatAttachment]>,
+        max_tokens: usize,
+        params: &ModelParams,
+        stop_words: &[String],
+        grammar: Option<GrammarSpec>,
+        disable_reasoning: bool,
+        cancel_flag: Arc<AtomicBool>,
+        ctx_label: &str,
+        tool_choice: Option<&str>,
+        tools: Option<&[ToolDefinition]>,
+        mut progress_cb: F,
+        log_cb: L,
+    ) -> Result<GenerationResult, String>
+    where F: FnMut(f32, &str), L: Fn(String) {
+        let mut grammar = grammar;
+        if tools.is_some() && grammar.is_some() {
+            log_cb("🎯 tools[] заданы — GBNF/JSON-schema грамматика отключена (llama.cpp: HTTP 400 с кастомной грамматикой + tools[])".to_string());
+            grammar = None;
+        }
+        if let Some(g) = &grammar {
+            if let Some(gbnf) = &g.gbnf {
+                log_cb(format!("🎯 Грамматика GBNF: {} символов, корень: {}", gbnf.len(), gbnf.lines().next().unwrap_or("?")));
+            } else if g.json_schema.is_some() {
+                log_cb("🎯 Грамматика: json_schema (конвертируется движком)".to_string());
+            }
+        }
+        let actual_min_p = params.min_p.max(0.0);
+        let actual_rep_pen = params.repetition_penalty.max(1.0);
+        let actual_temp = params.temperature.max(0.01);
+
+        log_cb(format!(
+            "🎛 Фактические параметры сэмплинга: Temp={:.2}, Top_K={}, Top_P={:.2}, Min_P={:.2}, Rep_Pen={:.2}, Pres_Pen={:.2}, DRY={:.2}/{:.2}/{}, XTC={:.2}/{:.2}",
+            actual_temp, params.top_k, params.top_p, actual_min_p, actual_rep_pen, params.presence_penalty,
+            params.dry_multiplier, params.dry_base, params.dry_penalty_last_n,
+            params.xtc_probability, params.xtc_threshold
+        ));
+
+        #[derive(Serialize)]
+        struct ChatCompletionsRequest<'a> {
+            messages: Vec<serde_json::Value>,
+            n_predict: usize,
+            stream: bool,
+            temperature: f32,
+            top_k: u32,
+            top_p: f32,
+            min_p: f32,
+            repeat_penalty: f32,
+            presence_penalty: f32,
+            frequency_penalty: f32,
+            dry_multiplier: f32,
+            dry_base: f32,
+            dry_allowed_length: i32,
+            dry_penalty_last_n: i32,
+            xtc_probability: f32,
+            xtc_threshold: f32,
+            stop: &'a [String],
+            cache_prompt: bool,
+            seed: i32,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            grammar: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            json_schema: Option<&'a serde_json::Value>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            chat_template_kwargs: Option<serde_json::Value>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            tool_choice: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            tools: Option<&'a [ToolDefinition]>,
+        }
+
+        // messages[] — строки; вложения — image-части последнего user-сообщения
+        // (OAI-совместимый формат content parts; рендер на стороне движка).
+        let mut messages_val: Vec<serde_json::Value> = Vec::with_capacity(messages.len());
+        let last_user_idx = messages.iter().rposition(|m| m.role == "user");
+        for (i, m) in messages.iter().enumerate() {
+            let attach_here = attachments.is_some_and(|a| !a.is_empty()) && last_user_idx == Some(i);
+            if !attach_here {
+                let mut msg_val = json!({"role": m.role, "content": m.content});
+                // Нативный OpenAI tools[]: assistant-сообщение несёт tool_calls,
+                // сообщение результата — роль "tool" с tool_call_id.
+                if let Some(tcs) = &m.tool_calls {
+                    msg_val["tool_calls"] = serde_json::Value::Array(tcs.clone());
+                    if msg_val.get("content").and_then(|c| c.as_str()).map_or(false, |c| c.is_empty()) {
+                        msg_val["content"] = serde_json::Value::Null;
+                    }
+                }
+                if let Some(id) = &m.tool_call_id {
+                    msg_val["tool_call_id"] = serde_json::Value::String(id.clone());
+                }
+                messages_val.push(msg_val);
+                continue;
+            }
+            let mut parts = vec![json!({"type": "text", "text": m.content})];
+            for a in attachments.unwrap() {
+                parts.push(json!({
+                    "type": "image_url",
+                    "image_url": { "url": format!("data:{};base64,{}", a.mime_type, a.data_base64) }
+                }));
+            }
+            messages_val.push(json!({"role": m.role, "content": parts}));
+        }
+        // Вложения есть, но последний user отсутствует — добавляем отдельное сообщение.
+        if let Some(atts) = attachments {
+            if !atts.is_empty() && last_user_idx.is_none() {
+                let mut parts = Vec::with_capacity(atts.len());
+                for a in atts {
+                    parts.push(json!({
+                        "type": "image_url",
+                        "image_url": { "url": format!("data:{};base64,{}", a.mime_type, a.data_base64) }
+                    }));
+                }
+                messages_val.push(json!({"role": "user", "content": parts}));
+            }
+        }
+
+        // HTTP 400 «Cannot have 2 or more assistant messages at the end of the
+        // list»: докачка/сжатие оставляют два assistant подряд — Gemma-шаблон
+        // отвергает список. Слияние делает отказ структурно невозможным; одна
+        // trailing assistant сохраняется (prefill-докачка жива). До лога и
+        // до move в request — слепок ролей ниже отражает уже слитый список.
+        let before_merge = messages_val.len();
+        messages_val = merge_consecutive_assistant(messages_val);
+        if messages_val.len() != before_merge {
+            log_cb(format!(
+                "🔗 Слито подряд идущих assistant: {} → {} сообщений (llama-server отвергает ≥2 assistant в конце)",
+                before_merge,
+                messages_val.len()
+            ));
+        }
+
+        // ── Диагностика причин бага грамматики: слепок того, что уйдёт на сервер ──
+        // Показывает состав сообщений (роли/длины), cache_prompt, disable_reasoning
+        // — вычисляется до move messages_val в request.
+        log_cb(format!(
+            "🔬 Запрос: {} сообщений (последний user=#{}) | roles_len=[{}] | cache_prompt=true n_predict={} disable_reasoning={} | вложений={}",
+            messages_val.len(),
+            last_user_idx.map(|i| i.to_string()).unwrap_or_else(|| "—".to_string()),
+            messages_val.iter().map(|m| {
+                let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("?");
+                let len = m.get("content").and_then(|c| c.as_str()).map(str::len).unwrap_or(0);
+                format!("{}:{}", role, len)
+            }).collect::<Vec<_>>().join(", "),
+            max_tokens,
+            disable_reasoning,
+            attachments.as_ref().map(|a| a.len()).unwrap_or(0),
+        ));
+
+        let request = ChatCompletionsRequest {
+            messages: messages_val,
+            n_predict: max_tokens,
+            stream: true,
+            temperature: actual_temp,
+            top_k: params.top_k,
+            top_p: params.top_p,
+            min_p: actual_min_p,
+            repeat_penalty: actual_rep_pen,
+            presence_penalty: params.presence_penalty,
+            frequency_penalty: 0.0,
+            dry_multiplier: params.dry_multiplier,
+            dry_base: params.dry_base,
+            dry_allowed_length: params.dry_allowed_length,
+            dry_penalty_last_n: params.dry_penalty_last_n,
+            xtc_probability: params.xtc_probability,
+            xtc_threshold: params.xtc_threshold,
+            stop: stop_words,
+            cache_prompt: true,
+            seed: -1,
+            grammar: grammar.as_ref().and_then(|g| g.gbnf.as_deref()),
+            json_schema: grammar.as_ref().and_then(|g| g.json_schema.as_ref()),
+            chat_template_kwargs: if disable_reasoning {
+                Some(serde_json::json!({"enable_thinking": false}))
+            } else {
+                None
+            },
+            tool_choice,
+            tools,
+        };
+
+        // ── Диагностика: превью точного тела запроса ──
+        // Голова (system/сообщения) + хвост (грамматика, kwargs) — доказательство,
+        // что грамматика реально была отправлена на сервер.
+        let req_body = serde_json::to_vec(&request).unwrap_or_default();
+        let req_summary = String::from_utf8_lossy(&req_body).into_owned();
+        if !req_summary.is_empty() {
+            let head: String = req_summary.chars().take(300).collect();
+            let tail: String = req_summary.chars().rev().take(400).collect::<String>().chars().rev().collect();
+            log_cb(format!(
+                "🔬 Тело запроса ({} байт): head=[{}] ... tail=[{}]",
+                req_summary.len(),
+                head.replace('\n', "\\n").replace('\r', ""),
+                tail.replace('\n', "\\n").replace('\r', ""),
+            ));
+        }
+
+        // ── Телеметрия: старт генерации ──
+        crate::engine::analytics::track_event(
+            "llm_started",
+            Some(json!({
+                "ctx": ctx_label,
+                "model": extract_model_filename(&self.model_path),
+                "mode": self.engine_mode.borrow().clone(),
+                "ctx_limit": self.global_ctx_limit,
+                "max_tokens": max_tokens,
+            })),
+        );
+
+        // ── Замер пиков памяти (RAM + VRAM) на время генерации ──
+        // Гвард останавливает семплер на любом пути выхода (успех/ошибка/cancel).
+        let server_pid = self.child.lock().unwrap().as_ref().map(|c| c.id());
+        let sampler = crate::engine::MemSampler::start(server_pid);
+        let mem_guard = crate::engine::MemGuard::new(sampler, ctx_label, &log_cb);
+
+        let resp = self.send_with_timeout(req_body, StreamTimeouts::default().headers);
+        let resp = match resp {
+            Ok(resp) => resp,
+            Err(e) => {
+                // Раньше здесь стоял `?`, из-за чего `mem_guard` срабатывал в
+                // `Drop` и печатал «Замер памяти прерван» — то есть заведомо
+                // ложную причину сбоя, а пик VRAM/RSS по попытке терялся.
+                let report = mem_guard.finish();
+                let message = self.err_details(&report, &e);
+                self.report_generation_error(ctx_label, &report, &message);
+                return Err(message);
+            }
+        };
+
+        let response_meta = ResponseMeta::from_response(&resp);
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().unwrap_or_default();
+            let report = mem_guard.finish();
+            let message = self.err_details(
+                &report,
+                &format!("llama-server: HTTP {} при генерации: {}", status, truncate_str(&text, 500)),
+            );
+            self.report_generation_error(ctx_label, &report, &message);
+            return Err(message);
+        }
+
+        let gen_start = Instant::now();
+        let timeouts = StreamTimeouts::default();
+        // Чтение стрима — в отдельном потоке: блокирующий read_line нельзя
+        // прервать по таймауту. Основной цикл ждёт строки с recv_timeout —
+        // так работает сторожевой таймер, при этом длинная живая генерация
+        // не обрезается. До первого байта действует один бюджет (весь prompt
+        // eval), после первого байта — другой (пауза между токенами).
+        let (lines_tx, lines_rx) = std::sync::mpsc::channel::<Result<Option<String>, StreamReaderError>>();
+        let mut reader = BufReader::new(resp);
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(0) => { let _ = lines_tx.send(Ok(None)); break; }
+                    Ok(_) => {
+                        if lines_tx.send(Ok(Some(line.clone()))).is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = lines_tx.send(Err(StreamReaderError::from_io(&error)));
+                        break;
+                    }
+                }
+            }
+        });
+        let mut result_text = String::new();
+        let mut reasoning_text = String::new();
+        let mut generated_bytes: Vec<u8> = Vec::new();
+        let mut generated_tokens: u32 = 0;
+        let mut reasoning_tokens: u32 = 0;
+        let mut tool_calls_acc: Vec<ToolCall> = Vec::new();
+        let mut stop_reason = "MAX_TOKENS".to_string();
+        let mut last_loop_check_chars = 0usize;
+        let mut prompt_done_logged = false;
+        let mut predicted_per_second: Option<f64> = None;
+        let mut prompt_per_second: Option<f64> = None;
+        let mut prompt_tokens: u32 = 0;
+        let mut final_timings: Option<Timings> = None;
+        let mut first_event_at: Option<Instant> = None;
+        let mut first_token_at: Option<Instant> = None;
+        let mut last_data_at: Option<Instant> = None;
+        let mut stream_events: u64 = 0;
+        let mut raw_lines: u64 = 0;
+        let mut stream_bytes: u64 = 0;
+
+        loop {
+            if cancel_flag.load(Ordering::SeqCst) {
+                stop_reason = "CANCELLED".to_string();
+                break;
+            }
+
+            let wait = timeouts.wait_for(raw_lines > 0);
+            let line = match lines_rx.recv_timeout(wait) {
+                Ok(Ok(Some(line))) => line,
+                Ok(Ok(None)) => {
+                    let received_tokens = generated_tokens + reasoning_tokens;
+                    if received_tokens == 0 {
+                        let diagnostics = self.capture_stream_diagnostics(
+                            format!("{}Сервер закрыл поток до первого токена", STREAM_RETRY_MARKER),
+                            response_meta.clone(),
+                            Some(StreamReaderError {
+                                message: "unexpected EOF before first token".to_string(),
+                                kind: "UnexpectedEof".to_string(),
+                                raw_os_error: None,
+                            }),
+                            gen_start,
+                            first_event_at,
+                            first_token_at,
+                            last_data_at,
+                            raw_lines,
+                            stream_events,
+                            stream_bytes,
+                            generated_tokens,
+                            reasoning_tokens,
+                            "нет".to_string(),
+                        );
+                        crate::engine::analytics::track_event(
+                            "llm_stream_error",
+                            Some(diagnostics.telemetry()),
+                        );
+                        let report = mem_guard.finish();
+                        return Err(self.err_details(&report, &diagnostics.format()));
+                    }
+                    break;
+                }
+                Ok(Err(reader_error)) => {
+                    let received_tokens = generated_tokens + reasoning_tokens;
+                    let marker = if received_tokens == 0 { STREAM_RETRY_MARKER } else { "" };
+                    let diagnostics = self.capture_stream_diagnostics(
+                        format!("{}Ошибка чтения потока генерации: {}", marker, reader_error.message),
+                        response_meta.clone(),
+                        Some(reader_error),
+                        gen_start,
+                        first_event_at,
+                        first_token_at,
+                        last_data_at,
+                        raw_lines,
+                        stream_events,
+                        stream_bytes,
+                        generated_tokens,
+                        reasoning_tokens,
+                        "нет".to_string(),
+                    );
+                    crate::engine::analytics::track_event(
+                        "llm_stream_error",
+                        Some(diagnostics.telemetry()),
+                    );
+                    let report = mem_guard.finish();
+                    let message = self.err_details(&report, &diagnostics.format());
+                    if received_tokens > 0 {
+                        self.report_generation_error(ctx_label, &report, &message);
+                    }
+                    return Err(message);
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    // ── Liveness-сторож: SSE-тишина ≠ мёртвый движок ──
+                    // Дифф-парсер llama.cpp не эмитит delta, пока не закрыт
+                    // `<think>`/tool-call (ggml-org/llama.cpp#15000), а движок
+                    // всё это время генерирует. Инцидент 30.10.26: 4 стрима
+                    // убиты на 60-й сек, stderr при этом печатал print_timing
+                    // с растущим n_gen каждые 3 сек. Свежий stderr-прогресс —
+                    // ждать дальше; тишина движка или кап 600 сек — обрыв.
+                    let total_elapsed = gen_start.elapsed();
+                    let progress_age_ms = now_unix_ms()
+                        .saturating_sub(self.engine_last_progress_ms.load(Ordering::Relaxed));
+                    if stream_timeout_should_wait(total_elapsed, progress_age_ms) {
+                        log_cb(format!(
+                            "⏳ SSE молчит {} сек, но движок генерирует (stderr-прогресс {} сек назад) — жду дальше (кап {} сек от старта)",
+                            wait.as_secs(),
+                            progress_age_ms / 1000,
+                            STREAM_LIVENESS_HARD_CAP.as_secs()
+                        ));
+                        continue;
+                    }
+                    let received_tokens = generated_tokens + reasoning_tokens;
+                    let marker = if received_tokens == 0 { STREAM_RETRY_MARKER } else { "" };
+                    let reason = if raw_lines > 0 {
+                        format!(
+                            "генерация остановилась: нет данных от движка {} сек",
+                            wait.as_secs()
+                        )
+                    } else {
+                        format!(
+                            "prompt eval не завершился за {} сек (движок считает промпт)",
+                            wait.as_secs()
+                        )
+                    };
+                    let diagnostics = self.capture_stream_diagnostics(
+                        format!("{}{}", marker, reason),
+                        response_meta.clone(),
+                        None,
+                        gen_start,
+                        first_event_at,
+                        first_token_at,
+                        last_data_at,
+                        raw_lines,
+                        stream_events,
+                        stream_bytes,
+                        generated_tokens,
+                        reasoning_tokens,
+                        "нет".to_string(),
+                    );
+                    crate::engine::analytics::track_event(
+                        "llm_stream_error",
+                        Some(diagnostics.telemetry()),
+                    );
+                    let report = mem_guard.finish();
+                    let message = self.err_details(&report, &diagnostics.format());
+                    if received_tokens > 0 {
+                        self.report_generation_error(ctx_label, &report, &message);
+                    }
+                    return Err(message);
+                }
+                Err(_) => break, // поток-читатель завершился без данных
+            };
+            raw_lines += 1;
+            stream_bytes += line.len() as u64;
+            last_data_at = Some(Instant::now());
+            let trimmed = line.trim();
+            let Some(data) = trimmed.strip_prefix("data:") else { continue };
+            let data = data.trim();
+            if data.is_empty() {
+                continue;
+            }
+            if first_event_at.is_none() {
+                first_event_at = Some(Instant::now());
+            }
+            stream_events += 1;
+            let event: ChatCompletionEvent = match serde_json::from_str(data) {
+                Ok(e) => e,
+                Err(_) => {
+                    if data.contains("\"error\"") {
+                        let report = mem_guard.finish();
+                        let message = self.err_details(
+                            &report,
+                            &format!("llama-server: ошибка генерации: {}", truncate_str(data, 500)),
+                        );
+                        self.report_generation_error(ctx_label, &report, &message);
+                        return Err(message);
+                    }
+                    continue;
+                }
+            };
+
+            // Счётчик промпта печатается один раз — но только когда движок реально его
+            // прислал. Раньше флаг выставлялся на ПЕРВОМ чанке, где timings ещё
+            // пусты, из-за чего в лог уезжало «Промпт принят движком: 0 токенов»
+            // и диагностика префилла слепла. Позднейшее уточнение (ниже, по
+            // timings) в лог не попадало — расхождение лога и метрик.
+            let prompt_seen = event
+                .tokens_evaluated
+                .max(event.timings.as_ref().map(|t| t.prompt_n).unwrap_or(0));
+            if !prompt_done_logged && prompt_seen > 0 {
+                prompt_done_logged = true;
+                prompt_tokens = prompt_seen;
+                log_cb(format!(
+                    "📐 Промпт принят движком: {} токенов, max_gen={}",
+                    prompt_seen, max_tokens
+                ));
+            }
+
+            if let Some(delta) = event.choices.first().and_then(|c| c.delta.content.as_deref()) {
+                if !delta.is_empty() {
+                    if first_token_at.is_none() {
+                        let token_at = Instant::now();
+                        first_token_at = Some(token_at);
+                        // Диагностика: первый сырой фрагмент ответа движка. Под
+                        // envelope-json первый токен обязан быть "{", а не "<".
+                        let preview: String = delta.chars().take(120).collect();
+                        let ttft = token_at.duration_since(gen_start).as_secs_f64();
+                        log_cb(format!("🔬 [{}] Первый токен через {:.1}с ({} симв.): {}", ctx_label, ttft, delta.chars().count(), preview.replace('\n', "\\n")));
+                    }
+                    generated_bytes.extend_from_slice(delta.as_bytes());
+                    let current_text = String::from_utf8_lossy(&generated_bytes).into_owned();
+                    let diff = compute_stream_diff(&current_text, &result_text).to_string();
+                    if !diff.is_empty() {
+                        (self.stream_cb)(diff);
+                    }
+                    result_text = current_text;
+                    generated_tokens += 1;
+                }
+            }
+            if let Some(r) = event.choices.first().and_then(|c| c.delta.reasoning_content.as_deref()) {
+                if !r.is_empty() {
+                    // Размышление — тоже первый токен с точки зрения юзера:
+                    // у reasoning-моделей они идут ДО ответа и могут длиться
+                    // минуты. Раньше метка ставилась только на `content`, из-за
+                    // чего лог показывал «Первый токен через 900 с» на полностью
+                    // идущей генерации.
+                    if first_token_at.is_none() {
+                        first_token_at = Some(Instant::now());
+                    }
+                    reasoning_text.push_str(r);
+                    reasoning_tokens += 1;
+                    (self.reasoning_cb.borrow())(r.to_string());
+                }
+            }
+            // Нативные tool_calls (OpenAI tools[]): чанки доклеиваются к
+            // аккумулятору по index. Границы id/name/arguments в потоке не
+            // гарантированы — фрагменты конкатенируются, финальные значения
+            // читаются только после завершения SSE-стрима.
+            if let Some(choice) = event.choices.first() {
+                for tc in &choice.delta.tool_calls {
+                    if tool_calls_acc.len() <= tc.index {
+                        tool_calls_acc.resize(tc.index + 1, ToolCall::default());
+                    }
+                    let slot = &mut tool_calls_acc[tc.index];
+                    if let Some(id) = &tc.id {
+                        if !id.is_empty() {
+                            slot.id.push_str(id);
+                        }
+                    }
+                    if let Some(f) = &tc.function {
+                        if let Some(name) = &f.name {
+                            if !name.is_empty() {
+                                slot.name.push_str(name);
+                            }
+                        }
+                        if let Some(arg) = &f.arguments {
+                            if !arg.is_empty() {
+                                slot.arguments.push_str(arg);
+                            }
+                        }
+                    }
+                }
+            }
+
+            let total_tokens = generated_tokens + reasoning_tokens;
+            let gen_p = ((total_tokens as f32 / max_tokens.max(1) as f32) * 50.0).min(50.0);
+            progress_cb(50.0 + gen_p, &format!("Генерация: {} токенов...", total_tokens));
+
+            if let Some(t) = event.timings {
+                if is_sane_rate(t.predicted_per_second) {
+                    predicted_per_second = Some(t.predicted_per_second);
+                }
+                if is_sane_rate(t.prompt_per_second) {
+                    prompt_per_second = Some(t.prompt_per_second);
+                }
+                if t.prompt_n > 0 {
+                    prompt_tokens = t.prompt_n;
+                }
+                if t.predicted_n > 0 {
+                    final_timings = Some(t);
+                }
+            }
+
+            // Лёгкая защита от зацикливания (проверяем хвост текста каждые ~300 символов)
+            let chars_now = result_text.chars().count();
+            if chars_now - last_loop_check_chars >= 300 {
+                last_loop_check_chars = chars_now;
+                if detect_repetition(&result_text, &log_cb) {
+                    stop_reason = "LOOP_DETECTED".to_string();
+                    break;
+                }
+            }
+
+            if let Some(fr) = event.choices.first().and_then(|c| c.finish_reason.as_deref()) {
+                match fr {
+                    "stop" => stop_reason = "EOS".to_string(),
+                    "length" => stop_reason = "MAX_TOKENS".to_string(),
+                    "tool_calls" => stop_reason = "TOOL_CALLS".to_string(),
+                    _ => stop_reason = fr.to_string(),
+                }
+                break;
+            }
+        }
+        progress_cb(100.0, &format!("Готово ({} токенов)", generated_tokens + reasoning_tokens));
+
+        let gen_elapsed = gen_start.elapsed().as_secs_f64();
+        let total_tokens = generated_tokens + reasoning_tokens;
+        let speed = predicted_per_second
+            .or_else(|| final_timings.as_ref().map(|t| t.predicted_per_second).filter(|&v| is_sane_rate(v)))
+            .unwrap_or_else(|| if gen_elapsed > 0.0 { total_tokens as f64 / gen_elapsed } else { 0.0 });
+        let prompt_speed = prompt_per_second
+            .or_else(|| final_timings.as_ref().map(|t| t.prompt_per_second).filter(|&v| is_sane_rate(v)))
+            .unwrap_or(0.0);
+        let ttft_sec = first_token_at
+            .map(|t| t.duration_since(gen_start).as_secs_f64())
+            .unwrap_or(gen_elapsed);
+        self.last_tok_per_sec.set(speed);
+        if reasoning_tokens > 0 {
+            log_cb(format!(
+                "⚙️ Сгенерировано {} токенов ответа + {} токенов думателя за {:.1}с ({:.0} tok/s). Причина: {}",
+                generated_tokens, reasoning_tokens, gen_elapsed, speed, stop_reason
+            ));
+        } else {
+            log_cb(format!(
+                "⚙️ Сгенерировано {} токенов за {:.1}с ({:.0} tok/s). Причина: {}",
+                generated_tokens, gen_elapsed, speed, stop_reason
+            ));
+        }
+        // llama.cpp#15000: сервер не эмитит SSE-дельты, пока think не закрыт, —
+        // счётчики стоят на нуле при живой генерации. Без пояснения «0 токенов»
+        // выглядит как зависший движок (лог юзера 01.11.26: экстрактор 2×400с,
+        // телеметрия 0+0, MAX_TOKENS). Пояснение — только при нулях и
+        // MAX_TOKENS: «length» уже переведён в «MAX_TOKENS» выше (match по
+        // finish_reason), и дефолт до цикла — тоже он; при других stop_reason
+        // нули означают иное (пустой ответ, ошибка). Раньше здесь сравнивали с
+        // «length» — условие было мёртвым и пояснение не выходило никогда.
+        if generated_tokens == 0 && reasoning_tokens == 0 && stop_reason == "MAX_TOKENS" {
+            log_cb(
+                "⚠️ Стрим не эмитил ни одной дельты: вывод уходил в незакрытый <think> — сервер держит дельты до его закрытия (llama.cpp#15000), бюджет генерации исчерпан, JSON/ответ не родился."
+                    .to_string(),
+            );
+        }
+
+        if reasoning_tokens > 0 {
+            let take = 300.min(reasoning_text.chars().count());
+            let preview: String = reasoning_text.chars().take(take).collect();
+            log_cb(format!("🧠 Думатель ({} токенов). Первые {} символов: {}", reasoning_tokens, take, preview.replace('\n', "\\n")));
+        }
+
+        if generated_tokens > 50 {
+            let char_count: usize = result_text.chars().count();
+            let take = 300.min(char_count);
+            let preview: String = result_text.chars().take(take).collect();
+            log_cb(format!("📝 Первые {} символов: {}", take, preview.replace('\n', "\\n")));
+        }
+
+        // ── Пиковые показатели памяти за время генерации (сверка с прогнозом) ──
+        let report = mem_guard.finish();
+        let peak_kv_spec = self
+            .respawn_ctx
+            .as_ref()
+            .map(|c| c.kv_spec)
+            .unwrap_or_else(|| crate::engine::vram_estimate::current_kv_spec(false, false));
+        let total_mb = estimate_vram_mb_with_spec(&self.model_path, self.global_ctx_limit, &peak_kv_spec);
+        let extra = format!(
+            "{} токенов (+{} думателя) за {:.1}с ({:.0} tok/s), причина: {}",
+            generated_tokens, reasoning_tokens, gen_elapsed, speed, stop_reason
+        );
+        log_cb(crate::engine::peak_line(ctx_label, &report, self.vram_before, total_mb, &extra));
+
+        // ── Диагностика: LCP/слот-строки llama_server.log для ЭТОГО запроса ──
+        // Привязывает f_sim_best/f_keep/graphs_reused к текущей генерации.
+        self.dump_new_server_log_lines(&log_cb);
+
+        // ── Логирование найденных tool_calls (нативный OpenAI tools[]) ──
+        if !tool_calls_acc.is_empty() {
+            let names: Vec<String> = tool_calls_acc.iter().map(|t| format!("{}[{}]", t.name, t.id)).collect();
+            log_cb(format!("🔧 Модель вызвала инструменты: {}", names.join(", ")));
+            if stop_reason != "TOOL_CALLS" {
+                log::warn!("tool_calls присутствуют, но finish_reason={} — модель могла вызвать инструмент в середине текста", stop_reason);
+            }
+        }
+
+        // ── Телеметрия: итоги генерации ──
+        crate::engine::analytics::track_event(
+            "llm_finished",
+            Some(json!({
+                "ctx": ctx_label,
+                "model": extract_model_filename(&self.model_path),
+                "mode": self.engine_mode.borrow().clone(),
+                "tokens": generated_tokens,
+                "reasoning_tokens": reasoning_tokens,
+                "elapsed_s": (gen_elapsed * 10.0).round() / 10.0,
+                "tok_per_sec": (speed * 10.0).round() / 10.0,
+                "stop_reason": stop_reason,
+                "rss_server_mb": report.rss_server_peak / (1024 * 1024),
+                "rss_app_mb": report.rss_app_peak / (1024 * 1024),
+                "vram_mb": report.vram_used_peak / (1024 * 1024),
+                "vram_ok": report.vram_ok,
+            })),
+        );
+
+        Ok(GenerationResult {
+            text: result_text,
+            stop_reason,
+            reasoning: reasoning_text,
+            tool_calls: tool_calls_acc,
+            metrics: LlmMetrics {
+                prompt_tokens,
+                generated_tokens,
+                reasoning_tokens,
+                prompt_per_second: prompt_speed,
+                predicted_per_second: speed,
+                ttft_sec,
+                elapsed_sec: gen_elapsed,
+            },
+        })
+    }
+
+    /// Диагностика: дамп НОВЫХ строк llama_server.log с последнего вызова.
+    /// Фильтрует только релевантные: выбор слота по LCP (f_sim_best/f_keep),
+    /// launch_slot_, print_timing (prompt eval / graphs reused), release.
+    /// Так LCP-цифры сервера привязываются к конкретному запросу клиента.
+    /// Смещение — число ПОЛНЫХ строк (без недописанного хвоста): частичную
+    /// строку подхватим при следующем вызове.
+    fn dump_new_server_log_lines(&self, log_cb: &impl Fn(String)) {
+        let content = match std::fs::read_to_string(&self.server_log) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let complete = content.matches('\n').count();
+        let mut offset = self.server_log_line_count.lock().unwrap();
+        let selected: Vec<&str> = content.lines()
+            .skip(*offset)
+            .take(complete.saturating_sub(*offset))
+            .filter(|l| {
+                l.contains("get_availabl")
+                    || l.contains("launch_slot_")
+                    || (l.contains("print_timing") && l.contains("prompt eval"))
+                    || l.contains("prompt processing")
+                    || l.contains("slot print_timing")
+                    || l.contains("graphs reused")
+                    || (l.contains("release") && l.contains("stop processing"))
+            })
+            .collect();
+        *offset = complete;
+        drop(offset);
+        if selected.is_empty() {
+            return;
+        }
+        let shown = selected.iter().rev().take(25).collect::<Vec<_>>();
+        log_cb(format!(
+            "🔬 llama-server (последние {} из {} строк, всего новых {}): {}",
+            shown.len(),
+            selected.len(),
+            complete,
+            shown.iter().rev().map(|l| l.trim()).collect::<Vec<_>>().join(" \\n ")
+        ));
+    }
+
+    pub fn is_multimodal(&self) -> bool {
+        self.is_multimodal_engine
+    }
+
+    /// Активный движковый потолок размышления (`--reasoning-budget`) в токенах.
+    ///
+    /// 0 = размышление движком отдельно НЕ ограничено: флаг не задан
+    /// (`reasoning_budget = 0` в конфиге), reasoning-флаги отключены фолбэком
+    /// цикла запуска (старый сервер не знает флагов) или это stub-движок без
+    /// `respawn_ctx`. Единственный источник правды для хостовых бюджетов,
+    /// завязанных на кап размышления: грамматика, считающая потолок думы,
+    /// обязана совпадать с тем капом, который РЕАЛЬНО применён к серверу,
+    /// иначе при заполнении думы до потолка конверт структурно недостижим.
+    pub fn reasoning_budget(&self) -> u32 {
+        self.respawn_ctx
+            .as_ref()
+            .map(|ctx| {
+                if ctx.reasoning_enabled {
+                    ctx.reasoning_budget
+                } else {
+                    0
+                }
+            })
+            .unwrap_or(0)
+    }
+
+    // ─── Автоповтор при CUDA OOM (честный, без блокировки) ───
+    //
+    // Запуск с меньшим -ngl реально выполняется ЗДЕСЬ (а не обещается в тексте
+    // ошибки): при нехватке видеопамяти в РАБОТАЮЩЕЙ генерации движок перезапускается
+    // с урезанным оффлоадом и запрос повторяется автоматически (одна попытка →
+    // вторая OOM → ngl=0 → третья OOM → понятная ошибка). История сессии не успевает
+    // измениться — результат записывается оркестратором только после Ok.
+
+    /// Есть ли контекст для авто-перезапуска при OOM (тестовые stub-движки — нет).
+    fn can_oom_retry(&self) -> bool {
+        self.respawn_ctx.is_some()
+    }
+
+    /// Следующее значение -ngl для авто-повтора при CUDA OOM:
+    /// шаг 1 — «сколько влезает в свободную VRAM сейчас» (процесс умер, память
+    /// освободилась) по единой оценке; если NVML недоступен — половина текущего.
+    /// шаг 2 — полный перевод в ОЗУ (0).
+    fn oom_next_ngl(&self, step: u8) -> u32 {
+        Self::oom_next_ngl_impl(step, self.current_ngl.get(), self.fitting_ngl_from_current_vram())
+    }
+
+    /// Чистая версия (без NVML) — для юнит-тестов.
+    fn oom_next_ngl_impl(step: u8, cur: u32, fitting: Option<u32>) -> u32 {
+        if cur == 0 {
+            return 0;
+        }
+        if step >= 2 {
+            return 0;
+        }
+        if let Some(est) = fitting {
+            if est < cur {
+                return est;
+            }
+        }
+        if cur >= 999 {
+            return (cur / 2).max(1);
+        }
+        (cur / 2).min(cur.saturating_sub(1))
+    }
+
+    /// Максимальное число GPU-слоёв, помещающихся в свободную VRAM СЕЙЧАС
+    /// (единая формула vram_estimate + KV-spec источника). None — NVML недоступен
+    /// или нет контекста.
+    fn fitting_ngl_from_current_vram(&self) -> Option<u32> {
+        let ctx = self.respawn_ctx.as_deref()?;
+        let nvml = nvml_wrapper::Nvml::init().ok()?;
+        let device = nvml.device_by_index(0).ok()?;
+        let mem = device.memory_info().ok()?;
+        let free_mb = mem.free as f64 / (1024.0 * 1024.0);
+        Some(crate::engine::vram_estimate::max_fitting_ngl_safe_with_spec(
+            &self.model_path,
+            self.global_ctx_limit,
+            &ctx.kv_spec,
+            free_mb,
+            256.0,
+            1.25,
+        ))
+    }
+
+    /// Освобождает VRAM перед тяжёлым внешним вычислением (image-движок):
+    /// убивает llama-server, конфиг перезапуска сохраняется в respawn_ctx.
+    /// Возвращает true, если процесс был жив и убит.
+    pub fn suspend_for_external_compute(&self) -> bool {
+        let old = self.child.lock().unwrap().take();
+        if let Some(mut child) = old {
+            let pid = child.id();
+            crate::engine::process_util::unregister_engine_pid(pid);
+            log::info!(
+                "⏸ llama-server (pid {}) приостановлен для внешнего вычисления (освобождение VRAM)",
+                pid
+            );
+            crate::engine::process_util::kill_process_tree(&mut child);
+            let _ = child.wait();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Перезапускает llama-server после внешнего вычисления (тот же -ngl/порт/конфиг).
+    /// KV-кэш теряется (новый процесс) — промпт будет переоценён заново.
+    pub fn resume_after_external_compute(&self) -> Result<(), String> {
+        if self.child.lock().unwrap().is_some() {
+            return Ok(());
+        }
+        let ngl = self.current_ngl.get();
+        (self.log_cb)(format!(
+            "▶ Перезапуск llama-server после внешнего вычисления (-ngl {})…",
+            ngl
+        ));
+        self.respawn_with_ngl(ngl)
+    }
+
+    /// Убивает текущий llama-server и запускает заново с указанным -ngl.
+    /// Возвращает Ok, когда сервер здоров. Логи попадают в UI (self.log_cb).
+    fn respawn_with_ngl(&self, new_ngl: u32) -> Result<(), String> {
+        let ctx = match self.respawn_ctx.as_deref() {
+            Some(c) => c,
+            None => return Err("Нет контекста для перезапуска движка".to_string()),
+        };
+
+        // ── Убить старый процесс (если ещё жив) ──
+        let old = self.child.lock().unwrap().take();
+        if let Some(mut child) = old {
+            let pid = child.id();
+            crate::engine::process_util::unregister_engine_pid(pid);
+            log::info!("🔻 Перезапуск llama-server (pid {}) на -ngl {}", pid, new_ngl);
+            crate::engine::process_util::kill_process_tree(&mut child);
+            let _ = child.wait();
+        }
+
+        // ── Спавн с тем же конфигом, но меньшим -ngl ──
+        let mut c = Command::new(&ctx.server_exe);
+        if let Some(p) = &ctx.cudart_path {
+            c.env("PATH", p);
+        }
+        c.current_dir(&ctx.engine_dir)
+            .arg("-m").arg(&self.model_path)
+            .arg("--host").arg("127.0.0.1")
+            .arg("--port").arg(self.port.to_string())
+            .arg("--api-key").arg(&self.api_key)
+            .arg("--ctx-size").arg(self.global_ctx_limit.to_string())
+            .arg("--parallel").arg(crate::engine::vram_estimate::SERVER_N_PARALLEL.to_string())
+            .arg("-t").arg(ctx.threads.to_string())
+            .arg("-ngl").arg(new_ngl.to_string())
+            .arg("--flash-attn").arg("on")
+            .arg("--no-webui")
+            .arg("--jinja")
+            .arg("--log-file").arg(&self.server_log);
+        if ctx.is_pre_hopper {
+            c.env("GGML_CUDA_PDL", "0");
+        }
+        if let Some(mmp) = &self.mmproj_path {
+            c.arg("--mmproj").arg(mmp);
+        }
+        // KV-квант при перезапуске: тот же порядок, что в build_cmd —
+        // source.runtime (KVarN) перекрывает чекбоксы, иначе q8_0.
+        {
+            let cfg_r = crate::engine::config::load_config_early();
+            let sid = crate::engine::sources::resolve_source(cfg_r.engine_source.as_deref());
+            let spec = crate::engine::sources::source_spec(&sid);
+            let rk = spec.as_ref().and_then(|s| s.runtime.cache_type_k.clone());
+            let rv = spec.as_ref().and_then(|s| s.runtime.cache_type_v.clone());
+            if let Some(ck) = rk {
+                c.arg("--cache-type-k").arg(ck);
+            } else if ctx.kv_quant_keys {
+                c.arg("--cache-type-k").arg("q8_0");
+            }
+            if let Some(cv) = rv {
+                c.arg("--cache-type-v").arg(cv);
+            } else if ctx.kv_quant_values {
+                c.arg("--cache-type-v").arg("q8_0");
+            }
+            if let Some(tail) = spec.as_ref().and_then(|s| s.runtime.kv_tail_tokens) {
+                c.arg("--kv-tail-tokens").arg(tail.to_string());
+            }
+        }
+        if ctx.reasoning_enabled {
+            c.arg("--reasoning-format").arg("deepseek");
+            c.arg("--reasoning-budget").arg(ctx.reasoning_budget.to_string());
+            c.arg("--no-reasoning-preserve");
+        }
+        #[cfg(target_os = "windows")]
+        { use std::os::windows::process::CommandExt; c.creation_flags(0x08000000); }
+        // CUDA/ggml-ошибки идут в stderr — захватываем их (тот же паттерн, что при старте).
+        c.stderr(std::process::Stdio::piped());
+
+        let mut child = c.spawn().map_err(|e| format!("Ошибка перезапуска llama-server: {}", e))?;
+        self.server_trace.begin_process(child.id());
+        crate::engine::process_util::register_engine_pid(child.id());
+        #[cfg(windows)]
+        crate::engine::process_util::assign_child_to_kill_job(&child);
+        if let Some(stderr) = child.stderr.take() {
+            let log_cb = self.log_cb.clone();
+            let server_trace = self.server_trace.clone();
+            let engine_last_progress_ms = self.engine_last_progress_ms.clone();
+            std::thread::spawn(move || {
+                let reader = std::io::BufReader::new(stderr);
+                for line in reader.lines() {
+                    let line = match line {
+                        Ok(l) => l,
+                        Err(_) => break,
+                    };
+                    let line = line.trim().to_string();
+                    if !line.is_empty() {
+                        if stderr_line_shows_progress(&line) {
+                            engine_last_progress_ms.store(now_unix_ms(), Ordering::Relaxed);
+                        }
+                        server_trace.push_stderr(line.clone());
+                        if stderr_line_mirrors_to_log(&line) {
+                            log_cb(format!("[llama-server] {}", line));
+                        }
+                    }
+                }
+            });
+        }
+
+        // ── Ждём здоровья (без фолбэков — конфиг уже проверен при первом старте) ──
+        let deadline = Instant::now() + HEALTH_TIMEOUT;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    let _ = child.wait();
+                    let log_tail = read_log_tail(&self.server_log);
+                    return Err(format!(
+                        "Перезапущенный llama-server завершился с кодом {} при старте. {}",
+                        status.code().unwrap_or(-1),
+                        log_tail
+                    ));
+                }
+                Ok(None) => {}
+                Err(e) => return Err(format!("Ошибка ожидания перезапущенного llama-server: {}", e)),
+            }
+            if engine_health_check(&self.client, self.port, &self.auth_header()) {
+                break;
+            }
+            if Instant::now() > deadline {
+                let _ = child.kill();
+                let log_tail = read_log_tail(&self.server_log);
+                return Err(format!(
+                    "Таймаут загрузки модели после перезапуска движка ({} сек). {}",
+                    HEALTH_TIMEOUT.as_secs(),
+                    log_tail
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+
+        *self.child.lock().unwrap() = Some(child);
+        self.current_ngl.set(new_ngl);
+        if new_ngl == 0 {
+            self.engine_mode.replace("cpu".to_string());
+            self.engine_mode_detail.replace(
+                "После CUDA OOM движок перезапущен с полной выгрузкой оффлоада в ОЗУ.".to_string(),
+            );
+        }
+        (self.log_cb)(format!("✅ Перезапуск движка с -ngl {} завершён, сервер здоров.", new_ngl));
+        Ok(())
+    }
+
+    /// Обёртка над run_chat_completions с авто-повтором при CUDA OOM.
+    /// Повторяет ЗАПРОС (не трогая историю сессии — результат ещё не записан):
+    /// 1-я OOM → перезапуск с влезающим -ngl; 2-я OOM → полный перевод в ОЗУ (ngl=0);
+    /// 3-я → честная ошибка (без обещаний «запуск с меньшим -ngl автоматический»).
+    pub(crate) fn run_chat_completions_with_oom_retry<F, L>(
+        &self,
+        messages: &[LlmMessage],
+        attachments: Option<&[ChatAttachment]>,
+        max_tokens: usize,
+        params: &ModelParams,
+        stop_words: &[String],
+        grammar: Option<GrammarSpec>,
+        disable_reasoning: bool,
+        cancel_flag: Arc<AtomicBool>,
+        ctx_label: &str,
+        tool_choice: Option<&str>,
+        tools: Option<Vec<ToolDefinition>>,
+        mut progress_cb: F,
+        log_cb: L,
+    ) -> Result<GenerationResult, String>
+    where F: FnMut(f32, &str), L: Fn(String)     {
+        let mut step: u8 = 0;
+        let mut stream_retry_used = false;
+        loop {
+            let result = self.run_chat_completions(
+                messages,
+                attachments,
+                max_tokens,
+                params,
+                stop_words,
+                grammar.clone(),
+                disable_reasoning,
+                cancel_flag.clone(),
+                ctx_label,
+                tool_choice,
+                tools.as_deref(),
+                &mut progress_cb,
+                &log_cb,
+            );
+            let err = match result {
+                Ok(r) => return Ok(r),
+                Err(e) => e,
+            };
+            // Пользователь нажал «Стоп»: движок/стрим могли оборваться ИЗ-ЗА остановки,
+            // а не из-за OOM — повторять запрос запрещено (иначе «Стоп» игнорируется).
+            if cancel_flag.load(Ordering::SeqCst) {
+                return Err(strip_stream_retry_marker(&err));
+            }
+            if should_retry_stream(false, stream_retry_used, &err) {
+                stream_retry_used = true;
+                (self.log_cb)("🔄 Стрим оборвался до первого токена — повторяю запрос 1/1.".to_string());
+                log::warn!("Стрим оборвался до первого токена: {}", strip_stream_retry_marker(&err));
+                continue;
+            }
+            if is_stream_retry_candidate(&err) {
+                log::error!("LLM генерация [{}]: {}", ctx_label, strip_stream_retry_marker(&err));
+            }
+            let err = strip_stream_retry_marker(&err);
+            // OOM-детект: (1) явные маркеры в тексте ошибки и/или в хвосте лога движка;
+            // (2) «молчаливая смерть» стрима — сервер убит БЕЗ печати OOM (драйвер
+            // сбросил GPU по TDR раньше, чем ggml написал диагноз), при этом пиковый
+            // расход VRAM во время генерации ≥ 85% карты (см. incident: на 98% VRAM в
+            // логе остался только print_timing, stderr оборвался на error decoding).
+            let silent_death = is_silent_generation_death(&err);
+            let log_tail = read_log_tail(&self.server_log);
+            let log_tail_oom = is_cuda_oom_text(&log_tail);
+            let vram_pressure = if silent_death {
+                match (vram_peak_mb_from_error(&err), current_vram_total_free_mb()) {
+                    (Some(peak_mb), Some((total_mb, _))) if total_mb > 0.0 => peak_mb >= total_mb * 0.85,
+                    _ => false,
+                }
+            } else {
+                false
+            };
+            // Host-RAM отказ (pinned-буферы BeeLlama, инцидент 30.10.26) — ПЕРЕД
+            // CUDA-веткой: там ответ «урезать -ngl», что при host-отказе делает
+            // причину ХУЖЕ (больше слоёв уйдёт в ОЗУ). Честный отказ + факт в чат.
+            if is_host_memory_oom_text(&err) || is_host_memory_oom_text(&log_tail) {
+                (self.log_cb)("❌ Движку не хватило обычной памяти (ОЗУ) под pinned-буферы. Повтор не поможет: памяти не прибавится.".to_string());
+                crate::engine::notify_vram(crate::engine::vram::vram_oom_fact_notice(
+                    "оперативная память (ОЗУ) под pinned-буферы движка",
+                    "Уменьшите размер контекста в настройках или закройте другие приложения; при оффлоаде части слоёв в ОЗУ — увеличьте число GPU-слоёв.",
+                ));
+                return Err(format!(
+                    "{} Движку не хватило обычной памяти (ОЗУ) под pinned-буферы (используется нулевой копией KV/вычислений). \
+                     Уменьшите контекст в настройках или закройте другие приложения.",
+                    err
+                ));
+            }
+            let err_is_oom = is_cuda_oom_text(&err) || log_tail_oom || vram_pressure;
+            if step >= 2 || !self.can_oom_retry() || !err_is_oom {
+                return Err(err);
+            }
+            step += 1;
+            let next_ngl = self.oom_next_ngl(step);
+            if next_ngl >= self.current_ngl.get() {
+                // урезать нечего — повтор не поможет
+                return Err(err);
+            }
+            (self.log_cb)(format!(
+                "🔄 CUDA OOM при генерации — автоматический перезапуск движка с меньшим оффлоадом (-ngl {} → {}), шаг {}/2...",
+                self.current_ngl.get(),
+                next_ngl,
+                step
+            ));
+            log::warn!("CUDA OOM → автоперезапуск с -ngl {} (шаг {}/2)", next_ngl, step);
+            // Факт нехватки — от самого движка (OOM-детект) → честное сообщение
+            // в чат (vram.rs: «не хватило» разрешено только здесь).
+            crate::engine::notify_vram(crate::engine::vram::vram_oom_fact_notice(
+                "видеопамять при генерации (CUDA OOM)",
+                "Автоматически перезапускаю движок с меньшим оффлоадом.",
+            ));
+            if let Err(resp_err) = self.respawn_with_ngl(next_ngl) {
+                return Err(format!(
+                    "{}\n\nНе удалось перезапустить движок для авто-повтора: {}",
+                    err, resp_err
+                ));
+            }
+        }
+    }
+
+    /// Задаёт грамматику для СЛЕДУЮЩЕГО вызова generate_chat/generate_chat_multimodal.
+    /// Грамматика «потребляется» одним вызовом (consume-and-clear), поэтому
+    /// повторные итерации цикла агента (докачки, компакты, результаты tools)
+    /// автоматически получают базовую грамматику, а не per-agent.
+    pub fn set_grammar(&self, spec: Option<GrammarSpec>) {
+        *self.pending_grammar.lock().unwrap() = spec;
+    }
+
+    /// Подписывает получателя на поток размышлений модели (`reasoning_content`).
+    ///
+    /// Нужен, чтобы юзер видел ход мыслей в реальном времени: у reasoning-моделей
+    /// фаза размышлений может длиться дольше всего остального запроса, и без
+    /// подписки экран молчит минутами, а лог копит «Первый токен через 900 с».
+    /// Канал отдельный от `stream_cb`, чтобы мысли не попадали в разбор
+    /// JSON-envelope у агентов Method 3.
+    pub fn set_reasoning_sink(&self, sink: Arc<dyn Fn(String) + Send + Sync>) {
+        *self.reasoning_cb.borrow_mut() = sink;
+    }
+
+    /// Забирает заданную грамматику для текущего вызова (consume-and-clear).
+    pub(crate) fn take_pending_grammar(&self) -> Option<GrammarSpec> {
+        self.pending_grammar.lock().unwrap().take()
+    }
+
+    /// Задаёт инструменты (OpenAI tools[]) для СЛЕДУЮЩЕГО вызова
+    /// generate_chat/generate_chat_multimodal (consume-and-clear), по аналогии
+    /// с set_grammar(). Нативный tool-calling: модель сама решает, когда
+    /// вызвать инструмент (tool_choice задаётся отдельным аргументом вызова).
+    /// Одновременную задачу tools + grammar движок не принимает → в
+    /// run_chat_completions грамматика гасится, если переданы tools.
+    pub fn set_tools(&self, tools: Option<Vec<ToolDefinition>>) {
+        *self.pending_tools.lock().unwrap() = tools;
+    }
+
+    /// Забирает заданные инструменты для текущего вызова (consume-and-clear).
+    pub(crate) fn take_pending_tools(&self) -> Option<Vec<ToolDefinition>> {
+        self.pending_tools.lock().unwrap().take()
+    }
+
+    pub fn generate_chat<F, L>(
+        &self,
+        messages: &[LlmMessage],
+        max_tokens: usize,
+        model_params: &ModelParams,
+        _format_type: &str,
+        disable_reasoning: bool,
+        cancel_flag: Arc<AtomicBool>,
+        ctx_label: &str,
+        tool_choice: Option<&str>,
+        progress_cb: F,
+        log_cb: L,
+    ) -> Result<GenerationResult, String>
+    where F: FnMut(f32, &str), L: Fn(String) {
+        // Рендер промпта выполняет движок (llama.cpp jinja по GGUF chat_template) —
+        // единый канонический путь для ВСЕХ моделей. Формат из GGUF нужен только
+        // для стоп-слов и базовой грамматики.
+        let actual_format = PromptFormat::detect_from_gguf(&self.model_path);
+        log_cb(format!(
+            "🎯 Рендер промпта: chat template из GGUF (движок llama.cpp, jinja), формат {:?} — стоп-слова и грамматика",
+            actual_format
+        ));
+        let words = actual_format.get_stop_words();
+        let stop_words = merged_stop_words(&words);
+        let pending = self.take_pending_grammar();
+        let grammar = pending.or_else(|| build_base_grammar(&actual_format).map(|gbnf| GrammarSpec { gbnf: Some(gbnf), json_schema: None }));
+        let tools = self.take_pending_tools();
+        self.run_chat_completions_with_oom_retry(messages, None, max_tokens, model_params, &stop_words, grammar, disable_reasoning, cancel_flag, ctx_label, tool_choice, tools, progress_cb, log_cb)
+    }
+}
+
+impl Drop for LlamaEngine {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.lock().unwrap().take() {
+            let pid = child.id();
+            crate::engine::process_util::unregister_engine_pid(pid);
+            log::info!("🔻 Остановка llama-server (pid {})", pid);
+            // kill_process_tree убивает всё дерево (на Windows `child.kill()`
+            // оставил бы потомков «висящими» в памяти).
+            crate::engine::process_util::kill_process_tree(&mut child);
+            let _ = child.wait();
+        }
+    }
+}
+
+/// Верхняя «санитарная» граница скорости (токен/с). Скорости выше — заведомый мусор:
+/// llama.cpp печатает/отдаёт fallback 1000000.0 ток/с, когда время генерации замерилось
+/// нулём (обычно на генерации из одного токена с `predicted_ms == 0`).
+const MAX_SANE_TOK_PER_SEC: f64 = 10_000.0;
+
+/// Принимает только достоверные скорости движка: конечные, положительные и ниже
+/// физически достижимого потолка. Мусор (0, inf, nan, fallback 1_000_000) отсекается,
+/// чтобы в бейдж/логи не попадало «1 млн ток/с» из llama.cpp.
+fn is_sane_rate(v: f64) -> bool {
+    v.is_finite() && v > 0.0 && v < MAX_SANE_TOK_PER_SEC
+}
+
+#[derive(Deserialize, Default)]
+struct Timings {
+    #[serde(default)]
+    predicted_per_second: f64,
+    #[serde(default, alias = "predicted_n")]
+    predicted_n: u32,
+    #[serde(default)]
+    prompt_n: u32,
+    #[serde(default)]
+    prompt_per_second: f64,
+}
+
+#[derive(Deserialize, Default)]
+struct ChatDelta {
+    #[serde(default)]
+    content: Option<String>,
+    /// Думатель модели: llama.cpp с --reasoning-format deepseek отдаёт его
+    /// отдельным полем reasoning_content (Ollama использует то же имя).
+    #[serde(default, alias = "thinking")]
+    reasoning_content: Option<String>,
+    /// Фрагменты вызова инструментов (нативный OpenAI tools[]). Каждый чанк
+    /// доклеивает index/id/name/arguments к соответствующему аккумулятору.
+    #[serde(default)]
+    tool_calls: Vec<ToolCallDelta>,
+}
+
+/// Чанк накапливаемого вызова инструмента в SSE-дельте.
+#[derive(Deserialize, Default)]
+struct ToolCallDelta {
+    #[serde(default)]
+    index: usize,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    function: Option<ToolCallFunctionDelta>,
+}
+
+/// Функция в чанке вызова инструмента: имя и фрагменты JSON-аргументов.
+#[derive(Deserialize, Default)]
+struct ToolCallFunctionDelta {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ChatChoice {
+    #[serde(default)]
+    delta: ChatDelta,
+    #[serde(default)]
+    finish_reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ChatCompletionEvent {
+    #[serde(default)]
+    choices: Vec<ChatChoice>,
+    #[serde(default)]
+    tokens_evaluated: u32,
+    #[serde(default)]
+    timings: Option<Timings>,
+}
+
+/// Объединение стоп-слов: статический список + стоп-слова формата промпта
+pub(crate) fn merged_stop_words(format_words: &[&'static str]) -> Vec<String> {
+    let mut stops: Vec<String> = DEFAULT_STOP_WORDS.iter().map(|s| s.to_string()).collect();
+    for w in format_words {
+        if !stops.iter().any(|s| s == w) {
+            stops.push(w.to_string());
+        }
+    }
+    stops
+}
+
+/// Лёгкая защита от зацикливания: ищем повторяющиеся подстроки в хвосте текста
+/// (аппаратный аналог N-gram loop-detection; сэмплинг и DRY теперь нативно в сервере).
+fn detect_repetition(text: &str, log_cb: &impl Fn(String)) -> bool {
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    if n < 32 {
+        return false;
+    }
+    let window = &chars[n.saturating_sub(1024)..];
+    let w = window.len();
+    let max_len = 256.min(w / 4);
+    for l in 8..=max_len {
+        if w < l * 4 {
+            continue;
+        }
+        let block = &window[w - l..];
+        let mut is_loop = true;
+        for i in 1..4 {
+            let start = w - l * (i + 1);
+            let end = w - l * i;
+            if &window[start..end] != block {
+                is_loop = false;
+                break;
+            }
+        }
+        if is_loop {
+            log_cb(format!(
+                "🛑 Аппаратная защита: обнаружено зацикливание фразы (повтор подстроки из {} символов). Жёсткое прерывание.",
+                l
+            ));
+            return true;
+        }
+    }
+    false
+}
+
+fn truncate_str(s: &str, max: usize) -> String {
+    let end = s.char_indices()
+        .take_while(|(i, _)| *i < max)
+        .last()
+        .map(|(i, c)| i + c.len_utf8())
+        .unwrap_or(max.min(s.len()));
+    format!("{}", &s[..end])
+}
+
+/// Полная цепочка источников ошибки (reqwest → hyper → io/tls), до 3 уровней.
+/// Одиночный to_string() у reqwest скрывает реальную причину (порт закрыт
+/// и т.п.), цепочка source() показывает её.
+pub fn chain_err(e: &dyn std::error::Error, max: usize) -> String {
+    let mut msg = String::new();
+    let mut cur: Option<&dyn std::error::Error> = Some(e);
+    for _ in 0..=max {
+        let Some(c) = cur else { break };
+        if !msg.is_empty() {
+            msg.push_str(" → ");
+        }
+        msg.push_str(&c.to_string());
+        cur = c.source();
+    }
+    msg
+}
+
+fn is_stream_retry_candidate(message: &str) -> bool {
+    // contains, а не starts_with: сообщение проходит через
+    // `stream_diagnostics::format()`, который ставит ПЕРЕД маркером префикс
+    // "STREAM_DIAGNOSTIC " (инцидент 30.10.26: при starts_with ретрай не
+    // срабатывал ни разу — тест кормил голый маркер, которого в проде не бывает).
+    message.contains(STREAM_RETRY_MARKER)
+}
+
+fn should_retry_stream(cancelled: bool, retry_used: bool, message: &str) -> bool {
+    !cancelled && !retry_used && is_stream_retry_candidate(message)
+}
+
+fn strip_stream_retry_marker(message: &str) -> String {
+    // Удаление по find, а не strip_prefix: маркер может стоять после префикса
+    // "STREAM_DIAGNOSTIC " (см. is_stream_retry_candidate).
+    match message.find(STREAM_RETRY_MARKER) {
+        Some(idx) => {
+            let head = &message[..idx];
+            let tail = message[idx + STREAM_RETRY_MARKER.len()..]
+                .trim_start()
+                .to_string();
+            format!("{}{}", head, tail).trim_start().to_string()
+        }
+        None => message.to_string(),
+    }
+}
+
+/// Хвост лога движка для диагностики ошибок запуска
+fn read_log_tail(path: &Path) -> String {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return String::new();
+    };
+    format_log_tail(&content)
+}
+
+fn format_log_tail(content: &str) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    let recent_start = lines.len().saturating_sub(50);
+    let error_indices: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .rev()
+        .filter(|(_, line)| {
+            let lower = line.to_lowercase();
+            lower.contains("error") || lower.contains("failed") || lower.contains("oom")
+                || lower.contains("exception") || lower.contains("fatal")
+        })
+        .take(20)
+        .map(|(index, _)| index)
+        .collect();
+    let mut selected = std::collections::BTreeSet::new();
+    for index in &error_indices {
+        selected.insert(*index);
+    }
+    for index in recent_start..lines.len() {
+        selected.insert(index);
+    }
+    let body = selected
+        .into_iter()
+        .filter_map(|index| lines.get(index).map(|line| line.trim_end()))
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let status = if error_indices.is_empty() {
+        "В последних 50 строках llama-server явных ошибок нет."
+    } else {
+        "Сначала показаны последние строки с ошибками, затем остальные строки запуска."
+    };
+    format!("\n--- хвост лога llama-server ---\n{}\n{}", status, body)
+}
+
+/// Проверка: упал ли llama-server из-за ОШИБКИ ЗАГРУЗКИ проектора mmproj
+/// (битый/несовместимый файл, нечитаемый тензор и т.п.).
+fn is_mmproj_load_error(log: &str) -> bool {
+    let l = log.to_lowercase();
+    l.contains("clip_init")
+        || l.contains("mtmd_init")
+        || l.contains("failed to load multimodal")
+        || (l.contains("failed to seek for tensor"))
+        || (l.contains("failed to load model") && l.contains("mmproj"))
+}
+
+/// Проверка: требует ли модель проектор, которого не передали
+/// (VL-модель запущена без --mmproj).
+fn is_mmproj_required_error(log: &str) -> bool {
+    let l = log.to_lowercase();
+    (l.contains("multimodal") && (l.contains("no multimodal projector") || l.contains("no mmproj") || l.contains("no projector") || l.contains("requires a multimodal")))
+        || (l.contains("model is multimodal") && l.contains("projector"))
+}
+
+/// Извлекает из лога конкретную строку с ошибкой проектора — для понятного сообщения.
+fn mmproj_error_detail(log: &str) -> String {
+    for line in log.lines().rev() {
+        let l = line.to_lowercase();
+        if (l.contains("mmproj") || l.contains("clip") || l.contains("mtmd") || l.contains("tensor") || l.contains("multimodal"))
+            && (l.contains("error") || l.contains("failed") || l.contains("exiting"))
+        {
+            return line.trim().to_string();
+        }
+    }
+    for line in log.lines().rev() {
+        let l = line.to_lowercase();
+        if l.contains("error") || l.contains("failed") {
+            return line.trim().to_string();
+        }
+    }
+    "неизвестная ошибка загрузки проектора".to_string()
+}
+
+/// Детектор CUDA OOM по тексту (ошибка/хвост лога llama-server).
+fn is_cuda_oom_text(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    lower.contains("out of memory")
+        || lower.contains("cuda error: out of memory")
+        || lower.contains("cuda_malloc failed")
+        || lower.contains("ggml_cuda: out of memory")
+        || ((lower.contains("cu memory") || lower.contains("cumemalloc")) && lower.contains("failed"))
+        || lower.contains("not enough memory")
+        || lower.contains("insufficient memory")
+        || lower.contains("cudaerrormemoryallocation")
+        || lower.contains("nomemory")
+}
+
+/// Детектор нехватки ОБЫЧНОЙ памяти (host RAM) — pinned-буферы BeeLlama.
+/// Инцидент 30.10.26: на 16 ГБ ОЗУ аллокация 4.6-5.4 ГБ падала, тексты не
+/// матчились ни одним детектором → generic EngineCrash без диагноза и ретрая.
+/// ДОЛЖЕН быть отдельным от `is_cuda_oom_text`: направление фикса ОБРАТНОЕ —
+/// понижение -ngl УВЕЛИЧИВАЕТ host-давление (меньше слоёв на GPU = больше
+/// в ОЗУ), поэтому host-отказ запрещено маршрутизировать в respawn с меньшим
+/// оффлоадом (§00.2: маршрут не должен делать причину отказа хуже).
+fn is_host_memory_oom_text(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    // Реальные строки крэша (лог 30.10.26, дословно):
+    //   ggml_gallocr_reserve_n_impl: failed to allocate CUDA_Host buffer of size 4811427936
+    //   graph_reserve: failed to allocate compute buffers
+    //   llama_init_from_model: failed to initialize the context: failed to allocate compute pp buffers
+    //   ggml_backend_cpu_buffer_type_alloc_buffer: failed to allocate buffer of size 4811427936
+    lower.contains("cuda_host buffer")
+        || lower.contains("graph_reserve")
+        || (lower.contains("failed to allocate") && lower.contains("compute"))
+        || (lower.contains("cpu_buffer_type_alloc_buffer") && lower.contains("failed to allocate"))
+}
+
+/// «Молчаливая смерть» llama-server при генерации: HTTP-поток оборвался БЕЗ явного
+/// OOM-текста (сброс соединения, разрыв тела ответа). Такое бывает, когда CUDA-ресурс
+/// завис и драйвер сбросил GPU (TDR) раньше, чем движок успел напечатать ggml-диагноз.
+fn is_silent_generation_death(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    lower.contains("error decoding response body")
+        || lower.contains("чтения потока генерации")
+        || lower.contains("connection reset")
+        || lower.contains("connection aborted")
+        || lower.contains("broken pipe")
+        || lower.contains("unexpected eof")
+        || lower.contains("stream closed")
+        || lower.contains("io error")
+}
+
+/// Пиковое потребление VRAM (МБ) из текста ошибки — строка «VRAM=NNNN МБ» из
+/// `err_details` (MemReport). None, если семплер не собрал данных.
+fn vram_peak_mb_from_error(text: &str) -> Option<f64> {
+    let marker = "VRAM=";
+    let idx = text.find(marker)?;
+    let digits: String = text[idx + marker.len()..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse::<f64>().ok().filter(|v| *v > 0.0)
+}
+
+/// (total, free) VRAM в МБ по NVML. None — NVML недоступен.
+fn current_vram_total_free_mb() -> Option<(f64, f64)> {
+    let nvml = nvml_wrapper::Nvml::init().ok()?;
+    let device = nvml.device_by_index(0).ok()?;
+    let mem = device.memory_info().ok()?;
+    Some((
+        mem.total as f64 / (1024.0 * 1024.0),
+        mem.free as f64 / (1024.0 * 1024.0),
+    ))
+}
+
+/// Возвращает понятную формулировку ошибки, если llama-server реально упал
+/// от нехватки видеопамяти (CUDA OOM). Иначе возвращает исходный `reason`
+/// без изменений. Юзер видит ГЛАВНЫЙ совет, а не хвост ggml-лога.
+fn cuda_oom_friendly_reason(log_tail: &str, reason: &str) -> String {
+    if !is_cuda_oom_text(log_tail) {
+        return reason.to_string();
+    }
+    format!(
+        "{} Модель не поместилась в видеопамять (CUDA OOM): GPU-слои + KV-кэш + буферы превысили свободную VRAM. \
+         Приложение автоматически повторит запрос с меньшим GPU-оффлоадом (шаг 1: урезан до влезающего; шаг 2: весь оффлоад в ОЗУ). \
+         Если не поможет — уменьшите контекст (Настройки → размер контекста) или выберите более лёгкую квантизацию модели.",
+        reason
+    )
+}
+
+/// Проверка готовности llama-server по HTTP /health (без создания структуры engine).
+fn engine_health_check(client: &Client, port: u16, auth: &str) -> bool {
+    client
+        .get(format!("http://127.0.0.1:{}/health", port))
+        .header(AUTHORIZATION, auth)
+        .timeout(Duration::from_secs(3))
+        .send()
+        .map(|r| r.status().is_success())
+        .unwrap_or(false)
+}
+
+/// Поиск в логе llama-server реальной причины CPU-фолбэка (почему CUDA не сработала).
+/// Возвращает человекочитаемый диагноз или пустую строку.
+fn diagnose_cuda_fallback(log_path: &Path) -> String {
+    let content = match std::fs::read_to_string(log_path) {
+        Ok(c) => c,
+        Err(_) => return String::new(),
+    };
+    let lower = content.to_lowercase();
+    // (паттерн в логе, человекочитаемое объяснение)
+    const PATTERNS: &[(&str, &str)] = &[
+        ("no kernel image", "в сборке движка нет ядер для вашей видеокарты (для RTX 50xx / Blackwell нужен вариант cuda-13.x)"),
+        ("driver version is insufficient", "драйвер NVIDIA слишком старый для этой CUDA-сборки (для cuda-13.x нужен драйвер 580+ / CUDA 13, для cuda-12.4 — 527.41+)"),
+        ("compute capability", "в сборке движка нет ядер для вашего GPU (compute capability)"),
+        ("invalid device function", "драйвер NVIDIA слишком старый для этой CUDA-сборки (обновите драйвер до ≥ 551.78 / CUDA 12.4)"),
+        ("failed to initialize cuda", "CUDA не инициализировалась — неполадка драйвера"),
+        ("cuda error", "ошибка CUDA"),
+        ("ggml_cuda", "ошибка CUDA-бэкенда"),
+        ("cuda", "CUDA-проблемы в логе движка"),
+    ];
+    for (needle, reason) in PATTERNS {
+        if !lower.contains(needle) {
+            continue;
+        }
+        for line in content.lines().rev().take(60) {
+            if line.to_lowercase().contains(needle) {
+                return format!("{} (из лога: {})", reason, line.trim());
+            }
+        }
+        return reason.to_string();
+    }
+    String::new()
+}
+
+// ─── Слияние подряд идущих assistant (HTTP 400 «2+ assistant в конце») ───
+
+/// Слияние соседних assistant-сообщений со СТРОКОВЫМ content без tool-семантики.
+///
+/// Первопричина: механика докачки/сжатия в хосте может оставить в конце списка
+/// ДВА assistant (тезисы размышлений + сырой обрывок). Чат-шаблон Gemma в
+/// llama-server отвергает такой список ошибкой 400 «Cannot have 2 or more
+/// assistant messages at the end of the list» — ход терялся целиком. Слияние
+/// делает ситуацию структурно невозможной (одна trailing assistant разрешена —
+/// prefill-режим докачки жив).
+///
+/// НЕ мерджатся: assistant с `tool_calls` (семантика tool-loop), сообщения с
+/// `tool_call_id`, parts-контент (вложения — массив, только у последнего user),
+/// а также любая пара, где content не строка (null/массив).
+pub fn merge_consecutive_assistant(messages: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+    let is_mergeable =
+        |m: &serde_json::Value| -> bool {
+            m.get("role").and_then(|r| r.as_str()) == Some("assistant")
+                && m.get("content").map_or(false, |c| c.is_string())
+                && m.get("tool_calls").is_none()
+                && m.get("tool_call_id").is_none()
+        };
+    let mut out: Vec<serde_json::Value> = Vec::with_capacity(messages.len());
+    for msg in messages {
+        if is_mergeable(&msg)
+            && out.last().map_or(false, is_mergeable)
+        {
+            if let Some(prev) = out.last_mut() {
+                let joined = format!(
+                    "{}\n\n{}",
+                    prev["content"].as_str().unwrap_or(""),
+                    msg["content"].as_str().unwrap_or("")
+                );
+                prev["content"] = serde_json::Value::String(joined);
+            }
+            continue;
+        }
+        out.push(msg);
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ─── Таймауты фаз обмена с llama-server ───
+
+    /// Регрессия (инцидент у юзера на GTX 1070 Ti): prompt eval длился дольше
+    /// 30 с, скрытый дефолт reqwest рвал стрим, и наш `first_token`-бюджет
+    /// никогда не успевал сработать. Проверяем именно РАЗДЕЛЕНИЕ фаз:
+    /// до первого байта — большой бюджет, после — короткий.
+    #[test]
+    fn stream_timeouts_use_large_budget_only_before_first_byte() {
+        let t = StreamTimeouts::default();
+        assert!(
+            t.first_token > Duration::from_secs(300),
+            "бюджет prompt eval должен переживать медленный CPU, got {:?}",
+            t.first_token
+        );
+        assert!(
+            t.inter_token < t.first_token,
+            "пауза между токенами не должна быть длиннее ожидания первого токена"
+        );
+        assert!(
+            t.wait_for(false) == t.first_token,
+            "до первого байта нужен бюджет prompt eval"
+        );
+        assert!(
+            t.wait_for(true) == t.inter_token,
+            "после первого байта нужен таймаут зависания генерации"
+        );
+    }
+
+    /// Бюджет фазы заголовков — сторожевой таймер «сервер принял соединение, но
+    /// не ответил». Он не про префилл (это `first_token`), поэтому держать его
+    /// равным бюджету первого токена смысла нет: достаточно многократного
+    /// превышения времени коннекта, чтобы отличить «движок думает» от «сокет мёртв».
+    #[test]
+    fn headers_budget_is_well_above_connect_timeout() {
+        let t = StreamTimeouts::default();
+        let connect = Duration::from_secs(5);
+        assert!(
+            t.headers >= connect * 20,
+            "заголовки {:?} слишком близко к коннекту {:?} — не отличим зависший движок от ожидания",
+            t.headers,
+            connect
+        );
+        assert!(
+            t.headers <= t.first_token,
+            "очередь слота ждёт меньше, чем сам prompt eval — иначе значения перепутаны"
+        );
+    }
+
+    // ─── Liveness-сторож по stderr (инцидент 30.10.26) ───
+
+    /// G5: строки прогресса распознаются на РЕАЛЬНОЙ форме stderr из лога
+    /// юзера (30.10.26, `[llama-server]` с ANSI-кодами времени и уровня).
+    /// Раньше именно разница «тестовая форма vs продовая» убила ретрай —
+    /// здесь повторять эту ошибку запрещено.
+    #[test]
+    fn stderr_progress_lines_from_real_log_are_recognized() {
+        // Генерация: растущий n_gen каждые ~3 сек (строки 248-276 лога).
+        let gen = "\u{1b}[34m2.53.844.948\u{1b}[0m \u{1b}[32mI \u{1b}[0mslot print_timing: id  0 | task 0 | n_gen =    302, tg =   5.09 t/s, tg_3s =   4.84 t/s";
+        assert!(stderr_line_shows_progress(gen), "print_timing с n_gen обязан быть прогрессом");
+        // Префилл: prompt processing с progress = 0.77 (строка 245 лога).
+        let prefill = "\u{1b}[34m1.50.703.145\u{1b}[0m \u{1b}[32mI \u{1b}[0mslot print_timing: id  0 | task 0 | prompt processing, n_tokens =   1699, progress = 0.77, t =  14.17 s / 119.89 tokens per second";
+        assert!(stderr_line_shows_progress(prefill), "print_timing префилла обязан быть прогрессом");
+        // Старая сборка: eval progress без print_timing.
+        assert!(stderr_line_shows_progress("prompt eval progress = 0.55"));
+        assert!(stderr_line_shows_progress("eval progress = 10/100"));
+        // НЕ прогресс: init/слот/шаблон — на них сторож ждать не продлевает.
+        assert!(!stderr_line_shows_progress("srv init_listene: The UI is disabled"));
+        assert!(!stderr_line_shows_progress("slot get_availabl: id  0 | task -1 | selected slot by LRU, n_tokens = 0, t_last = -1"));
+        assert!(!stderr_line_shows_progress("srv  chat_template:.chat_template"));
+    }
+
+    /// Зеркало stderr в лог приложения гейтится ТЕМ ЖЕ классификатором, что
+    /// кормит сторож живости: прогресс-строки (`print_timing` / `eval progress`)
+    /// — рутинный тайминг, не ошибки, в лог приложения не идут (решение
+    /// владельца 14.11.26); ошибки и служебные строки зеркалятся как раньше.
+    #[test]
+    fn progress_lines_are_not_mirrored_to_app_log() {
+        let gen = "\u{1b}[34m2.53.844.948\u{1b}[0m \u{1b}[32mI \u{1b}[0mslot print_timing: id  0 | task 0 | n_gen =    302, tg =   5.09 t/s, tg_3s =   4.84 t/s";
+        assert!(stderr_line_shows_progress(gen), "тайминг генерации — прогресс");
+        assert!(!stderr_line_mirrors_to_log(gen), "print_timing не должен попадать в лог приложения");
+        let prefill = "\u{1b}[34m1.50.703.145\u{1b}[0m \u{1b}[32mI \u{1b}[0mslot print_timing: id  0 | task 0 | prompt processing, n_tokens =   1699, progress = 0.77, t =  14.17 s / 119.89 tokens per second";
+        assert!(!stderr_line_mirrors_to_log(prefill), "тайминг префилла не должен попадать в лог приложения");
+        assert!(
+            stderr_line_mirrors_to_log("slot get_availabl: id  0 | task -1 | selected slot by LRU, n_tokens = 0, t_last = -1"),
+            "слот-строки без print_timing — не прогресс, зеркалятся"
+        );
+        assert!(
+            stderr_line_mirrors_to_log("ggml_backend_cuda_buffer_type_alloc_buffer: failed to allocate"),
+            "ошибки движка зеркалятся"
+        );
+    }
+
+    /// G5: решение сторожа — свежий прогресс движка продолжает ожидание,
+    /// тишина движка или превышение капа ведут к обрыву.
+    #[test]
+    fn liveness_continues_only_on_fresh_engine_progress_under_cap() {
+        // Движок генерирует (print_timing 3 сек назад), стрим молчит 60 сек —
+        // точный кейс юзера: ждать дальше, НЕ убивать живую генерацию.
+        assert!(stream_timeout_should_wait(Duration::from_secs(60), 3_000));
+        // Движок молчит 10+ сек (мёртв/завис) — обрыв, прежнее поведение.
+        assert!(!stream_timeout_should_wait(Duration::from_secs(60), 10_000));
+        assert!(!stream_timeout_should_wait(Duration::from_secs(60), u64::MAX / 2));
+        // Свежий прогресс, но кап достигнут — патология «генерит вечно, SSE
+        // не отдаёт ничего» ограничена: обрыв.
+        assert!(!stream_timeout_should_wait(STREAM_LIVENESS_HARD_CAP, 0));
+        // Границы строгие: порог и кап включительно считаются нарушением.
+        assert!(!stream_timeout_should_wait(Duration::from_secs(599), STREAM_LIVENESS_FRESH_MS));
+        assert!(stream_timeout_should_wait(Duration::from_secs(599), STREAM_LIVENESS_FRESH_MS - 1));
+    }
+
+    /// Числа сторожа выведены из худшего легитимного молчания (tasks/31.10.26):
+    /// think до 1500 токенов при 3 t/s = 500 сек + префилл ~20 сек < капа;
+    /// порог свежести — запас > 2 периодов печати print_timing (~3 сек).
+    /// Изменение констант без пересчёта обоснования — ошибка.
+    #[test]
+    fn liveness_constants_cover_worst_legitimate_silence() {
+        let worst_think_silence = Duration::from_secs(500 + 20);
+        assert!(
+            STREAM_LIVENESS_HARD_CAP > worst_think_silence,
+            "кап {:?} не должен обрезать легитимный think-марафон {:?}",
+            STREAM_LIVENESS_HARD_CAP,
+            worst_think_silence
+        );
+        assert_eq!(STREAM_LIVENESS_HARD_CAP, Duration::from_secs(600));
+        assert!(STREAM_LIVENESS_FRESH_MS > 2 * 3_000);
+    }
+
+    /// Один слот — потому что запросы строго последовательные. При дефолте 4
+    /// llama-server умножал `-c` на 4 и резервировал KV вчетверо больший.
+    #[test]
+    fn engine_is_launched_with_single_slot() {
+        assert_eq!(
+            crate::engine::vram_estimate::SERVER_N_PARALLEL, 1,
+            "движок обязан запускаться с одним слотом"
+        );
+    }
+
+    #[test]
+    fn cuda_fallback_diagnosis_finds_no_kernel_image() {
+        let dir = std::env::temp_dir().join(format!("diag_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("llama_server.log");
+        std::fs::write(&log, concat!(
+            "load_backend: loaded CUDA backend\n",
+            "CUDA error: no kernel image is available for execution on the device (CUDA_ERROR_NO_KERNEL_IMAGE)\n",
+            "llama_model_load: error loading model: failed to load model\n"
+        )).unwrap();
+        let diag = diagnose_cuda_fallback(&log);
+        assert!(diag.contains("нет ядер"), "diag: {}", diag);
+        assert!(diag.contains("no kernel image"), "diag: {}", diag);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cuda_fallback_diagnosis_empty_on_clean_log() {
+        let dir = std::env::temp_dir().join(format!("diag2_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("llama_server.log");
+        std::fs::write(&log, "llama server listening on port 17800").unwrap();
+        assert_eq!(diagnose_cuda_fallback(&log), "");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cuda_oom_reason_is_friendly() {
+        let log_tail = "CUDA error: out of memory\n  ggml_cuda: allocating 8388608 bytes failed\n  failed to allocate 8.0 MB\n";
+        let friendly = cuda_oom_friendly_reason(log_tail, "Ошибка чтения потока генерации: error decoding response body");
+        assert!(friendly.contains("CUDA OOM"), "friendly: {}", friendly);
+        assert!(friendly.contains("не поместилась в видеопамять"), "friendly: {}", friendly);
+        assert!(friendly.contains("уменьшите контекст"), "friendly: {}", friendly);
+    }
+
+    #[test]
+    fn cuda_oom_reason_passthrough_when_not_oom() {
+        let log_tail = "llama server listening on port 17800";
+        let reason = "Ошибка чтения потока генерации: error decoding response body";
+        assert_eq!(cuda_oom_friendly_reason(log_tail, reason), reason);
+    }
+
+    #[test]
+    fn cuda_oom_text_detects_only_oom_markers() {
+        assert!(is_cuda_oom_text("ggml_cuda: out of memory\n  failed to allocate 8 MB\n"));
+        assert!(is_cuda_oom_text("llama_model_load: error loading model: not enough memory"));
+        assert!(is_cuda_oom_text("CUDA error: out of memory"));
+        assert!(is_cuda_oom_text("cuMemAlloc failed to allocate 484644864 bytes"));
+        // НЕ путаем с другими CUDA-проблемами (нет ядер, драйвер и т.п.).
+        assert!(!is_cuda_oom_text("no kernel image is available for execution on the device"));
+        assert!(!is_cuda_oom_text("driver version is insufficient"));
+        assert!(!is_cuda_oom_text("invalid device function"));
+    }
+
+    /// Host-RAM отказ BeeLlama (инцидент 30.10.26) обязан распознаваться
+    /// на ДОСЛОВНЫХ строках лога юзера и НЕ матчиться как CUDA OOM:
+    /// у этих двух отказов противоположные фиксы (ngl вниз vs контекст вниз).
+    #[test]
+    fn host_memory_oom_detects_beellama_pinned_failures() {
+        // Дословные строки из лога 30.10.26 (4 попытки, два разных размера).
+        assert!(is_host_memory_oom_text(
+            "ggml_gallocr_reserve_n_impl: failed to allocate CUDA_Host buffer of size 4811427936"
+        ));
+        assert!(is_host_memory_oom_text(
+            "ggml_gallocr_reserve_n_impl: failed to allocate CUDA_Host buffer of size 5650288736"
+        ));
+        assert!(is_host_memory_oom_text("graph_reserve: failed to allocate compute buffers"));
+        assert!(is_host_memory_oom_text(
+            "llama_init_from_model: failed to initialize the context: failed to allocate compute pp buffers"
+        ));
+        assert!(is_host_memory_oom_text(
+            "ggml_backend_cpu_buffer_type_alloc_buffer: failed to allocate buffer of size 4811427936"
+        ));
+        // С(ERROR)-строки с ANSI-кодами (как в логе) — тоже матчатся.
+        assert!(is_host_memory_oom_text(
+            "\u{1b}[31mE ggml_gallocr_reserve_n_impl: failed to allocate CUDA_Host buffer of size 4811427936\u{1b}[0m"
+        ));
+        // Не-ООМ строки не матчатся.
+        assert!(!is_host_memory_oom_text("srv init_listene: The UI is disabled"));
+        assert!(!is_host_memory_oom_text("compute buffer size = 217.00 MiB"));
+        // Дизъюнкция с CUDA-детектором: host-текст не должен уводить в respawn ngl.
+        assert!(!is_cuda_oom_text(
+            "ggml_gallocr_reserve_n_impl: failed to allocate CUDA_Host buffer of size 4811427936"
+        ));
+        assert!(!is_host_memory_oom_text("CUDA error: out of memory"));
+    }
+
+    /// Коэффициент pinned-оценки BeeLlama обязан покрывать ОБА замера крэшей
+    /// 30.10.26 (4588 и 5388 МиБ при ctx=20390) — иначе прогноз пропустит
+    /// реальный отказ; и не быть завышенным более чем на 10% (иначе ложные
+    /// тревоги на исправных машинах).
+    #[test]
+    fn beellama_pinned_estimate_covers_both_measured_crashes() {
+        let need = beellama_pinned_ram_need_mb(20_390);
+        assert!(need >= 5388.0, "оценка {:.0} МиБ не покрывает замер 5388 МиБ", need);
+        assert!(need <= 5388.0 * 1.10, "оценка {:.0} МиБ завышена более чем на 10%", need);
+    }
+
+    #[test]
+    fn stream_retry_marker_is_added_only_before_first_token() {
+        let before = format!(
+            "{}Ошибка чтения потока генерации: error decoding response body",
+            STREAM_RETRY_MARKER
+        );
+        let after = "Ошибка чтения потока генерации: error decoding response body".to_string();
+        assert!(is_stream_retry_candidate(&before));
+        assert_eq!(
+            strip_stream_retry_marker(&before),
+            "Ошибка чтения потока генерации: error decoding response body"
+        );
+        assert!(!is_stream_retry_candidate(&after));
+    }
+
+    /// РЕАЛЬНАЯ продовая форма сообщения: `stream_diagnostics::format()`
+    /// ставит перед маркером префикс "STREAM_DIAGNOSTIC " (инцидент 30.10.26:
+    /// при `starts_with` ретрай не срабатывал ни разу — старый тест кормил
+    /// голый маркер, которого в проде не бывает).
+    #[test]
+    fn stream_retry_works_on_real_stream_diagnostic_shape() {
+        let real = format!(
+            "STREAM_DIAGNOSTIC {}генерация остановилась: нет данных от движка 60 сек | \
+             response=meta | reader=ok | signals=- | elapsed_ms=66600 | first_event_ms=6592 | \
+             first_token_ms=нет | last_data_age_ms=60012 | raw_lines=2 | events=1 | bytes=295 | \
+             output_tokens=0 | reasoning_tokens=0 | finish=нет | server=pid=1; process=running",
+            STREAM_RETRY_MARKER
+        );
+        assert!(
+            is_stream_retry_candidate(&real),
+            "ретрай обязан распознавать маркер после префигса STREAM_DIAGNOSTIC"
+        );
+        assert!(should_retry_stream(false, false, &real));
+        let stripped = strip_stream_retry_marker(&real);
+        assert!(!stripped.contains(STREAM_RETRY_MARKER));
+        assert!(stripped.starts_with("STREAM_DIAGNOSTIC генерация остановилась"));
+        // После первого токена маркера нет — ретрая нет (без изменений).
+        assert!(!is_stream_retry_candidate(
+            "STREAM_DIAGNOSTIC генерация остановилась | output_tokens=5"
+        ));
+    }
+
+    #[test]
+    fn stream_retry_policy_respects_cancel_and_attempt_limit() {
+        let before_first = format!("{}stream error", STREAM_RETRY_MARKER);
+        let after_first_token = "stream error after token".to_string();
+        assert!(should_retry_stream(false, false, &before_first));
+        assert!(!should_retry_stream(false, true, &before_first));
+        assert!(!should_retry_stream(true, false, &before_first));
+        assert!(!should_retry_stream(false, false, &after_first_token));
+    }
+
+    #[test]
+    fn log_tail_prioritizes_errors_and_keeps_recent_lines() {
+        let mut content = String::new();
+        for index in 0..100 {
+            content.push_str(&format!("slot print_timing: prompt processing line {}\n", index));
+        }
+        content.push_str("CUDA error: out of memory\n");
+        for index in 0..10 {
+            content.push_str(&format!("recent line {}\n", index));
+        }
+        let tail = format_log_tail(&content);
+        let error_pos = tail.find("CUDA error").unwrap_or(0);
+        let recent_pos = tail.find("recent line 0").unwrap_or(0);
+        assert!(error_pos > 0);
+        assert!(error_pos < recent_pos);
+        assert!(tail.contains("slot print_timing: prompt processing line 99"));
+    }
+
+    #[test]
+    fn silent_death_detects_stream_breaks_but_not_plain_errors() {
+        assert!(is_silent_generation_death("Ошибка чтения потока генерации: error decoding response body"));
+        assert!(is_silent_generation_death("reqwest: error decoding response body"));
+        assert!(is_silent_generation_death("connection reset by peer"));
+        assert!(is_silent_generation_death("io error: broken pipe"));
+        // Обычные HTTP-ошибки со статусом — НЕ «молчаливая смерть» стрима.
+        assert!(!is_silent_generation_death("llama-server: HTTP 400 при генерации: bad request"));
+        assert!(!is_silent_generation_death("Ошибка отправки запроса генерации: timeout"));
+    }
+
+    #[test]
+    fn vram_peak_parsed_from_error_text() {
+        // Реальный формат err_details: «...VRAM=16081 МБ...».
+        let msg = "Ошибка чтения потока генерации: error decoding response body | пик памяти: llama-server RSS=9742 МБ, приложение RSS=80 МБ, VRAM=16081 МБ.";
+        assert_eq!(vram_peak_mb_from_error(msg), Some(16081.0));
+        // Без VRAM-строки (семплер не работал) — None.
+        assert_eq!(vram_peak_mb_from_error("llama-server: HTTP 500"), None);
+        assert_eq!(vram_peak_mb_from_error(""), None);
+        // VRAM=0 (в начале строки без данных) → None.
+        assert_eq!(vram_peak_mb_from_error("VRAM=0 МБ"), None);
+    }
+
+    #[test]
+    fn is_sane_rate_rejects_llama_fallback_and_garbage() {
+        // Fallback llama.cpp: скорость «1 млн ток/с» при генерации 1 токена с нулевым временем.
+        assert!(!is_sane_rate(1_000_000.0), "llama fallback не должен приниматься");
+        assert!(!is_sane_rate(f64::INFINITY), "inf не должен приниматься");
+        assert!(!is_sane_rate(f64::NAN), "nan не должен приниматься");
+        assert!(!is_sane_rate(0.0), "0 не должен приниматься (пусто), а не скорость");
+        assert!(!is_sane_rate(-5.0), "отрицательная скорость — мусор");
+        // Реальные скорости GPU-генерации влезают с запасом.
+        assert!(is_sane_rate(0.1), "малые скорости принимаются");
+        assert!(is_sane_rate(84.0), "обычная скорость принимается");
+        assert!(is_sane_rate(9_999.9), "нижняя граница потолка принимается");
+        assert!(!is_sane_rate(10_000.0), "граница порога — уже мусор");
+    }
+
+    #[test]
+    fn oom_ngl_step_logic() {
+        // Шаг 2 всегда переводит в ОЗУ.
+        assert_eq!(LlamaEngine::oom_next_ngl_impl(2, 999, Some(44)), 0);
+        assert_eq!(LlamaEngine::oom_next_ngl_impl(2, 44, None), 0);
+        // Уже в ОЗУ — остаёмся в ОЗУ.
+        assert_eq!(LlamaEngine::oom_next_ngl_impl(1, 0, Some(44)), 0);
+        // Шаг 1 с оценкой «влезает» — берём оценку.
+        assert_eq!(LlamaEngine::oom_next_ngl_impl(1, 999, Some(44)), 44);
+        // Шаг 1 без оценки — половина текущего (после пред.урезания).
+        assert_eq!(LlamaEngine::oom_next_ngl_impl(1, 44, None), 22);
+        // Половинное урезание не зацикливается на единице.
+        assert_eq!(LlamaEngine::oom_next_ngl_impl(1, 1, None), 0);
+    }
+
+    // ── Smoke на реальной модели (локальный файл) ──
+
+    #[test]
+    fn estimate_vram_mb_smoke_ternary_qwen35() {
+        // Ternary-Bonsai-27B-Q2_g64.gguf: qwen35-гибрид, файл ~7234 МБ,
+        // KV на ctx 24576 должен быть ~1536 МБ (16 из 64 слоёв, heads_kv=4,
+        // key/value 256), а НЕ 12 288 МБ по старым дефолтам. Сумма ~9 ГБ
+        // влезает в ~13 316 МБ свободной VRAM → ложного диалога нет.
+        let path = r"D:\nn\models\llm\censored\Ternary-Bonsai-27B-Q2_g64.gguf";
+        if !std::path::Path::new(path).exists() {
+            eprintln!("smoke: файл {} не найден — тест пропущен", path);
+            return;
+        }
+        let est = crate::engine::vram_estimate::estimate_vram(path, 24576, false, false);
+        assert!((est.kv_mb - 1536.0).abs() < 1.0, "KV: {} МБ (ожидалось ~1536)", est.kv_mb);
+        assert!(est.kv_mb < 2000.0, "KV всё ещё завышен: {} МБ", est.kv_mb);
+        assert!(est.total_mb < 13000.0, "Завышенная оценка VRAM: {:.0} МБ", est.total_mb);
+    }
+
+    // ─── Транспорт: скрытые таймауты reqwest ───
+    //
+    // Регрессионный тест на главный баг юзера. `reqwest::blocking` из коробки
+    // ставит таймаут 30 с на ЧТЕНИЕ ТЕЛА ответа (`Timeout::default()` в
+    // `blocking/client.rs`, применяется в `Response::read`). Локальный
+    // llama-server во время prompt eval не отдаёт ни одного байта, поэтому на
+    // медленной машине этот дефолт убивал запрос ещё ДО того, как наш
+    // собственный watchdog успел бы сработать.
+    //
+    // Тест поднимает настоящий TCP-сокет, отдаёт HTTP-заголовки, затем молчит
+    // 35 секунд — заведомо БОЛЬШЕ дефолтных 30 с — и только потом присылает
+    // первый SSE-чанк. Если дефолт снова включится, чтение упадёт по таймауту
+    // и тест упадёт.
+    //
+    // Запуск: test-plugin.bat plugin-llama-engine --test transport_no_hidden_read_timeout -- --ignored --nocapture
+    #[test]
+    #[ignore = "держит сокет 35 с; гоняется вручную"]
+    fn transport_no_hidden_read_timeout() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::TcpListener;
+
+        let stall = Duration::from_secs(35);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            // Сначала читаем голову запроса — иначе ответ уходит в гонке с
+            // недописанным запросом и hyper ругается UnexpectedMessage.
+            let mut head = [0u8; 4096];
+            let _ = sock.read(&mut head);
+            // Заголовки отдаём сразу — движок отвечает на HTTP до prompt eval.
+            sock.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
+            )
+            .expect("write headers");
+            sock.flush().expect("flush");
+            // Дальше — тишина на весь prompt eval.
+            std::thread::sleep(stall);
+            let chunk = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n";
+            sock.write_all(format!("{:X}\r\n{}\r\n", chunk.len(), chunk).as_bytes())
+                .expect("write chunk");
+            sock.flush().expect("flush");
+            sock
+        });
+
+        // Клиент собирается ТОЧНО как движок: без явного .timeout(...) —
+        // полагаемся на то, что дефолт отключён в коде движка.
+        let client = Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .tcp_nodelay(true)
+            .timeout(None)
+            .build()
+            .expect("client");
+
+        let mut resp = client
+            .get(format!("http://{}/v1/chat/completions", addr))
+            .send()
+            .expect("send");
+        assert!(resp.status().is_success(), "статус: {}", resp.status());
+
+        let started = Instant::now();
+        let mut reader = BufReader::new(resp);
+        let mut line = String::new();
+        let n = reader.read_line(&mut line).expect("read_line после паузы");
+        let waited = started.elapsed();
+
+        assert!(
+            n > 0,
+            "поток закрылся/оборвался: скрытый таймаут оборвал чтение через {:?}",
+            waited
+        );
+        assert!(
+            line.contains("\"ok\""),
+            "прочитан не тот чанк: {:?}",
+            line
+        );
+        assert!(
+            waited >= stall,
+            "чтение завершилось раньше паузы сервера ({:?} < {:?}) — тест не проверил ничего",
+            waited,
+            stall
+        );
+
+        let mut server = server.join().expect("server thread");
+        // Терминатор chunked-ответа; дальше сокеты закрывает процесс — ждать
+        // EOF вручную не нужно (клиент держит соединение в пуле).
+        let _ = server.write_all(b"0\r\n\r\n");
+    }
+
+    // ─── Слияние подряд идущих assistant (HTTP 400 «2+ assistant») ───
+
+    fn assistant_msg(content: &str) -> serde_json::Value {
+        json!({"role": "assistant", "content": content})
+    }
+
+    /// Регрессия потери хода (сессия 1794381122957): докачка+сжатие оставляют
+    /// assistant(тезисы) + assistant(сырой обрывок) в конце — Gemma-шаблон
+    /// llama-server отвечает 400, ход теряется целиком. Слияние делает отказ
+    /// невозможным, контент не теряется.
+    #[test]
+    fn merges_consecutive_trailing_assistants_and_keeps_content() {
+        let merged = merge_consecutive_assistant(vec![
+            json!({"role": "user", "content": "вопрос"}),
+            assistant_msg("тезисы размышлений"),
+            assistant_msg("сырой обрывок ответа"),
+        ]);
+        assert_eq!(merged.len(), 2, "два assistant слиты в один");
+        assert_eq!(merged[0]["role"], "user");
+        assert_eq!(
+            merged[1]["content"].as_str().unwrap(),
+            "тезисы размышлений\n\nсырой обрывок ответа",
+            "контент не теряется, порядок сохранён"
+        );
+    }
+
+    /// Три assistant подряд — все сливаются в один (тезисы + обрывок + докачка).
+    #[test]
+    fn merges_three_consecutive_assistants_into_one() {
+        let merged = merge_consecutive_assistant(vec![
+            assistant_msg("a"),
+            assistant_msg("b"),
+            assistant_msg("c"),
+        ]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0]["content"].as_str().unwrap(), "a\n\nb\n\nc");
+    }
+
+    /// assistant с tool_calls не сливается: семантика tool-loop (пары
+    /// assistant→tool) разрушается конкатенацией — роль tool-вызова терять нельзя.
+    #[test]
+    fn does_not_merge_assistant_with_tool_calls() {
+        let merged = merge_consecutive_assistant(vec![
+            assistant_msg("решение вызвать тул"),
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{"id": "t1", "type": "function"}]
+            }),
+            assistant_msg("сырой обрывок"),
+        ]);
+        assert_eq!(merged.len(), 3, "пара tool_calls+assistant не сливается");
+        assert!(merged[1].get("tool_calls").is_some());
+        assert_eq!(merged[2]["content"].as_str().unwrap(), "сырой обрывок");
+    }
+
+    /// assistant с tool_call_id (роль результата в некоторых шаблонах) и
+    /// parts-контент (вложения — массив) не сливаются; user/tool роли не трогаются.
+    #[test]
+    fn does_not_merge_tool_id_parts_or_non_assistant() {
+        let merged = merge_consecutive_assistant(vec![
+            json!({"role": "user", "content": "q1"}),
+            json!({"role": "assistant", "content": null, "tool_call_id": "x"}),
+            json!({"role": "user", "content": [{"type": "text", "text": "с вложением"}]}),
+            json!({"role": "user", "content": "обычный user"}),
+            json!({"role": "tool", "content": "результат тула"}),
+        ]);
+        assert_eq!(merged.len(), 5, "ни одна пара не слита");
+    }
+
+    /// Одна trailing assistant остаётся сама собой — prefill-докачка жива.
+    #[test]
+    fn single_trailing_assistant_untouched() {
+        let merged = merge_consecutive_assistant(vec![
+            json!({"role": "user", "content": "вопрос"}),
+            assistant_msg("частичный ответ (prefill)"),
+        ]);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[1]["content"].as_str().unwrap(), "частичный ответ (prefill)");
+    }
+}

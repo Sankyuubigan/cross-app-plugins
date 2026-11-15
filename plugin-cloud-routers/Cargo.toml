@@ -1,0 +1,44 @@
+[package]
+name = "plugin-cloud-routers"
+# Версия в локстепе с crates/core и crates/gateway: reconcile() сверяет версию
+# работающего бинаря шлюза (core VERSION) с этой. Рассинхрон (плагин 0.1.0 при
+# шлюзе 0.1.8) давал ложный warn «версии не совпадают» при каждом старте хоста.
+version = "0.1.9"
+edition = "2021"
+links = "tauri-plugin-cloud-routers"
+description = "Reusable cloud router gateway: self-contained install (portable node.exe + npm tgz), lazy start with persistent background process, combos list, web dashboard and OpenAI-compatible chat completion (SSOT for King Orch and other hosts)"
+license = "MIT"
+readme = "docs/README.md"
+
+[dependencies]
+tauri = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+log = { workspace = true }
+tokio = { workspace = true }
+reqwest = { version = "0.12", features = ["json", "rustls-tls-native-roots", "stream", "blocking"], default-features = false }
+zip = { workspace = true }
+flate2 = "1.0"
+tar = "0.4"
+# Доменный слой собственного шлюза (конфиг, ротация ключей, каталог пресетов).
+# НЕ тянет axum/reqwest: иначе они попали бы в бинарь хоста через path-зависимость.
+cloud-routers-core = { path = "crates/core" }
+# Единый движок скачивания (SSOT): Node.js zip + npm tgz + бинарь шлюза + фоллбэки без окон.
+plugin-downloader = { path = "../plugin-downloader" }
+
+# Декод консольного вывода Windows-утилит (taskkill/powershell): OEM-CP866 ->
+# UTF-8. Уже в дереве Cargo.lock (reqwest), новых пакетов не добавляет.
+encoding_rs = "0.8"
+
+# Атомарные записи JSON (app_config.json, server.json): tmp->rename + sidecar lock.
+json-store = { path = "../json-store" }
+
+[features]
+default = []
+
+[build-dependencies]
+tauri-plugin = { version = "2", features = ["build"] }
+
+[lib]
+name = "plugin_cloud_routers"
+path = "src/lib.rs"

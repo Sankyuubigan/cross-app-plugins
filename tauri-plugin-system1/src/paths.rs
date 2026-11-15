@@ -70,7 +70,7 @@ pub fn runtime_dir() -> PathBuf {
 ///
 /// **Одно место, без альтернатив.** Раньше кандидатов было два — `<exe>/laya`
 /// (ставился установщиком через `bundle.resources`) и `system1/runtime`.
-/// Первый нарушал `tauri-plugin-llama-engine/docs/llama_cpp_engine.md §1` и `tauri-plugin-speech/docs/crispasr_engine.md §1`:
+/// Первый нарушал `plugin-llama-engine/docs/llama_cpp_engine.md §1` и `plugin-speech-gen-engine/docs/crispasr_engine.md §1`:
 /// оба движка проекта не бандлятся, а `bundle.resources` по документу содержит
 /// только `agents/`, `mcp_servers/`, каталоги и `*.json`. DLL — тоже движок.
 pub fn onnxruntime_dll() -> PathBuf {

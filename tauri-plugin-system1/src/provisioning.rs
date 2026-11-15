@@ -4,14 +4,14 @@
 //! хэшем удаляется, а не оставляется «на потом» — иначе следующий запуск
 //! найдёт его и решит, что модель готова.
 //!
-//! Скачивание идёт через `tauri-plugin-downloader` (единый движок хоста): у него
+//! Скачивание идёт через `plugin-downloader` (единый движок хоста): у него
 //! есть multi-chunk, resume с `.part`, зеркало HuggingFace на случай обрыва и
 //! событие `downloader:progress`. Свой загрузчик здесь означал бы второй
 //! механизм доставки файлов в том же приложении.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use tauri_plugin_downloader::{download as download_file, DownloadOptions};
+use plugin_downloader::{download as download_file, DownloadOptions};
 
 use crate::catalog::{self, ModelEntry};
 use crate::paths;

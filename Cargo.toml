@@ -1,25 +1,25 @@
 [workspace]
 resolver = "2"
 members = [
-    "tauri-plugin-about-updates",
-    "tauri-plugin-speech",
-    "tauri-plugin-logs",
-    "tauri-plugin-logs/core",
-    "tauri-plugin-llama-engine",
-    "tauri-plugin-llama-engine/core",
-    "tauri-plugin-cloud-routers",
-    "tauri-plugin-cloud-routers/crates/core",
-    "tauri-plugin-cloud-routers/crates/gateway",
-    "tauri-plugin-downloader",
-    "tauri-plugin-image-engine",
-    "tauri-plugin-ytdlp",
-    "tauri-plugin-ffmpeg",
+    "plugin-about-updates",
+    "plugin-speech-gen-engine",
+    "plugin-log-collector",
+    "plugin-log-collector/core",
+    "plugin-llama-engine",
+    "plugin-llama-engine/core",
+    "plugin-cloud-routers",
+    "plugin-cloud-routers/crates/core",
+    "plugin-cloud-routers/crates/gateway",
+    "plugin-downloader",
+    "plugin-media-gen-engine",
+    "plugin-ytdlp-wrapper",
+    "plugin-ffmpeg-wrapper",
     "tauri-plugin-system1",
     "json-store",
     # gpui-kit — НЕ член workspace: его опциональные депы gpui-webview/lb-wry
     # (webkit2gtk =2.0.1) несовместимы с wry 0.54.x tauri-плагинов (=2.0.2) в
     # одном lock. Кит — отдельный workspace (gpui-kit/Cargo.lock), ядра
-    # logs-core/llama-engine-core он path-депит с наследованием из этого корня.
+    # log-collector-core/llama-engine-core он path-депит с наследованием из этого корня.
     "tools/code-tools",
     "tools/excel-tools",
     "tools/diag-tools",
@@ -96,7 +96,7 @@ log = { version = "0.4", features = ["std"] }
 # ВАЖНО (15.11.26): кит — ОТДЕЛЬНЫЙ workspace (см. members), его пины
 # gpui-kit/gpui-webview/lb-wry живут в gpui-kit/Cargo.toml, не здесь.
 
-# Движок llama.cpp (tauri-plugin-llama-engine): GPU-детект, VRAM, скачивание моделей.
+# Движок llama.cpp (plugin-llama-engine): GPU-детект, VRAM, скачивание моделей.
 # reqwest в плагине объявлен отдельно (default-features=false + rustls, как в хосте).
 sysinfo = "0.30.0"
 nvml-wrapper = "0.10.0"
@@ -104,7 +104,7 @@ sha2 = "0.10"
 futures-util = "0.3"
 minijinja = "1.0"
 
-# Сохранение озвучки в MP3 (команда `tts_save_mp3` плагина tauri-plugin-speech).
+# Сохранение озвучки в MP3 (команда `tts_save_mp3` плагина plugin-speech-gen-engine).
 # Pure Rust MP3-энкодер: ноль зависимостей, без build.rs, Apache-2.0, CI зелёный
 # на windows-latest. Раньше здесь был `glint-audio` -> `glint-audio-sys`: 50
 # вендоренных C++ файлов и непочиненный MSVC-баг (M_PI без _USE_MATH_DEFINES).
