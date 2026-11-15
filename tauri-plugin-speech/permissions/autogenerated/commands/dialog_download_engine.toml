@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-dialog-download-engine"
+description = "Enables the dialog_download_engine command without any pre-configured scope."
+commands.allow = ["dialog_download_engine"]
+
+[[permission]]
+identifier = "deny-dialog-download-engine"
+description = "Denies the dialog_download_engine command without any pre-configured scope."
+commands.deny = ["dialog_download_engine"]

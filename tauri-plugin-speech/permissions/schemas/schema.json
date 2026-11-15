@@ -295,6 +295,78 @@
       "type": "string",
       "oneOf": [
         {
+          "description": "Enables the dialog_download_engine command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-dialog-download-engine",
+          "markdownDescription": "Enables the dialog_download_engine command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the dialog_download_engine command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-dialog-download-engine",
+          "markdownDescription": "Denies the dialog_download_engine command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the dialog_get_settings command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-dialog-get-settings",
+          "markdownDescription": "Enables the dialog_get_settings command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the dialog_get_settings command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-dialog-get-settings",
+          "markdownDescription": "Denies the dialog_get_settings command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the dialog_save_settings command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-dialog-save-settings",
+          "markdownDescription": "Enables the dialog_save_settings command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the dialog_save_settings command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-dialog-save-settings",
+          "markdownDescription": "Denies the dialog_save_settings command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the dialog_start command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-dialog-start",
+          "markdownDescription": "Enables the dialog_start command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the dialog_start command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-dialog-start",
+          "markdownDescription": "Denies the dialog_start command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the dialog_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-dialog-status",
+          "markdownDescription": "Enables the dialog_status command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the dialog_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-dialog-status",
+          "markdownDescription": "Denies the dialog_status command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the dialog_stop command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-dialog-stop",
+          "markdownDescription": "Enables the dialog_stop command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the dialog_stop command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-dialog-stop",
+          "markdownDescription": "Denies the dialog_stop command without any pre-configured scope."
+        },
+        {
           "description": "Enables the stt_get_settings command without any pre-configured scope.",
           "type": "string",
           "const": "allow-stt-get-settings",
@@ -803,6 +875,42 @@
           "type": "string",
           "const": "allow-stt-inject-text",
           "markdownDescription": "Allow injecting transcribed text into the currently focused window (clipboard + Ctrl+V)."
+        },
+        {
+          "description": "Allow reading the dialog (speech.cpp/Haru) engine settings.",
+          "type": "string",
+          "const": "allow-dialog-get-settings",
+          "markdownDescription": "Allow reading the dialog (speech.cpp/Haru) engine settings."
+        },
+        {
+          "description": "Allow saving the dialog (speech.cpp/Haru) engine settings.",
+          "type": "string",
+          "const": "allow-dialog-save-settings",
+          "markdownDescription": "Allow saving the dialog (speech.cpp/Haru) engine settings."
+        },
+        {
+          "description": "Allow downloading the speech.cpp engine binary (SHA-256 verified).",
+          "type": "string",
+          "const": "allow-dialog-download-engine",
+          "markdownDescription": "Allow downloading the speech.cpp engine binary (SHA-256 verified)."
+        },
+        {
+          "description": "Allow starting the dialog engine process (speech.cpp serve).",
+          "type": "string",
+          "const": "allow-dialog-start",
+          "markdownDescription": "Allow starting the dialog engine process (speech.cpp serve)."
+        },
+        {
+          "description": "Allow stopping the dialog engine process.",
+          "type": "string",
+          "const": "allow-dialog-stop",
+          "markdownDescription": "Allow stopping the dialog engine process."
+        },
+        {
+          "description": "Allow reading the dialog engine status.",
+          "type": "string",
+          "const": "allow-dialog-status",
+          "markdownDescription": "Allow reading the dialog engine status."
         }
       ]
     }

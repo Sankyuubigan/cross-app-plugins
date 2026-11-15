@@ -54,11 +54,14 @@ pub struct PluginState {
     pub config: Config,
     pub tts: TtsEngine,
     pub stt: SttEngine,
+    pub dialog: DialogEngine,
 }
 
 mod audio;
 mod clone;
 mod commands;
+mod dialog;
+mod dialog_settings;
 pub mod download;
 mod inject;
 mod log;
@@ -71,6 +74,9 @@ pub mod tts_settings;
 mod voices;
 pub mod ws_client;
 
+pub use dialog::DialogEngine;
+pub use dialog::DialogStatus;
+pub use dialog_settings::DialogSettings;
 pub use stt::SttEngine;
 pub use stt::SttStatus;
 pub use stt_settings::SttSettings;
@@ -86,6 +92,7 @@ pub fn init<R: Runtime>() -> TauriPlugin<R, Config> {
                 config: api.config().clone(),
                 tts: TtsEngine::new(),
                 stt: SttEngine::new(),
+                dialog: DialogEngine::new(),
             };
             app.manage(state);
             Ok(())
@@ -119,6 +126,12 @@ pub fn init<R: Runtime>() -> TauriPlugin<R, Config> {
             commands::stt_stop,
             commands::stt_get_status,
             commands::stt_inject_text,
+            commands::dialog_get_settings,
+            commands::dialog_save_settings,
+            commands::dialog_download_engine,
+            commands::dialog_start,
+            commands::dialog_stop,
+            commands::dialog_status,
         ])
         .build()
 }

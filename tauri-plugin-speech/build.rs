@@ -27,6 +27,12 @@ const COMMANDS: &[&str] = &[
     "stt_stop",
     "stt_get_status",
     "stt_inject_text",
+    "dialog_get_settings",
+    "dialog_save_settings",
+    "dialog_download_engine",
+    "dialog_start",
+    "dialog_stop",
+    "dialog_status",
 ];
 
 fn main() {

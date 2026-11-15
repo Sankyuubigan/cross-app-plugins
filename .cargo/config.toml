@@ -1,0 +1,13 @@
+# Настройки cargo для workspace плагинов (my-tauri-plugins).
+#
+# CMAKE_POLICY_VERSION_MINIMUM: крейт `opus` (audiopus_sys, используется в
+# tauri-plugin-speech) собирает libopus через CMake, а в её CMakeLists.txt стоит
+# `cmake_minimum_required(VERSION 3.5)`. CMake 4.x удалил совместимость с <3.5
+# и без этой переменной падает с "Compatibility with CMake < 3.5 has been
+# removed". Хосты, подключающие плагин (напр. SpeechLab), уже задают её в своих
+# .cargo/config.toml — здесь та же настройка для standalone-проверок плагинов.
+#
+# Это НЕ обход бага: зависимость работает корректно, CMake просто требует
+# явного подтверждения политики версии.
+[env]
+CMAKE_POLICY_VERSION_MINIMUM = "3.5"

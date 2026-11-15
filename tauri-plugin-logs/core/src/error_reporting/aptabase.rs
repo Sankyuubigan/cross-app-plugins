@@ -86,8 +86,9 @@ fn system_props() -> Value {
         "osName": std::env::consts::OS,
         "osVersion": std::env::var("OS").unwrap_or_else(|_| std::env::consts::OS.to_string()),
         "locale": std::env::var("LANG").unwrap_or_else(|_| "ru-RU".to_string()),
+        // Чистое ядро не видит точную версию tauri; дашборду достаточно мажора.
         "engineName": "tauri",
-        "engineVersion": tauri::VERSION,
+        "engineVersion": "2",
         "appVersion": app_version,
         "sdkVersion": concat!("tauri-plugin-logs@", env!("CARGO_PKG_VERSION"))
     })
@@ -108,12 +109,14 @@ pub fn start() {
     if FLUSHER_STARTED.swap(true, Ordering::SeqCst) {
         return;
     }
-    tauri::async_runtime::spawn(async {
-        loop {
-            tokio::time::sleep(FLUSH_INTERVAL).await;
-            flush_periodic().await;
-        }
-    });
+    if let Some(rt) = super::try_runtime() {
+        rt.spawn(async {
+            loop {
+                tokio::time::sleep(FLUSH_INTERVAL).await;
+                flush_periodic().await;
+            }
+        });
+    }
 }
 
 /// Ставит событие в очередь и сразу пробует отправить.
@@ -132,7 +135,9 @@ fn kick() {
         try_flush().await;
         FLUSHING.store(false, Ordering::SeqCst);
     };
-    tauri::async_runtime::spawn(fut);
+    if let Some(rt) = super::try_runtime() {
+        rt.spawn(fut);
+    }
 }
 
 /// Периодический flush: досылает всё накопленное (используется флашером и при выходе).
@@ -291,7 +296,7 @@ pub fn send_error(cfg: ReportingConfig, report: ErrorReport) {
     let body = error_body(&report, &cfg, &app_version, &session_id());
     let url = format!("{}/api/v0/error", region_base(&cfg.app_key));
     let app_key = cfg.app_key;
-    tauri::async_runtime::spawn(async move {
+    let send = async move {
         // Единый ленивый клиент (см. http_client) — без новой коннекции на каждую ошибку.
         let Some(client) = http_client() else { return };
         let result = client
@@ -309,7 +314,10 @@ pub fn send_error(cfg: ReportingConfig, report: ErrorReport) {
             ),
             Err(e) => log::warn!("телеметрия: отчёт об ошибке не отправлен: {e}"),
         }
-    });
+    };
+    if let Some(rt) = super::try_runtime() {
+        rt.spawn(send);
+    }
 }
 
 #[cfg(test)]
@@ -334,6 +342,14 @@ mod tests {
             app_key: "A-EU-test".to_string(),
             events: true,
         }
+    }
+
+    fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        rt.block_on(fut)
     }
 
     /// Обогащённое тело содержит контекст, которого раньше не было
@@ -460,16 +476,16 @@ mod tests {
         lock(queue()).push_back(build_event("test_event", None));
 
         // Попытки 1 и 2: батч возвращается в очередь, счётчик растёт.
-        tauri::async_runtime::block_on(try_flush_with(&client, &url, "A-EU-test"));
+        block_on(try_flush_with(&client, &url, "A-EU-test"));
         assert_eq!(lock(queue()).len(), 1, "батч обязан вернуться в очередь");
         assert_eq!(SEND_FAILURES.load(Ordering::SeqCst), 1);
 
-        tauri::async_runtime::block_on(try_flush_with(&client, &url, "A-EU-test"));
+        block_on(try_flush_with(&client, &url, "A-EU-test"));
         assert_eq!(lock(queue()).len(), 1);
         assert_eq!(SEND_FAILURES.load(Ordering::SeqCst), 2);
 
         // Попытка 3: кап достигнут — очередь очищена, счётчик сброшен.
-        tauri::async_runtime::block_on(try_flush_with(&client, &url, "A-EU-test"));
+        block_on(try_flush_with(&client, &url, "A-EU-test"));
         assert!(lock(queue()).is_empty(), "после капа очередь обязана очиститься");
         assert_eq!(SEND_FAILURES.load(Ordering::SeqCst), 0, "счётчик обязан сброситься");
     }
@@ -487,7 +503,7 @@ mod tests {
 
         lock(queue()).clear();
         SEND_FAILURES.store(0, Ordering::SeqCst);
-        tauri::async_runtime::block_on(try_flush_with(&client, &url, "A-EU-test"));
+        block_on(try_flush_with(&client, &url, "A-EU-test"));
         assert_eq!(SEND_FAILURES.load(Ordering::SeqCst), 0, "попыток быть не должно");
     }
 
@@ -520,7 +536,7 @@ mod tests {
         lock(queue()).clear();
         SEND_FAILURES.store(2, Ordering::SeqCst);
         lock(queue()).push_back(build_event("test_event", None));
-        tauri::async_runtime::block_on(try_flush_with(&client, &url, "A-EU-test"));
+        block_on(try_flush_with(&client, &url, "A-EU-test"));
         assert!(lock(queue()).is_empty(), "батч ушёл — очередь пуста");
         assert_eq!(SEND_FAILURES.load(Ordering::SeqCst), 0, "успех обязан сбросить счётчик");
     }

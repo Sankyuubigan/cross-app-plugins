@@ -17,6 +17,10 @@ thiserror = { workspace = true }
 log = { workspace = true }
 tokio = { workspace = true }
 
+# Чистое ядро логгера (SSOT, без tauri): logger/path/flight/error_reporting
+# живут здесь; Tauri-плагин — фасад совместимости (emit-хук + команды).
+logs-core = { path = "core" }
+
 [dev-dependencies]
 tempfile = "3"
 

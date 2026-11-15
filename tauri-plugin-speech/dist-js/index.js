@@ -127,5 +127,25 @@ export async function sttGetStatus() {
 export async function sttInjectText(text) {
     return invoke('plugin:speech|stt_inject_text', { text });
 }
+export async function dialogGetSettings() {
+    return invoke('plugin:speech|dialog_get_settings');
+}
+export async function dialogSaveSettings(settings) {
+    return invoke('plugin:speech|dialog_save_settings', { settings });
+}
+/** Скачивает движок speech.cpp (SHA-256 контроль) и возвращает путь к speech.exe. */
+export async function dialogDownloadEngine(destDir) {
+    return invoke('plugin:speech|dialog_download_engine', { destDir: destDir ?? '' });
+}
+/** Запускает (или переиспользует) `speech serve`, возвращает HTTP-порт. */
+export async function dialogStart() {
+    return invoke('plugin:speech|dialog_start');
+}
+export async function dialogStop() {
+    return invoke('plugin:speech|dialog_stop');
+}
+export async function dialogStatus() {
+    return invoke('plugin:speech|dialog_status');
+}
 // Регистрируем Web Components при импорте пакета.
 import './web-components';

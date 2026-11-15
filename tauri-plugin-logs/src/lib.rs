@@ -49,18 +49,18 @@ use tauri::plugin::{Builder, TauriPlugin};
 use tauri::Wry;
 
 mod commands;
-mod error_reporting;
-mod flight;
-// pub: egui-хосты без WebView читают лог-хвост напрямую из Rust
+// pub: egui/GPUI-хосты без WebView читают лог-хвост напрямую из Rust
 // (tauri_plugin_logs::logger::read_tail) — вкладка «Логи» без JS-канала.
 pub mod logger;
-mod path;
+// Чистое ядро (SSOT): logger/path/flight/error_reporting живут в logs-core;
+// здесь только Tauri-обвязка (emit-хук + команды).
+use logs_core::{error_reporting, flight};
 
 pub use error_reporting::ReportingConfig;
 
-/// Установка единого логгера без Tauri-хоста (нативные фронтенды без
-/// `AppHandle`, например GPUI): файл лога / `last_logs` / panic-hook работают,
-/// emit-события UI не шлются. См. `logger::install_standalone`.
+/// Установка единого логгера без Tauri-хоста (нативные фронтенды,
+/// например GPUI): тот же `log::Log` без emit-канала.
+/// См. `logger::install_standalone`.
 pub use logger::install_standalone;
 
 /// Конфиг плагина (`plugins.logs` в `tauri.conf.json` хоста).

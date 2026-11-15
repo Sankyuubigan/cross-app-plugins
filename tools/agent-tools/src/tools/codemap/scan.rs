@@ -398,9 +398,21 @@ fn component_matches(pattern: &str, text: &str) -> bool {
         return pattern == text;
     }
     let parts: Vec<&str> = pattern.split('*').collect();
-    let first = parts[0];
-    let last = parts[parts.len() - 1];
-    text.len() >= first.len() + last.len() && text.starts_with(first) && text.ends_with(last)
+    // Первый литерал — префикс, последний — суффикс, средние обязаны встретиться
+    // по порядку между ними. Жадный поиск слева направо для «*»-глобов корректен.
+    let Some(mut rest) = text.strip_prefix(parts[0]) else {
+        return false;
+    };
+    for (i, part) in parts[1..].iter().enumerate() {
+        if i + 2 == parts.len() {
+            return rest.len() >= part.len() && rest.ends_with(part);
+        }
+        match rest.find(part) {
+            Some(pos) => rest = &rest[pos + part.len()..],
+            None => return false,
+        }
+    }
+    true
 }
 
 #[cfg(test)]
@@ -525,6 +537,25 @@ mod tests {
     fn star_does_not_cross_directory_separator() {
         assert!(matches("*.rs", "main.rs"));
         assert!(!matches("src/*.rs", "src/deep/main.rs"));
+    }
+
+    #[test]
+    fn middle_glob_literals_are_checked_in_order() {
+        // Регрессия: `*.ntvs*` раньше совпадал с любым именем (средний литерал
+        // не проверялся), из-за чего весь репозиторий считался gitignored.
+        assert!(matches("*.ntvs*", "foo.ntvs"));
+        assert!(matches("*.ntvs*", "foo.ntvsbar"));
+        assert!(!matches("*.ntvs*", "src"));
+        assert!(!matches("*.ntvs*", "main.rs"));
+        // Средний литерал между двумя звёздочками.
+        assert!(matches("a*bc*d", "axxbcyyd"));
+        assert!(!matches("a*bc*d", "axbxyyd"));
+        assert!(!matches("a*bc*d", "xxxbcyyd"));
+        // Два средних литерала — по порядку.
+        assert!(matches("a*b*c", "axbxc"));
+        assert!(!matches("a*b*c", "axcxb"));
+        // Имя без звёздочек — прежнее поведение (точное равенство).
+        assert!(!matches("a.bc", "axbc"));
     }
 
     #[test]

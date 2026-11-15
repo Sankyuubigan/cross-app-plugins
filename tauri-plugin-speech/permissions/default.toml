@@ -140,6 +140,36 @@ identifier = "allow-stt-inject-text"
 description = "Allow injecting transcribed text into the currently focused window (clipboard + Ctrl+V)."
 commands.allow = ["stt_inject_text"]
 
+[[permission]]
+identifier = "allow-dialog-get-settings"
+description = "Allow reading the dialog (speech.cpp/Haru) engine settings."
+commands.allow = ["dialog_get_settings"]
+
+[[permission]]
+identifier = "allow-dialog-save-settings"
+description = "Allow saving the dialog (speech.cpp/Haru) engine settings."
+commands.allow = ["dialog_save_settings"]
+
+[[permission]]
+identifier = "allow-dialog-download-engine"
+description = "Allow downloading the speech.cpp engine binary (SHA-256 verified)."
+commands.allow = ["dialog_download_engine"]
+
+[[permission]]
+identifier = "allow-dialog-start"
+description = "Allow starting the dialog engine process (speech.cpp serve)."
+commands.allow = ["dialog_start"]
+
+[[permission]]
+identifier = "allow-dialog-stop"
+description = "Allow stopping the dialog engine process."
+commands.allow = ["dialog_stop"]
+
+[[permission]]
+identifier = "allow-dialog-status"
+description = "Allow reading the dialog engine status."
+commands.allow = ["dialog_status"]
+
 [default]
 description = "Default permissions for the speech plugin (CrispASR TTS/STT engine)."
 permissions = [

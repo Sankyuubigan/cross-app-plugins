@@ -45,6 +45,162 @@ Default permissions for the speech plugin (CrispASR TTS/STT engine).
 <tr>
 <td>
 
+`speech:allow-dialog-download-engine`
+
+</td>
+<td>
+
+Enables the dialog_download_engine command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`speech:deny-dialog-download-engine`
+
+</td>
+<td>
+
+Denies the dialog_download_engine command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`speech:allow-dialog-get-settings`
+
+</td>
+<td>
+
+Enables the dialog_get_settings command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`speech:deny-dialog-get-settings`
+
+</td>
+<td>
+
+Denies the dialog_get_settings command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`speech:allow-dialog-save-settings`
+
+</td>
+<td>
+
+Enables the dialog_save_settings command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`speech:deny-dialog-save-settings`
+
+</td>
+<td>
+
+Denies the dialog_save_settings command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`speech:allow-dialog-start`
+
+</td>
+<td>
+
+Enables the dialog_start command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`speech:deny-dialog-start`
+
+</td>
+<td>
+
+Denies the dialog_start command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`speech:allow-dialog-status`
+
+</td>
+<td>
+
+Enables the dialog_status command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`speech:deny-dialog-status`
+
+</td>
+<td>
+
+Denies the dialog_status command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`speech:allow-dialog-stop`
+
+</td>
+<td>
+
+Enables the dialog_stop command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`speech:deny-dialog-stop`
+
+</td>
+<td>
+
+Denies the dialog_stop command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
 `speech:allow-stt-get-settings`
 
 </td>
@@ -1130,6 +1286,84 @@ Allow reading the STT engine status.
 <td>
 
 Allow injecting transcribed text into the currently focused window (clipboard + Ctrl+V).
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`speech:allow-dialog-get-settings`
+
+</td>
+<td>
+
+Allow reading the dialog (speech.cpp/Haru) engine settings.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`speech:allow-dialog-save-settings`
+
+</td>
+<td>
+
+Allow saving the dialog (speech.cpp/Haru) engine settings.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`speech:allow-dialog-download-engine`
+
+</td>
+<td>
+
+Allow downloading the speech.cpp engine binary (SHA-256 verified).
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`speech:allow-dialog-start`
+
+</td>
+<td>
+
+Allow starting the dialog engine process (speech.cpp serve).
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`speech:allow-dialog-stop`
+
+</td>
+<td>
+
+Allow stopping the dialog engine process.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`speech:allow-dialog-status`
+
+</td>
+<td>
+
+Allow reading the dialog engine status.
 
 </td>
 </tr>

@@ -380,7 +380,6 @@ pub async fn auto_download_default_model(app: AppHandle, save_path: String) -> R
         .map_err(|e| format!("Не удалось создать директорию: {}", e))?;
 
     engine::downloader::download_model(
-        app.clone(),
         default_entry.download_url.clone(),
         save_path.clone(),
     )
@@ -400,7 +399,7 @@ pub async fn auto_download_default_model(app: AppHandle, save_path: String) -> R
             std::path::MAIN_SEPARATOR,
             mmp_name
         );
-        engine::downloader::download_model(app.clone(), mmp_url.clone(), mmp_path.clone()).await?;
+        engine::downloader::download_model(mmp_url.clone(), mmp_path.clone()).await?;
         mmproj_saved = Some(mmp_path);
     }
 
@@ -765,4 +764,20 @@ pub fn estimate_prompt_memory(
         vram_used_mb: used_mb,
         vram_total_mb: total_mb,
     })
+}
+
+// ── Прямое скачивание (ядро llama-engine-core без tauri; команды-обёртки) ──
+
+#[tauri::command]
+pub async fn download_model(url: String, save_path: String) -> Result<(), String> {
+    engine::downloader::download_model(url, save_path).await
+}
+
+#[tauri::command]
+pub async fn download_binary(
+    url: String,
+    save_path: String,
+    extract_zip: bool,
+) -> Result<(), String> {
+    engine::downloader::download_binary(url, save_path, extract_zip).await
 }

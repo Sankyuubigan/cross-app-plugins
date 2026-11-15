@@ -5,6 +5,7 @@ use serde_json::{json, Value};
 use crate::clone;
 use crate::download;
 use crate::log;
+use crate::dialog_settings::DialogSettings;
 use crate::stt_settings::SttSettings;
 use crate::tts;
 use crate::tts_settings::{
@@ -681,5 +682,68 @@ pub async fn stt_get_status<R: Runtime>(app: AppHandle<R>) -> Result<String, Str
 #[tauri::command]
 pub async fn stt_inject_text(text: String) -> Result<(), String> {
     crate::inject::inject_text(&text)
+}
+
+// ─── Dialog: движок speech.cpp (full-duplex Haru) ─────────────────────
+
+#[tauri::command]
+pub async fn dialog_get_settings() -> DialogSettings {
+    DialogSettings::load()
+}
+
+#[tauri::command]
+pub async fn dialog_save_settings<R: Runtime>(
+    app: AppHandle<R>,
+    settings: DialogSettings,
+) -> Result<(), String> {
+    settings.save()?;
+    log::app_log(&app, "[dialog] настройки сохранены");
+    Ok(())
+}
+
+/// Скачивает и устанавливает движок speech.cpp в `<engine_dir>/speechcpp/`.
+/// dest_dir пустой = папка по умолчанию. Возвращает путь к speech.exe.
+#[tauri::command]
+pub async fn dialog_download_engine<R: Runtime>(
+    app: AppHandle<R>,
+    dest_dir: String,
+) -> Result<String, String> {
+    let dir = if dest_dir.trim().is_empty() {
+        crate::download::engine_base(&crate::tts_settings::load(&app).engine_dir)
+            .join("speechcpp")
+    } else {
+        std::path::PathBuf::from(&dest_dir)
+    };
+    let dir_str = dir.to_string_lossy().to_string();
+    let exe = crate::download::dialog_download_engine(&dir_str).await?;
+    log::app_log(&app, &format!("[dialog] движок speech.cpp установлен: {exe}"));
+    Ok(exe)
+}
+
+/// Запускает (или переиспользует) `speech serve <модель>`, возвращает HTTP-порт.
+#[tauri::command]
+pub async fn dialog_start<R: Runtime>(app: AppHandle<R>) -> Result<u16, String> {
+    let state = app.state::<PluginState>();
+    let settings = DialogSettings::load();
+    state.dialog.ensure(&app, &settings).await
+}
+
+#[tauri::command]
+pub async fn dialog_stop<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
+    let state = app.state::<PluginState>();
+    state.dialog.stop(&app).await;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn dialog_status<R: Runtime>(app: AppHandle<R>) -> Result<String, String> {
+    let state = app.state::<PluginState>();
+    Ok(match state.dialog.status() {
+        crate::dialog::DialogStatus::Stopped => "stopped",
+        crate::dialog::DialogStatus::Starting => "starting",
+        crate::dialog::DialogStatus::Ready => "ready",
+        crate::dialog::DialogStatus::Error(_) => "error",
+    }
+    .to_string())
 }
 

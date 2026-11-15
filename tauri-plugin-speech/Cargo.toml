@@ -16,6 +16,9 @@ reqwest = { workspace = true }
 tokio = { workspace = true }
 zip = { workspace = true }
 
+# Проверка SHA256SUMS релиза speech.cpp (движок диалога)
+sha2 = { workspace = true }
+
 # Скачивание файлов — ЕДИНЫЙ движок проекта (core §2.1 SSOT).
 # Раньше плагин держал свою копию на голом reqwest: без stall-детекта, без
 # таймаутов и без фолбэков. Из-за этого один зависший ответ CDN (0 байт по

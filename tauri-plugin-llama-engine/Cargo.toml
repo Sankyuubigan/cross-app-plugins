@@ -33,6 +33,10 @@ tauri-plugin-downloader = { path = "../tauri-plugin-downloader" }
 # Атомарные записи JSON (app_config.json): tmp->rename + sidecar lock.
 json-store = { path = "../json-store" }
 
+# Чистое ядро движка (SSOT, без tauri): engine/* живёт здесь; Tauri-плагин —
+# фасад совместимости (ре-экспорт + AppHandle-обёртки + мосты событий).
+llama-engine-core = { path = "core" }
+
 [features]
 default = []
 host-logs = ["dep:tauri-plugin-logs"]

@@ -3,18 +3,17 @@ use std::cmp::min;
 use std::fs::{self, File};
 use std::io::{Cursor, Read, SeekFrom};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Emitter};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::task::JoinSet;
 
 #[derive(Clone, serde::Serialize)]
-struct DownloadProgress {
-    downloaded: u64,
-    total: u64,
+pub struct DownloadProgress {
+    pub downloaded: u64,
+    pub total: u64,
     /// Скорость скачивания, байт/сек (для плавного GUI). 0 = нет данных.
-    speed_bps: f64,
+    pub speed_bps: f64,
 }
 
 const MIN_GGUF_SIZE: u64 = 1024 * 1024;
@@ -34,6 +33,80 @@ const STALL_TIMEOUT: Duration = Duration::from_secs(30);
 const PART_SUFFIX: &str = ".part";
 
 const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+
+// ── Инъекция хоста (ядро без Tauri) ──
+
+fn lock<T>(guard: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    guard.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Прогресс скачивания: хост ставит колбэк (Tauri-плагин эмитит событие
+/// `download_progress` с тем же payload, GPUI-хост рисует свой бар).
+pub type ProgressHook = Arc<dyn Fn(&DownloadProgress) + Send + Sync>;
+
+static PROGRESS_HOOK: OnceLock<Mutex<Option<ProgressHook>>> = OnceLock::new();
+
+/// Установить/снять колбэк прогресса скачивания (повторный вызов заменяет).
+pub fn set_progress_hook(hook: Option<ProgressHook>) {
+    let cell = PROGRESS_HOOK.get_or_init(|| Mutex::new(None));
+    *lock(cell) = hook;
+}
+
+fn notify_progress(progress: &DownloadProgress) {
+    let hook = PROGRESS_HOOK.get().and_then(|cell| lock(cell).clone());
+    if let Some(hook) = hook {
+        hook(progress);
+    }
+}
+
+/// Запрос фоллбэк-скачивания: ядро описывает ЧТО качать, хост решает КАК
+/// (Tauri-плагин адаптирует единый движок tauri-plugin-downloader — зеркала
+/// HF + curl/process-фоллбэки).
+#[derive(Clone, Debug, Default)]
+pub struct FallbackRequest {
+    pub url: String,
+    pub dest: std::path::PathBuf,
+    pub label: String,
+    pub kind: String,
+    pub magic: Option<Vec<u8>>,
+    pub min_size: Option<u64>,
+    pub expected_size: Option<u64>,
+}
+
+/// Хост-обработчик фоллбэка: async-скачивание через движок хоста. Лог-колбэк —
+/// Send+Sync (адаптер хоста передаёт его дальше в движок скачивания); future
+/// может заимствовать его на время скачивания (HRTB-контракт).
+pub type FallbackHandler = Arc<
+    dyn for<'a> Fn(
+            FallbackRequest,
+            &'a (dyn Fn(String) + Send + Sync),
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>,
+        > + Send
+        + Sync,
+>;
+
+static FALLBACK: OnceLock<Mutex<Option<FallbackHandler>>> = OnceLock::new();
+
+/// Установить/снять фоллбэк-скачивание. Без него ядро ограничено
+/// reqwest-путём (multi-chunk + retry), что покрывает большинство CDN.
+pub fn set_fallback_downloader(handler: Option<FallbackHandler>) {
+    let cell = FALLBACK.get_or_init(|| Mutex::new(None));
+    *lock(cell) = handler;
+}
+
+pub(crate) async fn fallback_download(
+    req: FallbackRequest,
+    on_log: &(dyn Fn(String) + Send + Sync),
+) -> Result<(), String> {
+    let handler = FALLBACK.get().and_then(|cell| lock(cell).clone());
+    match handler {
+        Some(handler) => handler(req, on_log).await,
+        None => Err(
+            "фоллбэк-скачивание недоступно: хост не установил fallback_downloader".to_string(),
+        ),
+    }
+}
 
 /// Резолвим финальный CDN-URL, точный размер файла и поддержку HTTP Range.
 /// GET с `Range: bytes=0-0` заставляет сервер вернуть 206 + `Content-Range`
@@ -80,8 +153,7 @@ async fn resolve_target(client: &reqwest::Client, url: &str) -> Result<(String, 
     Ok((final_url, total, supports_range))
 }
 
-#[tauri::command]
-pub async fn download_model(app: AppHandle, url: String, save_path: String) -> Result<(), String> {
+pub async fn download_model(url: String, save_path: String) -> Result<(), String> {
     eprintln!("[download] Старт загрузки: {} -> {}", url, save_path);
 
     let client = reqwest::Client::builder()
@@ -90,29 +162,32 @@ pub async fn download_model(app: AppHandle, url: String, save_path: String) -> R
         .build()
         .map_err(|e| format!("Ошибка создания HTTP-клиента: {}", e))?;
 
-    match run_download(&app, &client, &url, &save_path).await {
+    match run_download(&client, &url, &save_path).await {
         Ok(()) => Ok(()),
         Err(e) => {
             // Страховка: единый движок скачивания (зеркала HF + process-фоллбэки).
             eprintln!("[download] Основной путь не удался ({}). Плагин downloader...", e);
             let _ = fs::remove_file(format!("{}{}", save_path, PART_SUFFIX));
-            let dest = std::path::PathBuf::from(&save_path);
             let on_log = |msg: String| { eprintln!("[download] {}", msg); };
-            let opts = tauri_plugin_downloader::DownloadOptions {
-                label: "Модель".into(),
-                kind: "model".into(),
-                magic: Some(b"GGUF".to_vec()),
-                min_size: Some(MIN_GGUF_SIZE),
-                ..Default::default()
-            };
-            tauri_plugin_downloader::download(&url, &dest, opts, Some(&on_log)).await
+            fallback_download(
+                FallbackRequest {
+                    url: url.clone(),
+                    dest: std::path::PathBuf::from(&save_path),
+                    label: "Модель".into(),
+                    kind: "model".into(),
+                    magic: Some(b"GGUF".to_vec()),
+                    min_size: Some(MIN_GGUF_SIZE),
+                    expected_size: None,
+                },
+                &on_log,
+            )
+            .await
         }
     }
 }
 
 /// Один полный проход загрузки: резолв → параллельные чанки (или однопоток).
 async fn run_download(
-    app: &AppHandle,
     client: &reqwest::Client,
     url: &str,
     save_path: &str,
@@ -139,7 +214,7 @@ async fn run_download(
 
     if total == 0 || !supports_range {
         // Размер неизвестен или сервер не умеет Range — однопоточный fallback.
-        return download_single(app, client, url, &part_path, save_path, total).await;
+        return download_single(client, url, &part_path, save_path, total).await;
     }
 
     // Подготавливаем .part (sparse-файл нужного размера, чтобы писать в любой offset).
@@ -157,7 +232,6 @@ async fn run_download(
     let orig_url = url.to_string();
 
     // Таск-репортер прогресса (совместим с chat.ts:815 — тот же payload).
-    let rep_app = app.clone();
     let rep_total = total.clone();
     let rep_dl = downloaded.clone();
     let reporter = tokio::spawn(async move {
@@ -169,14 +243,11 @@ async fn run_download(
             let cur = rep_dl.load(Ordering::SeqCst);
             let dt = now.duration_since(last).as_secs_f64();
             let speed = if dt > 0.0 { (cur - last_bytes) as f64 / dt } else { 0.0 };
-            let _ = rep_app.emit(
-                "download_progress",
-                DownloadProgress {
-                    downloaded: cur,
-                    total: *rep_total,
-                    speed_bps: speed,
-                },
-            );
+            notify_progress(&DownloadProgress {
+                downloaded: cur,
+                total: *rep_total,
+                speed_bps: speed,
+            });
             last = now;
             last_bytes = cur;
             if cur >= *rep_total {
@@ -347,14 +418,11 @@ async fn run_download(
     }
 
     // Все чанки готовы — финализация + валидация GGUF.
-    let _ = app.emit(
-        "download_progress",
-        DownloadProgress {
-            downloaded: *total,
-            total: *total,
-            speed_bps: 0.0,
-        },
-    );
+    notify_progress(&DownloadProgress {
+        downloaded: *total,
+        total: *total,
+        speed_bps: 0.0,
+    });
     reporter.abort();
 
     finalize(part_path, save_path, *total)
@@ -402,7 +470,6 @@ async fn sleep_backoff(attempt: usize) {
 /// Однопоточный fallback (нет размера / нет поддержки Range): стрим с
 /// детектом зависания и повторами (перезапуск с начала).
 async fn download_single(
-    app: &AppHandle,
     client: &reqwest::Client,
     url: &str,
     part_path: &str,
@@ -470,14 +537,11 @@ async fn download_single(
                     let dt = now.duration_since(last).as_secs_f64();
                     if dt >= 0.2 {
                         let speed = (downloaded - last_bytes) as f64 / dt;
-                        let _ = app.emit(
-                            "download_progress",
-                            DownloadProgress {
-                                downloaded,
-                                total,
-                                speed_bps: speed,
-                            },
-                        );
+                        notify_progress(&DownloadProgress {
+                            downloaded,
+                            total,
+                            speed_bps: speed,
+                        });
                         last = now;
                         last_bytes = downloaded;
                     }
@@ -490,14 +554,11 @@ async fn download_single(
         }
 
         if ok && (total == 0 || downloaded >= total) {
-            let _ = app.emit(
-                "download_progress",
-                DownloadProgress {
-                    downloaded,
-                    total,
-                    speed_bps: 0.0,
-                },
-            );
+            notify_progress(&DownloadProgress {
+                downloaded,
+                total,
+                speed_bps: 0.0,
+            });
             return finalize(part_path.to_string(), save_path, total);
         }
         // иначе — следующая итерация перезапустит с начала
@@ -505,8 +566,7 @@ async fn download_single(
     Err("Не удалось докачать файл (однопоточный режим)".to_string())
 }
 
-#[tauri::command]
-pub async fn download_binary(app: AppHandle, url: String, save_path: String, extract_zip: bool) -> Result<(), String> {
+pub async fn download_binary(url: String, save_path: String, extract_zip: bool) -> Result<(), String> {
     eprintln!("[download_binary] Старт: {} -> {}", url, save_path);
 
     // Уровень 1: reqwest
@@ -526,7 +586,7 @@ pub async fn download_binary(app: AppHandle, url: String, save_path: String, ext
         Ok(resp) if resp.status().is_success() => {
             let total_size = resp.content_length().unwrap_or(0);
             let b = resp.bytes().await.map_err(|e| format!("Ошибка чтения: {}", e))?;
-            let _ = app.emit("download_progress", DownloadProgress {
+            notify_progress(&DownloadProgress {
                 downloaded: b.len() as u64,
                 total: total_size,
                 speed_bps: 0.0,
@@ -539,16 +599,23 @@ pub async fn download_binary(app: AppHandle, url: String, save_path: String, ext
             let tmp = std::env::temp_dir().join(format!("king_dl_bin_{}.tmp",
                 std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()));
             let on_log = |msg: String| { eprintln!("[download_binary] {}", msg); };
-            let opts = tauri_plugin_downloader::DownloadOptions {
-                label: "Бинарь".into(),
-                kind: "bin".into(),
-                ..Default::default()
-            };
-            tauri_plugin_downloader::download(&url, &tmp, opts, Some(&on_log)).await
-                .map_err(|e| format!("Ошибка скачивания: {}", e))?;
+            fallback_download(
+                FallbackRequest {
+                    url: url.clone(),
+                    dest: tmp.clone(),
+                    label: "Бинарь".into(),
+                    kind: "bin".into(),
+                    magic: None,
+                    min_size: None,
+                    expected_size: None,
+                },
+                &on_log,
+            )
+            .await
+            .map_err(|e| format!("Ошибка скачивания: {}", e))?;
             let b = fs::read(&tmp).map_err(|e| format!("Ошибка чтения temp: {}", e))?;
             let _ = fs::remove_file(&tmp);
-            let _ = app.emit("download_progress", DownloadProgress {
+            notify_progress(&DownloadProgress {
                 downloaded: b.len() as u64,
                 total: b.len() as u64,
                 speed_bps: 0.0,

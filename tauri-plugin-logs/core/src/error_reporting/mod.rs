@@ -16,6 +16,21 @@ use serde_json::Value;
 
 mod aptabase;
 
+/// Глобальный tokio-рантайм ядра для async-работы вне хостового рантайма
+/// (в чистом крейте `tauri::async_runtime` недоступен). Создаётся лениво;
+/// неудача сборки не фатальна: телеметрия пропускается, отказ виден в логе.
+pub(crate) fn try_runtime() -> Option<&'static tokio::runtime::Runtime> {
+    static RT: OnceLock<Option<tokio::runtime::Runtime>> = OnceLock::new();
+    RT.get_or_init(|| match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+        Ok(rt) => Some(rt),
+        Err(err) => {
+            log::error!("[logs-core] не удалось создать tokio-рантайм: {err}");
+            None
+        }
+    })
+    .as_ref()
+}
+
 /// Опциональный блок конфига `plugins.logs.reporting` (`tauri.conf.json`).
 #[derive(Deserialize, Clone)]
 #[serde(default)]
@@ -175,9 +190,11 @@ pub fn track_event(name: &str, props: Option<Value>) {
 }
 
 pub fn flush_on_exit() {
-    let _ = std::thread::Builder::new()
-        .name("tauri-logs-flush".to_string())
-        .spawn(|| {
-            tauri::async_runtime::block_on(aptabase::flush_periodic());
-        });
+    if let Some(rt) = try_runtime() {
+        let _ = std::thread::Builder::new()
+            .name("logs-core-flush".to_string())
+            .spawn(move || {
+                rt.block_on(aptabase::flush_periodic());
+            });
+    }
 }

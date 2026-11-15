@@ -167,4 +167,25 @@ export declare function sttStart(): Promise<number>;
 export declare function sttStop(): Promise<void>;
 export declare function sttGetStatus(): Promise<string>;
 export declare function sttInjectText(text: string): Promise<void>;
+/** Настройки диалогового движка (dialog_settings.json рядом с exe). */
+export interface DialogSettings {
+    engine_exe?: string;
+    model?: string;
+    port?: number;
+    language?: string;
+    name?: string;
+    persona?: string;
+    voice?: string;
+    seed?: number;
+    speak_first?: boolean;
+    max_seconds?: number;
+}
+export declare function dialogGetSettings(): Promise<DialogSettings>;
+export declare function dialogSaveSettings(settings: DialogSettings): Promise<void>;
+/** Скачивает движок speech.cpp (SHA-256 контроль) и возвращает путь к speech.exe. */
+export declare function dialogDownloadEngine(destDir?: string): Promise<string>;
+/** Запускает (или переиспользует) `speech serve`, возвращает HTTP-порт. */
+export declare function dialogStart(): Promise<number>;
+export declare function dialogStop(): Promise<void>;
+export declare function dialogStatus(): Promise<string>;
 import './web-components';

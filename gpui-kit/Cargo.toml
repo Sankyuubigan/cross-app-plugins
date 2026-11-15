@@ -1,0 +1,42 @@
+[package]
+name = "my-gpui-kit"
+version = "0.1.0"
+edition = "2021"
+description = "Owner's SSOT GPUI UI kit: 4-layer theme (setup_theme), AppShell window frame, AppCard, domain panels; rules in AI_UI_RULES.md"
+license = "MIT"
+
+# Отдельный workspace (НЕ корень my-tauri-plugins): опциональные депы
+# gpui-webview/lb-wry пинят webkit2gtk =2.0.1, а wry 0.54.x tauri-плагинов —
+# =2.0.2; в одном lock несовместимо. Пустая таблица [workspace] отцепляет
+# пакет от корневого workspace при поиске вверх по каталогам.
+# Ядра логов/движка — path-депы в члены чужого workspace: cargo читает их
+# манифесты с наследованием `workspace = true` из СВОЕГО корня (так же
+# собираются хосты: VibeBridge path-депит этот кит со своим lock).
+[workspace]
+
+[features]
+default = []
+# Логи: LogsPanel — хвост лог-файла (logs-core) + arboard-копирование.
+logs = ["dep:logs-core", "dep:arboard"]
+# llama-engine: LlamaSettingsCard — выбор модели из конфига движка.
+llama = ["dep:llama-engine-core"]
+# LegacyWebViewHost: gpui-webview (тот же пин семьи 0.9.1) + lb-wry builder.
+webview = ["dep:gpui-webview", "dep:wry"]
+
+[dependencies]
+# GPUI-фреймворк: тот же репо longbridge, семья 0.9.1. Жёсткий пин (правило
+# владельца): обновление осознанное, раз в 1–2 месяца; gpui-pre 0.3.12 идёт
+# транзитивно. Имя пакета НЕ gpui-kit: тёзка registry-крейта запрещена Cargo.
+gpui-kit = { version = "=0.9.1" }
+log = { version = "0.4", features = ["std"] }
+# Чистые ядра плагинов (без tauri) — под фичами, чтобы базовый кит не тянул тяжёлое.
+logs-core = { path = "../tauri-plugin-logs/core", optional = true }
+arboard = { version = "3", optional = true }
+llama-engine-core = { path = "../tauri-plugin-llama-engine/core", optional = true }
+# LegacyWebViewHost (фича webview): gpui-webview — тот же репо longbridge,
+# семья 0.9.1 едет вместе с gpui-kit — обновлять синхронно тем же циклом.
+gpui-webview = { version = "=0.9.1", optional = true }
+# wry-форк gpui-webview: типы builder'а кита должны совпадать с типами
+# gpui-webview (единый lb-wry в графе). Версия дублирует dep gpui-webview;
+# rename на `wry` — чтобы в коде кита был естественный путь wry::WebViewBuilder.
+wry = { version = "=0.53.3", package = "lb-wry", optional = true }

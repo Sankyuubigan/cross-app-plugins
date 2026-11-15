@@ -1,0 +1,22 @@
+[package]
+name = "logs-core"
+version = "0.1.0"
+edition = "2021"
+description = "Pure domain core of tauri-plugin-logs: unified log::Log, exe-adjacent log file, dev mirror test/last_logs, flight recorder and Aptabase reporting. No Tauri, no AppHandle - so a GPUI/native host can depend on it without dragging Tauri into the binary."
+license = "MIT"
+
+[dependencies]
+log = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lib]
+name = "logs_core"
+path = "src/lib.rs"

@@ -291,10 +291,19 @@ impl Cli {
         let (text, used) = render::render_map(&self.root, &index, &ranked, focus, tokens);
         report_concentration(&ranked, explain);
         if text.is_empty() {
+            if index.files.is_empty() {
+                return Err(format!(
+                    "Карта пуста: в {} не найдено ни одного исходника. \
+                     Возможно, корень указан неверно или всё дерево покрыто .gitignore.",
+                    self.display_root()
+                ));
+            }
             return Err(format!(
-                "Карта пуста: в {} не найдено ни одного определения. \
-                 Возможно, корень указан неверно.",
-                self.display_root()
+                "Карта пуста: в {} найдено файлов: {}, но ни одно определение не связано \
+                 ссылками с другими файлами — карте нечего показывать. Для маленьких деревьев \
+                 используй search/skeleton.",
+                self.display_root(),
+                index.files.len()
             ));
         }
         log::info!("codemap: карта {} токенов при бюджете {}", used, tokens);

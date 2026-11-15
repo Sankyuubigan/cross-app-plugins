@@ -335,5 +335,47 @@ export async function sttInjectText(text: string): Promise<void> {
   return invoke('plugin:speech|stt_inject_text', { text })
 }
 
+// ─── Dialog (speech.cpp, full-duplex Haru) ──────────────────────────────
+
+/** Настройки диалогового движка (dialog_settings.json рядом с exe). */
+export interface DialogSettings {
+  engine_exe?: string
+  model?: string
+  port?: number
+  language?: string
+  name?: string
+  persona?: string
+  voice?: string
+  seed?: number
+  speak_first?: boolean
+  max_seconds?: number
+}
+
+export async function dialogGetSettings(): Promise<DialogSettings> {
+  return invoke<DialogSettings>('plugin:speech|dialog_get_settings')
+}
+
+export async function dialogSaveSettings(settings: DialogSettings): Promise<void> {
+  return invoke('plugin:speech|dialog_save_settings', { settings })
+}
+
+/** Скачивает движок speech.cpp (SHA-256 контроль) и возвращает путь к speech.exe. */
+export async function dialogDownloadEngine(destDir?: string): Promise<string> {
+  return invoke<string>('plugin:speech|dialog_download_engine', { destDir: destDir ?? '' })
+}
+
+/** Запускает (или переиспользует) `speech serve`, возвращает HTTP-порт. */
+export async function dialogStart(): Promise<number> {
+  return invoke<number>('plugin:speech|dialog_start')
+}
+
+export async function dialogStop(): Promise<void> {
+  return invoke('plugin:speech|dialog_stop')
+}
+
+export async function dialogStatus(): Promise<string> {
+  return invoke<string>('plugin:speech|dialog_status')
+}
+
 // Регистрируем Web Components при импорте пакета.
 import './web-components'

@@ -9,7 +9,6 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
-use tauri::AppHandle;
 use tokio::sync::Mutex;
 
 use super::config::find_catalog_entry_for_model;
@@ -24,11 +23,10 @@ static IN_FLIGHT: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::n
 /// Возвращает путь к mmproj для модели, скачивая его при необходимости.
 /// Порядок: конфиг → автодетект в папке модели → каталог + докачка.
 pub async fn ensure_mmproj_for_model(
-    app: &AppHandle,
     model_path: &str,
 ) -> Result<Option<String>, String> {
     // Быстрый путь: путь уже в конфиге и файл существует.
-    let cfg = load_config(app);
+    let cfg = load_config();
     if let Some(p) = cfg.mmproj_files.get(model_path) {
         if Path::new(p).exists() {
             return Ok(Some(p.clone()));
@@ -46,7 +44,7 @@ pub async fn ensure_mmproj_for_model(
     let _permit = cell.lock().await;
 
     // После ожидания другой воркер мог уже докачать — перепроверяем конфиг.
-    let cfg = load_config(app);
+    let cfg = load_config();
     if let Some(p) = cfg.mmproj_files.get(model_path) {
         if Path::new(p).exists() {
             return Ok(Some(p.clone()));
@@ -55,14 +53,14 @@ pub async fn ensure_mmproj_for_model(
 
     // Пользователь мог сам положить mmproj рядом с моделью.
     if let Some(p) = auto_detect_mmproj(model_path) {
-        let mut cfg = load_config(app);
+        let mut cfg = load_config();
         cfg.mmproj_files.insert(model_path.to_string(), p.clone());
-        save_config(app, &cfg)?;
+        save_config(&cfg)?;
         return Ok(Some(p));
     }
 
     // Сопоставление с каталогом и докачка проектора.
-    let catalog = load_catalog(app);
+    let catalog = load_catalog();
     if let Some(entry) = find_catalog_entry_for_model(&catalog, model_path) {
         if let Some(url) = &entry.mmproj_url {
             let model_dir = Path::new(model_path)
@@ -77,15 +75,15 @@ pub async fn ensure_mmproj_for_model(
             let mmp_path = model_dir.join(mmp_name);
             let mmp_path_str = mmp_path.to_string_lossy().to_string();
             if mmp_path.exists() {
-                let mut cfg = load_config(app);
+                let mut cfg = load_config();
                 cfg.mmproj_files.insert(model_path.to_string(), mmp_path_str.clone());
-                save_config(app, &cfg)?;
+                save_config(&cfg)?;
                 return Ok(Some(mmp_path_str));
             }
-            download_model(app.clone(), url.clone(), mmp_path_str.clone()).await?;
-            let mut cfg = load_config(app);
+            download_model(url.clone(), mmp_path_str.clone()).await?;
+            let mut cfg = load_config();
             cfg.mmproj_files.insert(model_path.to_string(), mmp_path_str.clone());
-            save_config(app, &cfg)?;
+            save_config(&cfg)?;
             return Ok(Some(mmp_path_str));
         }
     }

@@ -572,22 +572,155 @@ fn extract_zip(zip_path: &Path, dest: &Path) -> Result<(), String> {
 
 /// Рекурсивно ищет `crispasr.exe` (zip может класть в подпапку).
 fn find_exe(dir: &Path) -> Option<PathBuf> {
+    find_exe_named(dir, "crispasr.exe")
+}
+
+/// Рекурсивно ищет exe с точным именем `name` (zip может класть в подпапку).
+fn find_exe_named(dir: &Path, name: &str) -> Option<PathBuf> {
     let entries = std::fs::read_dir(dir).ok()?;
     for entry in entries.flatten() {
         let p = entry.path();
         if p.is_dir() {
-            if let Some(found) = find_exe(&p) {
+            if let Some(found) = find_exe_named(&p, name) {
                 return Some(found);
             }
-        } else if p
-            .file_name()
-            .map(|n| n == "crispasr.exe")
-            .unwrap_or(false)
-        {
+        } else if p.file_name().map(|n| n == name).unwrap_or(false) {
             return Some(p);
         }
     }
     None
+}
+
+// ─── speech.cpp (движок диалога Haru): релиз + установка ─────────────
+
+pub const SPEECHCPP_RELEASE_API: &str =
+    "https://api.github.com/repos/nyosegawa/speech.cpp/releases/latest";
+
+/// Скачивает Windows-vulkan релиз speech.cpp, проверяет SHA-256 по SHA256SUMS
+/// и распаковывает в `<dest_dir>/<тег>/`. Возвращает путь к speech.exe.
+///
+/// dest_dir — корень `speechcpp` (пусто = `<engine_dir>/speechcpp` по умолчанию).
+pub async fn dialog_download_engine(dest_dir: &str) -> Result<String, String> {
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(SPEECHCPP_RELEASE_API)
+        .header("User-Agent", "SpeechLab")
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .map_err(|e| format!("ошибка запроса релиза speech.cpp: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!(
+            "GitHub вернул {} для релиза speech.cpp",
+            resp.status()
+        ));
+    }
+    let release: GhRelease = resp
+        .json()
+        .await
+        .map_err(|e| format!("не удалось разобрать релиз speech.cpp: {e}"))?;
+    let tag = release.tag_name.clone();
+
+    let zip = release
+        .assets
+        .iter()
+        .find(|a| {
+            let n = a.name.to_ascii_lowercase();
+            n.starts_with("speech-") && n.ends_with(".zip") && n.contains("windows")
+                && n.contains("vulkan")
+        })
+        .ok_or_else(|| "в релизе speech.cpp не найден Windows-vulkan zip-ассет".to_string())?;
+    let sums = release
+        .assets
+        .iter()
+        .find(|a| a.name == "SHA256SUMS")
+        .ok_or_else(|| "в релизе speech.cpp нет SHA256SUMS".to_string())?;
+
+    let base: PathBuf = if dest_dir.trim().is_empty() {
+        default_engine_dir().join("speechcpp")
+    } else {
+        PathBuf::from(dest_dir)
+    };
+    let target = base.join(&tag);
+    std::fs::create_dir_all(&target)
+        .map_err(|e| format!("не удалось создать папку {}: {e}", target.display()))?;
+
+    let zip_path = target.join("speech.zip");
+    download_to(&zip.browser_download_url, &zip_path, "engine").await?;
+
+    // Контроль целостности: SHA256SUMS ("<hex>  <имя>") для скачанного zip.
+    // Ошибку НЕ глотаем: битый zip → невнятный крах при распаковке/запуске.
+    let sums_path = target.join("SHA256SUMS");
+    download_to(&sums.browser_download_url, &sums_path, "engine").await?;
+    let sums_text = std::fs::read_to_string(&sums_path)
+        .map_err(|e| format!("не удалось прочитать SHA256SUMS: {e}"))?;
+    verify_sha256(&zip_path, &sums_text, &zip.name)?;
+    let _ = std::fs::remove_file(&sums_path);
+
+    extract_zip(&zip_path, &target)?;
+    let _ = std::fs::remove_file(&zip_path);
+
+    std::fs::write(target.join("version.txt"), &tag).map_err(|e| {
+        format!(
+            "движок распакован, но не удалось записать version.txt в {}: {e}",
+            target.display()
+        )
+    })?;
+
+    let exe = find_exe_named(&target, "speech.exe").ok_or_else(|| {
+        format!(
+            "после распаковки не найден speech.exe в {}",
+            target.display()
+        )
+    })?;
+    Ok(exe.to_string_lossy().to_string())
+}
+
+/// Резолвит путь к speech.exe: старшая версия среди папок `<engine_dir>/speechcpp/`.
+/// None — движок не установлен.
+pub fn resolve_speech_exe(engine_dir: &str) -> Option<PathBuf> {
+    let root = engine_base(engine_dir).join("speechcpp");
+    let mut best: Option<(String, PathBuf)> = None;
+    let entries = std::fs::read_dir(&root).ok()?;
+    for e in entries.flatten() {
+        let dir = e.path();
+        let exe = dir.join("speech.exe");
+        if !exe.exists() {
+            continue;
+        }
+        let ver = e.file_name().to_string_lossy().to_string();
+        if best.as_ref().map(|(v, _)| ver > *v).unwrap_or(true) {
+            best = Some((ver, exe));
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
+/// Проверяет sha256 файла по строке SHA256SUMS (`"<hex>  <имя>"`).
+fn verify_sha256(path: &Path, sums_text: &str, asset_name: &str) -> Result<(), String> {
+    use sha2::{Digest, Sha256};
+    let want = sums_text
+        .lines()
+        .find_map(|line| {
+            let mut it = line.split_whitespace();
+            let hex = it.next()?;
+            let name = it.next()?;
+            (name == asset_name).then(|| hex.to_ascii_lowercase())
+        })
+        .ok_or_else(|| format!("в SHA256SUMS нет строки для {asset_name}"))?;
+    let bytes = std::fs::read(path)
+        .map_err(|e| format!("не удалось прочитать {} для проверки: {e}", path.display()))?;
+    let got: String = Sha256::digest(&bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    if got != want {
+        return Err(format!(
+            "SHA-256 не совпал для {}: ожидалось {want}, получено {got}",
+            path.display()
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

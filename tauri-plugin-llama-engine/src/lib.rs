@@ -92,7 +92,7 @@ pub fn init() -> TauriPlugin<Wry, Config> {
                     engine::config::set_app_data_dir_name(name);
                 }
             }
-            engine::vram::start_forwarding(app);
+            install_host_bridges(app);
             Ok(())
         })
         .on_event(|_app, event| {
@@ -127,10 +127,62 @@ pub fn init() -> TauriPlugin<Wry, Config> {
             commands::get_model_params,
             commands::set_model_params,
             commands::reset_model_params,
-            engine::downloader::download_model,
+            commands::download_model,
             generate::generate_text,
         ])
         .build()
+}
+
+/// Мосты ядра `llama-engine-core` в Tauri-хост (вызывается из setup плагина):
+/// - прогресс скачивания → событие `download_progress` (тот же payload, что раньше);
+/// - VRAM-уведомления → событие `vram_notice`;
+/// - фоллбэк-скачивание → единый движок `tauri_plugin_downloader` (зеркала HF).
+fn install_host_bridges(app: &tauri::AppHandle) {
+    use std::sync::Arc;
+
+    // Прогресс скачивания (ядро зовёт колбэк из потоков скачивания).
+    let handle = app.clone();
+    engine::downloader::set_progress_hook(Some(Arc::new(
+        move |p: &engine::downloader::DownloadProgress| {
+            use tauri::Emitter;
+            let _ = handle.emit("download_progress", p);
+        },
+    )));
+
+    // VRAM-уведомления (одна кнопка «ОК» на фронте).
+    let handle = app.clone();
+    engine::vram::subscribe(Arc::new(move |notice: &engine::vram::VramNotice| {
+        use tauri::Emitter;
+        let _ = handle.emit("vram_notice", notice.note.clone());
+    }));
+
+    // Фоллбэк-скачивание: адаптер в единый движок tauri-plugin-downloader
+    // (stall/resume/зеркала HF остались в плагине downloader, как и было).
+    // Future заимствует on_log на время скачивания (HRTB-контракт ядра).
+    // Именованная fn вместо замыкания: fn item честно полиморфна по 'a,
+    // а замыкание с let-аннотацией компилятор не выводит как for<'a>.
+    engine::downloader::set_fallback_downloader(Some(Arc::new(
+        tauri_fallback_download,
+    ) as engine::downloader::FallbackHandler));
+}
+
+/// Адаптер фоллбэк-скачивания ядра в `tauri_plugin_downloader::download`.
+/// HRTB: future заимствует `on_log` ровно на время скачивания.
+fn tauri_fallback_download<'a>(
+    req: engine::downloader::FallbackRequest,
+    on_log: &'a (dyn Fn(String) + Send + Sync),
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+    Box::pin(async move {
+        let opts = tauri_plugin_downloader::DownloadOptions {
+            label: req.label,
+            kind: req.kind,
+            magic: req.magic,
+            min_size: req.min_size,
+            expected_size: req.expected_size,
+            ..Default::default()
+        };
+        tauri_plugin_downloader::download(&req.url, &req.dest, opts, Some(on_log)).await
+    })
 }
 
 /// Хелпер для хоста (setup): папка движка `<exe>/llamacpp` (или из конфига).

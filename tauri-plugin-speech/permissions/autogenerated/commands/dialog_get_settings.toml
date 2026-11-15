@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-dialog-get-settings"
+description = "Enables the dialog_get_settings command without any pre-configured scope."
+commands.allow = ["dialog_get_settings"]
+
+[[permission]]
+identifier = "deny-dialog-get-settings"
+description = "Denies the dialog_get_settings command without any pre-configured scope."
+commands.deny = ["dialog_get_settings"]

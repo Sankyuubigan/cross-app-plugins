@@ -1,0 +1,28 @@
+[package]
+name = "llama-engine-core"
+version = "0.1.0"
+edition = "2021"
+description = "Pure domain core of tauri-plugin-llama-engine: llama.cpp engine orchestration (external llama-server.exe process), gguf catalog, model management, multi-chunk downloads, VRAM notices. No Tauri, no AppHandle - so a GPUI/native host can depend on it without dragging Tauri into the binary."
+license = "MIT"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+log = { workspace = true }
+tokio = { workspace = true }
+# reqwest — как в плагине-хосте (default-features=false + rustls, чтобы не
+# конфликтовать с native-tls воркспейса).
+reqwest = { version = "0.12", features = ["json", "rustls-tls-native-roots", "stream", "blocking"], default-features = false }
+zip = { workspace = true }
+sysinfo = "0.30.0"
+nvml-wrapper = "0.10.0"
+sha2 = "0.10"
+futures-util = "0.3"
+minijinja = { workspace = true }
+
+# Атомарные записи JSON (app_config.json): tmp->rename + sidecar lock.
+json-store = { path = "../../json-store" }
+
+[lib]
+name = "llama_engine_core"
+path = "src/lib.rs"

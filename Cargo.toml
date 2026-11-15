@@ -4,7 +4,9 @@ members = [
     "tauri-plugin-about-updates",
     "tauri-plugin-speech",
     "tauri-plugin-logs",
+    "tauri-plugin-logs/core",
     "tauri-plugin-llama-engine",
+    "tauri-plugin-llama-engine/core",
     "tauri-plugin-cloud-routers",
     "tauri-plugin-cloud-routers/crates/core",
     "tauri-plugin-cloud-routers/crates/gateway",
@@ -14,6 +16,10 @@ members = [
     "tauri-plugin-ffmpeg",
     "tauri-plugin-system1",
     "json-store",
+    # gpui-kit — НЕ член workspace: его опциональные депы gpui-webview/lb-wry
+    # (webkit2gtk =2.0.1) несовместимы с wry 0.54.x tauri-плагинов (=2.0.2) в
+    # одном lock. Кит — отдельный workspace (gpui-kit/Cargo.lock), ядра
+    # logs-core/llama-engine-core он path-депит с наследованием из этого корня.
     "tools/code-tools",
     "tools/excel-tools",
     "tools/diag-tools",
@@ -82,6 +88,13 @@ windows = { version = "0.58", features = [
 # (warn/error -> stderr -> gateway.log), перезапись логов назвалась бы
 # «не ставится» без этой фичи.
 log = { version = "0.4", features = ["std"] }
+
+# GPUI-кит владельца (папка gpui-kit, пакет my-gpui-kit): SSOT GPUI-UI — тема
+# 4 слоя (setup_theme), каркас AppShell, AppCard, панели. Жёсткий пин (правило
+# владельца): обновление осознанное, раз в 1–2 месяца; gpui-pre 0.3.12 идёт
+# транзитивно. Имя пакета НЕ gpui-kit: тёзка registry-крейта запрещена Cargo.
+# ВАЖНО (15.11.26): кит — ОТДЕЛЬНЫЙ workspace (см. members), его пины
+# gpui-kit/gpui-webview/lb-wry живут в gpui-kit/Cargo.toml, не здесь.
 
 # Движок llama.cpp (tauri-plugin-llama-engine): GPU-детект, VRAM, скачивание моделей.
 # reqwest в плагине объявлен отдельно (default-features=false + rustls, как в хосте).

@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-dialog-stop"
+description = "Enables the dialog_stop command without any pre-configured scope."
+commands.allow = ["dialog_stop"]
+
+[[permission]]
+identifier = "deny-dialog-stop"
+description = "Denies the dialog_stop command without any pre-configured scope."
+commands.deny = ["dialog_stop"]

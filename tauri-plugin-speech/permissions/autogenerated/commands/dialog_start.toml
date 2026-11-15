@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-dialog-start"
+description = "Enables the dialog_start command without any pre-configured scope."
+commands.allow = ["dialog_start"]
+
+[[permission]]
+identifier = "deny-dialog-start"
+description = "Denies the dialog_start command without any pre-configured scope."
+commands.deny = ["dialog_start"]

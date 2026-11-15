@@ -56,7 +56,7 @@ pub struct SourceInfo {
     pub is_default: bool,
 }
 
-const EMBEDDED_SOURCES: &str = include_str!("../../engine_sources.json");
+const EMBEDDED_SOURCES: &str = include_str!("../../../engine_sources.json");
 
 /// Полный реестр источников (порядок как в JSON).
 pub fn all_sources() -> Vec<SourceSpec> {

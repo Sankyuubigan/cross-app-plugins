@@ -9,7 +9,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use tauri::AppHandle;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ModelParams {
@@ -190,7 +189,7 @@ fn ensure_migrated(dest: &Path) {
 /// Использует тот же каталог, что и `load_config_early` — `app_data_dir_early()`.
 /// Раньше здесь был `app.path().app_data_dir()` (каталог хоста), из-за чего
 /// `load_config` и `load_config_early` читали РАЗНЫЕ файлы.
-pub fn get_config_path(_app: &AppHandle) -> PathBuf {
+pub fn get_config_path() -> PathBuf {
     let path = app_data_dir_early().join("app_config.json");
     ensure_migrated(&path);
     path
@@ -207,8 +206,8 @@ pub fn load_config_early() -> EngineConfig {
     }
 }
 
-pub fn load_config(app: &AppHandle) -> EngineConfig {
-    if let Ok(data) = fs::read_to_string(get_config_path(app)) {
+pub fn load_config() -> EngineConfig {
+    if let Ok(data) = fs::read_to_string(get_config_path()) {
         serde_json::from_str(&data).unwrap_or_default()
     } else {
         EngineConfig::default()
@@ -217,8 +216,8 @@ pub fn load_config(app: &AppHandle) -> EngineConfig {
 
 /// Сохраняет движковые ключи в `app_config.json` field-preserving-merge:
 /// существующие хостовые ключи (theme, allow_error_reports, …) НЕ затираются.
-pub fn save_config(app: &AppHandle, config: &EngineConfig) -> Result<(), String> {
-    let path = get_config_path(app);
+pub fn save_config(config: &EngineConfig) -> Result<(), String> {
+    let path = get_config_path();
     save_engine_config_file(&path, config)
 }
 
@@ -243,11 +242,11 @@ pub fn save_engine_config_file(path: &Path, config: &EngineConfig) -> Result<(),
 
 /// Встроенный каталог моделей (SSOT для ВСЕХ проектов; файл живёт в корне
 /// плагина и компилируется внутрь крейта).
-const EMBEDDED_CATALOG: &str = include_str!("../../models_catalog.json");
+const EMBEDDED_CATALOG: &str = include_str!("../../../models_catalog.json");
 
 /// Возвращает встроенный каталог моделей. Единый источник правды — файл
 /// `models_catalog.json` плагина; внешние файлы-оверайды не поддерживаются.
-pub fn load_catalog(_app: &AppHandle) -> Vec<CatalogEntry> {
+pub fn load_catalog() -> Vec<CatalogEntry> {
     serde_json::from_str(EMBEDDED_CATALOG).unwrap_or_default()
 }
 

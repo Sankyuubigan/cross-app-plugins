@@ -13,7 +13,7 @@ pub struct VramNotice {
     pub note: String,
 }
 
-type Listener = Arc<dyn Fn(&VramNotice) + Send + Sync>;
+pub type Listener = Arc<dyn Fn(&VramNotice) + Send + Sync>;
 
 #[derive(Default)]
 struct VramBus {
@@ -73,19 +73,11 @@ pub fn ram_forecast_notice(note: &str) -> String {
     format!("⚙️ По оценке до запуска движку может не хватить обычной памяти (ОЗУ).\n\n{}", note)
 }
 
-/// Подписка + форвардинг VramNotice → событие `vram_notice` (UI).
-/// Вызывается один раз в setup плагина.
-pub fn start_forwarding(app: &tauri::AppHandle) {
-    let app = app.clone();
-    vram_bus().subscribe(Arc::new(move |notice| {
-        use tauri::Emitter;
-        let _ = app.emit(
-            "vram_notice",
-            serde_json::json!({
-                "note": notice.note,
-            }),
-        );
-    }));
+/// Подписка на VRAM-уведомления: хост решает, куда их доставить (Tauri-плагин
+/// форвардит как событие `vram_notice`, GPUI-хост — в свою панель). Вызывается
+/// один раз при старте хоста.
+pub fn subscribe(listener: Listener) {
+    vram_bus().subscribe(listener);
 }
 
 #[cfg(test)]
