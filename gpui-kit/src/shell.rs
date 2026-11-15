@@ -221,6 +221,11 @@ impl RenderOnce for AppShell {
             .size_full()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
+            // Рамка окна: системный кант Windows тёмный и в тёмной теме не
+            // спасает от слияния с тёмными фонами других программ — рисуем
+            // свою hairline из темы (детерминированно в обеих темах).
+            .border_1()
+            .border_color(cx.theme().border)
             .child(header)
             .child(content)
     }

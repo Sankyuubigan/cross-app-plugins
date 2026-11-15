@@ -46,3 +46,16 @@ gpui-webview = { version = "=0.9.1", optional = true }
 # gpui-webview (единый lb-wry в графе). Версия дублирует dep gpui-webview;
 # rename на `wry` — чтобы в коде кита был естественный путь wry::WebViewBuilder.
 wry = { version = "=0.53.3", package = "lb-wry", optional = true }
+
+# drag_probe (диагностика фриза при перетаскивании, Шаг 0 спеца): сабкласс
+# HWND и константы сообщений. Обе версии уже в графе хостов (windows 0.58,
+# raw-window-handle 0.6 от gpui-pre) — новые в lock не попадают.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = ["Win32_Foundation", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+raw-window-handle = "0.6"
+
+# Пример использует LegacyWebViewHost (фича webview): cargo test собирает
+# примеры и падает без required-features (E0432 на gated-экспорте).
+[[example]]
+name = "webview_demo"
+required-features = ["webview"]

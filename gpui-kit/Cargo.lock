@@ -4260,6 +4260,7 @@ checksum = "4744e383959f0db86ede514b809b1c53251889093803c05267acc7d4e7030d70"
 name = "llama-engine-core"
 version = "0.1.0"
 dependencies = [
+ "downloader-core",
  "futures-util",
  "json-store",
  "log",
@@ -4665,7 +4666,9 @@ dependencies = [
  "llama-engine-core",
  "log",
  "log-collector-core",
+ "raw-window-handle",
  "tokio",
+ "windows 0.58.0",
 ]
 
 [[package]]

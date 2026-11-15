@@ -45,6 +45,9 @@
   мышью (gpui-pre window.rs:2258) — вешать `window_control_area(Drag)` только на
   отдельный пустой div; дети drag-контейнера на Windows некликабельны (клики уходят
   в HTCAPTION).
+- **Рамка окна — AppShell**: системный кант Windows тёмный и в тёмной теме не спасает
+  от слияния с тёмными фонами; корень AppShell рисует hairline `border_1` из
+  `theme().border` (детерминированно в обеих темах, 15.11.26).
 - **Theme::change сбрасывает палитру**: кастом ставить только через `Theme::update`
   ПОСЛЕ change (всё внутри `setup_theme`).
 - Кнопки окна: `window.minimize_window() / zoom_window() / remove_window()`.

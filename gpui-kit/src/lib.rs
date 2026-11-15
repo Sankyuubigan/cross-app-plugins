@@ -20,6 +20,10 @@ pub mod palette;
 pub mod shell;
 pub mod theme;
 
+// Диагностический замер драг-цикла окна (Шаг 0 спеца, фриз при
+// перетаскивании): без VIBEBRIDGE_DRAG_PROBE=1 в окружении не делает ничего.
+pub mod drag_probe;
+
 #[cfg(feature = "log-collector")]
 pub mod logs_panel;
 #[cfg(feature = "llama")]
