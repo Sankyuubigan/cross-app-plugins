@@ -32,6 +32,12 @@ Default permissions for the speech plugin (CrispASR TTS/STT engine).
 - `allow-stt-stop`
 - `allow-stt-get-status`
 - `allow-stt-inject-text`
+- `allow-dialog-get-settings`
+- `allow-dialog-save-settings`
+- `allow-dialog-download-engine`
+- `allow-dialog-start`
+- `allow-dialog-stop`
+- `allow-dialog-status`
 
 ## Permission Table
 

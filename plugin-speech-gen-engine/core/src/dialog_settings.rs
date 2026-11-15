@@ -30,6 +30,9 @@ pub struct DialogSettings {
     pub speak_first: bool,
     /// Лимит длительности ответа в секундах (WS `start.max_seconds`; 0 = не задавать).
     pub max_seconds: u32,
+    /// Имя устройства ввода (cpal); пусто = системный микрофон по умолчанию.
+    #[serde(default)]
+    pub mic_device: String,
 }
 
 impl Default for DialogSettings {
@@ -45,6 +48,7 @@ impl Default for DialogSettings {
             seed: 0,
             speak_first: false,
             max_seconds: 0,
+            mic_device: String::new(),
         }
     }
 }
