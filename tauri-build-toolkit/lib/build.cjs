@@ -17,6 +17,9 @@ const BUNDLE_DIR = (cfg) => path.join(resolveTargetDir(cfg), 'release', 'bundle'
 const RELEASE_EXE = (cfg) =>
     cfg.appExe ? path.join(resolveTargetDir(cfg), 'release', `${cfg.appExe}.exe`) : null;
 
+// Окно наблюдения за запущенным приложением (передаётся в launchApp в run()).
+const LAUNCH_SETTLE_MS = 7000;
+
 function readTauriJson(cfg) {
     const p = path.join(cfg.projectRoot, 'src-tauri', 'tauri.conf.json');
     return JSON.parse(fs.readFileSync(p, 'utf8'));
@@ -193,8 +196,11 @@ async function run(cfg, opts = {}) {
     const exe = checkExeFresh(cfg, buildStart);
     copyVcRedistIfConfigured(cfg, exe);
 
-    // launchApp: false → ранний краш (PANIC/missing DLL) — фейлим билд, не молчим.
-    const ok = await launchApp(cfg, exe);
+    // launchApp: false → краш приложения в первые секунды (PANIC/missing DLL)
+    // — фейлим билд, не молчим. 7s вместо дефолтных 2s: смерть приложения
+    // ПОЗЖЕ 2s ранее давала «успешный» билд с exit 0 — pause в build.bat не
+    // срабатывал и консоль закрывалась без ошибки (репорт «консоль пропадает»).
+    const ok = await launchApp(cfg, exe, { settleMs: LAUNCH_SETTLE_MS });
     if (ok === false) {
         console.error('\n[build] FAILED: app did not stay alive after launch.');
         process.exitCode = 1;

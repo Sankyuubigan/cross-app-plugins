@@ -61,10 +61,15 @@ function launchApp(cfg, exePath, opts = {}) {
     const exeDir = path.dirname(exePath);
     const env = { ...process.env, ...(opts.env || {}) };
 
-    // 2. WEBVIEW2_USER_DATA_FOLDER — отдельный профиль для dev-инстанса.
-    //    Иначе dev и установленная релизная копия делят один каталог
-    //    %LOCALAPPDATA%\<имя exe>\EBWebView → конфликт при параллельной работе.
-    env.WEBVIEW2_USER_DATA_FOLDER = path.join(resolveTargetDir(cfg), 'webview2-dev');
+    // 2. WEBVIEW2_USER_DATA_FOLDER — отдельный профиль для dev-инстанса,
+    //    ПОДПАПКА НА ПРИЛОЖЕНИЕ (webview2-dev/<appExe>). Общий webview2-dev на
+    //    все приложения = сломанные окна: WebView2 не поддерживает user-data-
+    //    folder, шареную между разными хост-приложениями — у второго приложения
+    //    создание среды фейлится, Tauri-окно не создаётся (процесс жив, окна
+    //    нет; репорт «repos-control не собирается, окна никакого нет» при
+    //    запущенном king_orch). Иначе dev и установленная релизная копия делили
+    //    бы один каталог %LOCALAPPDATA%\<имя exe>\EBWebView.
+    env.WEBVIEW2_USER_DATA_FOLDER = path.join(resolveTargetDir(cfg), 'webview2-dev', cfg.appExe || 'default');
 
     // 3. APPDATA НЕ подменяем: app_data_dir() хоста резолвится через WinAPI
     //    (SHGetKnownFolderPath) и игнорирует env APPDATA, а плагины читают
@@ -134,35 +139,54 @@ function findAppPidsInDir(cfg, nameFilter, dir) {
 }
 
 // Закрытие запущенного dev-инстанса приложения (высвобождает file lock exe).
-// Убивает ТОЛЬКО процессы из target/{debug,release} ЭТОГО проекта.
+// Убивает ТОЛЬКО процессы из target/{debug,release} ЭТОГО проекта: из
+// резолвнутого (общего) target-dir И из legacy-пути <projectRoot>/src-tauri/target.
 function killApp(cfg, opts = {}) {
     if (!cfg.appExe) return;
     const exeName = `${cfg.appExe}.exe`;
     const targetDir = resolveTargetDir(cfg);
     const profiles = opts.profiles || ['release', 'debug'];
 
-    for (const profile of profiles) {
-        const dir = path.join(targetDir, profile);
-        let pids = [];
-        try {
-            pids = findAppPidsInDir(cfg, exeName, dir);
-        } catch (e) {
-            continue;
-        }
-        if (!pids.length) continue;
-        console.log(`killApp: ${exeName} (${profile}) -> PID ${pids.join(', ')}`);
-        for (const pid of pids) {
+    // Миграционное окно общего target-dir (включён 16.11.2026): инстансы,
+    // запущенные из старых <projectRoot>/src-tauri/target, обязаны гаситься
+    // перед пересборкой — резолвнутый путь их не видит, и старый инстанс
+    // переживал билд (репорт «repos-control не билдится, консоль пропала»).
+    const dirs = [targetDir];
+    const legacyDir = path.join(cfg.projectRoot, 'src-tauri', 'target');
+    if (path.resolve(legacyDir) !== path.resolve(targetDir)) {
+        dirs.push(legacyDir);
+    }
+
+    for (const dir of dirs) {
+        for (const profile of profiles) {
+            const dirProfile = path.join(dir, profile);
+            let pids = [];
             try {
-                run(cfg, 'taskkill', ['/F', '/T', '/PID', String(pid)], { quiet: true });
+                pids = findAppPidsInDir(cfg, exeName, dirProfile);
             } catch (e) {
-                /* процесс уже завершился — не ошибка */
+                continue;
+            }
+            if (!pids.length) continue;
+            console.log(`killApp: ${exeName} (${dirProfile}) -> PID ${pids.join(', ')}`);
+            for (const pid of pids) {
+                try {
+                    run(cfg, 'taskkill', ['/F', '/T', '/PID', String(pid)], { quiet: true });
+                } catch (e) {
+                    /* процесс уже завершился — не ошибка */
+                }
             }
         }
     }
 
     // Диагностика: пользовательские копии (вне projectRoot) НЕ трогаем, но если
     // что-то всё же держит target-exe — говорим об этом явно.
-    const stillLocked = findAppPidsInDir(cfg, exeName, targetDir);
+    const stillLocked = dirs.flatMap((dir) => {
+        try {
+            return findAppPidsInDir(cfg, exeName, dir);
+        } catch (e) {
+            return [];
+        }
+    });
     if (stillLocked.length) {
         console.warn(
             `killApp: ВНИМАНИЕ — остались процессы в target: PID ${stillLocked.join(', ')}. ` +
