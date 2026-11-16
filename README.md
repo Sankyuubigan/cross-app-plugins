@@ -34,8 +34,8 @@
 | `plugin-about-updates` | `about-updates` | Версия, проверка обновлений, история релизов GitHub, откат | `<about-updates-panel>` |
 | `plugin-speech-gen-engine` | `speech` | TTS/STT (движок CrispASR, голоса, модели) | да |
 
-`tauri-build-toolkit/` — отдельный Node-CLI пакет для сборки/препа/релиза хост-проектов
-(не плагин; дока — `tauri-build-toolkit/docs/README.md`).
+`rust-build-toolkit/` — отдельный Node-CLI пакет для сборки/препа/релиза хост-проектов
+(не плагин; дока — `rust-build-toolkit/docs/README.md`).
 
 Тул-семейство (не плагины) живёт в папке **`tools/`**:
 

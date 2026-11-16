@@ -1,11 +1,11 @@
 {
-  "name": "@my-tauri-plugins/build-toolkit",
+  "name": "@my-tauri-plugins/rust-build-toolkit",
   "version": "0.1.0",
-  "description": "Shared build/installer/release tooling and version sync (YY.M.P) for Tauri apps. Generalization of build.bat / generate_installer.bat / release.bat from the King Orch reference project.",
+  "description": "Shared build/installer/release tooling and version sync (YY.M.P) for Rust apps (Tauri, GPUI, egui). Generalization of build.bat / generate_installer.bat / release.bat from the King Orch reference project.",
   "type": "commonjs",
   "main": "cli.cjs",
   "bin": {
-    "tauri-build": "cli.cjs"
+    "rust-build": "cli.cjs"
   },
   "scripts": {
     "doctor": "node cli.cjs doctor",

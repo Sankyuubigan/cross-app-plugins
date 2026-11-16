@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// tauri-build-toolkit CLI.
+// rust-build-toolkit CLI.
 // Subcommands:
 //   build      - dev build (version bump + npm + icons + tauri build + launch app)
 //   prep       - prep-only (version bump + npm + icons) — шаг 1 generate_installer.bat

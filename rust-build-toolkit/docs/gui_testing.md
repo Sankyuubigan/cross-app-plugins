@@ -2,7 +2,7 @@
 
 > **Для кого:** ИИ-агенты (opencode и т.п.), которым нужно тестировать GUI десктопного Tauri-приложения на Windows (WebView2).
 > **Суть:** Интерфейс Tauri-приложения — это веб-страница внутри WebView2 (Chromium). Агент может подключиться к ней по CDP-порту и читать DOM / кликать / вводить текст / делать скриншоты. Пиксели и «зрение» не нужны.
-> **Каноническая интеграция в этом репо:** `tauri-build-toolkit` — порт включается через `devWindow.additionalBrowserArgs` в `.build-config.json` (см. `build_release_rules.md` §5, `templates/.build-config.example.json`). Краткая выжимка правил — там же, полный гайд — здесь.
+> **Каноническая интеграция в этом репо:** `rust-build-toolkit` — порт включается через `devWindow.additionalBrowserArgs` в `.build-config.json` (см. `build_release_rules.md` §5, `templates/.build-config.example.json`). Краткая выжимка правил — там же, полный гайд — здесь.
 
 ## 1. Почему это работает
 

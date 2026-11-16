@@ -11,7 +11,7 @@ const { readVersion } = require('./version.cjs');
 function run(cfg) {
     const version = cfg.configRaw && cfg.configRaw._version ? cfg.configRaw._version : null;
 
-    console.log('=== tauri-build-toolkit doctor ===');
+    console.log('=== rust-build-toolkit doctor ===');
     console.log('node            :', process.version, `(${process.platform} ${process.arch})`);
     console.log('toolkit root    :', path.resolve(__dirname, '..'));
     console.log('projectRoot     :', cfg.projectRoot);

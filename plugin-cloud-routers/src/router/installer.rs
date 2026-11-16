@@ -77,7 +77,7 @@ pub fn install_guard(router_id: RouterId) -> MutexGuard<'static, ()> {
 // (esbuild.exe: `remove ...\esbuild-<hash>: Access is denied`), и такой отказ
 // выглядел бы как «непонятная ошибка npm», хотя причина — в чужой папке.
 //
-// Инвариант тот же, что в сборке (tauri-build-toolkit/lib/scratch.cjs): своя
+// Инвариант тот же, что в сборке (rust-build-toolkit/lib/scratch.cjs): своя
 // папка, которую мы создаём и ПРОВЕРЯЕМ. Молчаливый откат на %TEMP% запрещён —
 // вместо него падение с точным сообщением на старте установки.
 //

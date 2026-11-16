@@ -14,18 +14,19 @@ if not exist "%PROJ%\src-tauri\tauri.conf.json" (
   )
 )
 
-set "TOOLKIT=%TAURI_BUILD_TOOLKIT%"
-if "%TOOLKIT%"=="" set "TOOLKIT=%~dp0..\cross-app-plugins\tauri-build-toolkit\cli.cjs"
+set "TOOLKIT=%BUILD_TOOLKIT%"
+if "%TOOLKIT%"=="" set "TOOLKIT=%~dp0..\cross-app-plugins\rust-build-toolkit\cli.cjs"
 REM Fallback #2: the project itself lives INSIDE cross-app-plugins (plugin-*, updater-core, ...).
-if not exist "%TOOLKIT%" set "TOOLKIT=%~dp0..\tauri-build-toolkit\cli.cjs"
+if not exist "%TOOLKIT%" set "TOOLKIT=%~dp0..\rust-build-toolkit\cli.cjs"
 if not exist "%TOOLKIT%" (
   echo [ERROR] Tauri build toolkit not found: "%TOOLKIT%"
-  echo Set env TAURI_BUILD_TOOLKIT to the toolkit cli.cjs, or place the
-  echo toolkit folder at: cross-app-plugins\tauri-build-toolkit
+  echo Set env BUILD_TOOLKIT to the toolkit cli.cjs, or place the
+  echo toolkit folder at: cross-app-plugins\rust-build-toolkit
   pause
   exit /b 1
 )
 
+REM --- Find VS and init MSVC environment ---
 set "VS_INIT_OK="
 for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath 2^>nul`) do (
     if exist "%%i\VC\Auxiliary\Build\vcvarsall.bat" (
@@ -39,6 +40,7 @@ if not defined VS_INIT_OK (
   exit /b 1
 )
 
+REM --- Reset sccache wrappers so they do not leak into cargo ---
 set "CC="
 set "CXX="
 set "CMAKE_C_COMPILER_LAUNCHER="
@@ -46,16 +48,17 @@ set "CMAKE_CXX_COMPILER_LAUNCHER="
 set "RUSTC_WRAPPER="
 set "CARGO_BUILD_RUSTC_WRAPPER="
 
+REM --- Unset profile env overrides; profile lives only in Cargo.toml ---
 set "CARGO_PROFILE_RELEASE_LTO="
 set "CARGO_PROFILE_RELEASE_CODEGEN_UNITS="
 set "CARGO_PROFILE_RELEASE_STRIP="
 
-node "%TOOLKIT%" test --project "%PROJ%" %*
+node "%TOOLKIT%" build --project "%PROJ%"
 if errorlevel 1 (
-  echo [ERROR] Tests failed.
+  echo [ERROR] Build failed.
   pause
   exit /b 1
 )
 
-echo [+DONE] test.bat finished.
+echo [+DONE] build.bat finished.
 endlocal
