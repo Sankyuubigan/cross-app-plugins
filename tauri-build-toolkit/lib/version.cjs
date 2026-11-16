@@ -157,6 +157,24 @@ function writeVersionToCargo(cfg, version) {
     fs.writeFileSync(cargoPath, head + tail, 'utf8');
 }
 
+// Путь Cargo.toml, ХРАНЯЩЕГО версию (SSOT для release-коммита, github.cjs):
+// [package] крейта; при наследовании version.workspace — корневой
+// [workspace.package] (резолв зеркален readVersion/writeVersionToCargo).
+function cargoVersionFilePath(cfg) {
+    const cargoPath = path.join(crateDirOf(cfg), 'Cargo.toml');
+    const text = fs.readFileSync(cargoPath, 'utf8');
+    const pkgIdx = text.indexOf('[package]');
+    const scope = pkgIdx === -1 ? text : text.slice(pkgIdx);
+    if (CARGO_WORKSPACE_VERSION_RE.test(scope)) {
+        const wsDir = workspaceRootOf(crateDirOf(cfg));
+        if (!wsDir) {
+            throw new Error(`version.workspace = true, но Cargo.toml с [workspace.package] не найден вверх от ${crateDirOf(cfg)}`);
+        }
+        return path.join(wsDir, 'Cargo.toml');
+    }
+    return cargoPath;
+}
+
 // Инкремент патча по YY.M.P. При guardAgainstLatest (дефолт) берём строго
 // бОльшую версию, чем в latest.json — защита от отката ниже уже выпущенного
 // релиза (инцидент 26.8.173 < 26.8.174).
@@ -210,4 +228,4 @@ function bumpVersion(cfg, opts = {}) {
     return version;
 }
 
-module.exports = { readVersion, bumpVersion, writeVersionToConf, writeVersionToCargo };
+module.exports = { readVersion, bumpVersion, writeVersionToConf, writeVersionToCargo, cargoVersionFilePath };

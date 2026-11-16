@@ -6,7 +6,8 @@ const fs = require('fs');
 const path = require('path');
 
 const { run: sh, killApp } = require('./run.cjs');
-const { prep, ensureBundleActive, BUNDLE_DIR } = require('./build.cjs');
+const { prep, ensureBundleActive, checkExeFresh, BUNDLE_DIR } = require('./build.cjs');
+const { buildCargoInstaller } = require('./nsis.cjs');
 const { resolveTargetDir } = require('./config.cjs');
 const { findInstallerBundle } = require('./selector.cjs');
 const { setupSigningEnv, signInstaller } = require('./signing.cjs');
@@ -56,12 +57,21 @@ async function run(cfg) {
     killApp(cfg); // РѕСЃРІРѕР±РѕРґРёС‚СЊ file lock exe РґРѕ РїРµСЂРµСЃР±РѕСЂРєРё
 
     setupSigningEnv(cfg, { strict: true });
-    ensureBundleActive(cfg);
+    // cargo (без Tauri): tauri.conf.json нет — ensureBundleActive не применим.
+    if (cfg.kind !== 'cargo') ensureBundleActive(cfg);
 
     // VC++ runtime DLL РєРѕРїРёСЂСѓСЋС‚СЃСЏ Р”Рћ СЃР±РѕСЂРєРё, С‡С‚РѕР±С‹ РїРѕРїР°СЃС‚СЊ РІ NSIS-Р±Р°РЅРґР».
     copyVcRedistTo(cfg, path.join(resolveTargetDir(cfg), 'release'));
 
-    sh(cfg, 'npx', ['tauri', 'build', '--bundles', 'nsis'], { echo: true });
+    if (cfg.kind === 'cargo') {
+        // cargo-ветка: cargo build --release + makensis (lib/nsis.cjs) вместо Tauri CLI.
+        const buildStart = Date.now();
+        sh(cfg, 'cargo', ['build', '--release'], { echo: true, cwd: cfg.crateDir });
+        const exe = checkExeFresh(cfg, buildStart);
+        buildCargoInstaller(cfg, exe);
+    } else {
+        sh(cfg, 'npx', ['tauri', 'build', '--bundles', 'nsis'], { echo: true });
+    }
 
     const version = readVersion(cfg);
     let installer = findInstallerBundle(BUNDLE_DIR(cfg), version);

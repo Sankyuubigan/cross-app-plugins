@@ -82,11 +82,19 @@
   `syncDirs` (sync-resources предупреждает и пропускает). `npm install` пропускается
   при отсутствии `package.json` (штатно для cargo).
 - **Статус поддержки**: `test`/`version`/`build`/`installer` — работают (верифицировано
-  16.11.2026 на toy-проекте и toy-воркспейсе; installer — NSIS setup + minisign .sig).
-  `version` понимает воркспейсы (`version.workspace = true` в `[package]` → литерал
-  читается/пишется в `[workspace.package]` корня; для нестандартной раскладки задайте
-  `"crateDir"` в конфиге). `release`/`latest.json`/updater для cargo — этап 4
-  плана универсализации (16.11.26), ещё НЕ реализован.
+  16.11.2026 на toy-проекте, toy-воркспейсе и VibeBridge; installer — NSIS setup + minisign .sig,
+  тот же контракт артефакта `bundle/nsis/<product>_<version>_x64-setup.exe`, что у tauri).
+  `release` для cargo — код готов (cargo-ветка `buildCargoInstaller` + общий gh/latest.json
+  конвейер), полный релиз-прогон на cargo-проекте пока не выполнялся. `version` понимает
+  воркспейсы (`version.workspace = true` в `[package]` → литерал читается/пишется в
+  `[workspace.package]` корня; для нестандартной раскладки задайте `"crateDir"` в конфиге).
+- **Updater (клиентская часть)** — СУЩЕСТВУЮЩИЙ крейт `cross-app-plugins/plugin-about-updates/core`
+  (about-updates-core, без Tauri: version compare, minisign verify + tauri base64-обёртка,
+  latest.json→GitHub API fallback, NSIS-установка `["/P","/UPDATE","/R"]`, install report/
+  rollback; для Tauri-хостов — фасад plugin-about-updates с web-компонентами UI).
+  Серверная часть — тулкит (`release`/`latest.json`), формат манифеста и подписей без
+  изменений. Отдельный updater-крейт НЕ создаётся (инцидент 16.11.26: дубль
+  about-updates-core был создан и в тот же день удалён по указанию владельца).
 
 ## Правила, которые встроены (не нарушать)
 

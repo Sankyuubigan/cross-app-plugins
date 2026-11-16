@@ -10,7 +10,7 @@ const path = require('path');
 const { spawnSync } = require('child_process');
 const { run, tryRun } = require('./run.cjs');
 const { normalizeRepo } = require('./config.cjs');
-const { readVersion } = require('./version.cjs');
+const { readVersion, cargoVersionFilePath } = require('./version.cjs');
 
 function getRemoteOrigin(cfg) {
     return tryRun(cfg, 'git', ['-C', cfg.projectRoot, 'remote', 'get-url', 'origin']);
@@ -59,12 +59,17 @@ function gitAdd(cfg, paths) {
 
 // Файлы, которые release обязан закоммитить: latest.json — манифест апдейтера
 // (его читает клиент по raw.githubusercontent), версии — источник правды сборки.
+// kind=cargo: tauri.conf.json не существует; SSOT версии — Cargo.toml, хранящий
+// версию ([package] крейта, а при version.workspace — корень воркспейса).
 function releaseCommittedFiles(cfg) {
-    return [
-        cfg.latestJsonPath,
-        path.join(cfg.projectRoot, 'src-tauri', 'tauri.conf.json'),
-        path.join(cfg.projectRoot, 'src-tauri', 'Cargo.toml'),
-    ];
+    const files = [cfg.latestJsonPath];
+    if (cfg.kind === 'cargo') {
+        files.push(cargoVersionFilePath(cfg));
+    } else {
+        files.push(path.join(cfg.projectRoot, 'src-tauri', 'tauri.conf.json'));
+        files.push(path.join(cfg.projectRoot, 'src-tauri', 'Cargo.toml'));
+    }
+    return files;
 }
 
 // `git check-ignore` сам возвращает признак через код выхода (0 = игнорируется),

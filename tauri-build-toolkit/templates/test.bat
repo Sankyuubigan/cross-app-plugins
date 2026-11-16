@@ -5,14 +5,19 @@ REM %~dp0 ends with a backslash. Passing it as --project "%PROJ%" makes
 REM the C runtime swallow the NEXT argument (and leaves a stray quote
 REM inside the path). %%~fI normalizes it without a trailing slash.
 for %%I in ("%~dp0.") do set "PROJ=%%~fI"
+REM Project = tauri (src-tauri\tauri.conf.json) OR cargo (Cargo.toml, kind=cargo).
 if not exist "%PROJ%\src-tauri\tauri.conf.json" (
-  echo [ERROR] This script must live in the project root, next to src-tauri\tauri.conf.json
-  pause
-  exit /b 1
+  if not exist "%PROJ%\Cargo.toml" (
+    echo [ERROR] Project root must contain src-tauri\tauri.conf.json or Cargo.toml
+    pause
+    exit /b 1
+  )
 )
 
 set "TOOLKIT=%TAURI_BUILD_TOOLKIT%"
 if "%TOOLKIT%"=="" set "TOOLKIT=%~dp0..\cross-app-plugins\tauri-build-toolkit\cli.cjs"
+REM Fallback #2: the project itself lives INSIDE cross-app-plugins (plugin-*, updater-core, ...).
+if not exist "%TOOLKIT%" set "TOOLKIT=%~dp0..\tauri-build-toolkit\cli.cjs"
 if not exist "%TOOLKIT%" (
   echo [ERROR] Tauri build toolkit not found: "%TOOLKIT%"
   echo Set env TAURI_BUILD_TOOLKIT to the toolkit cli.cjs, or place the
