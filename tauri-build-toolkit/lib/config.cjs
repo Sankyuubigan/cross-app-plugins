@@ -148,7 +148,66 @@ function loadProjectConfig(projectArg, cwd) {
     };
 }
 
+// ── Резолв папки cargo-артефактов (target dir) ──
+//
+// Единственный источник правды — сам cargo (`cargo metadata`): он учитывает
+// и ~/.cargo/config.toml ([build] target-dir), и env CARGO_TARGET_DIR.
+// Хардкод <projectRoot>/src-tauri/target ломает проекты с общим target-dir:
+// после успешной сборки тулкит не находил exe ("Built exe not found").
+// TAURI_CARGO_TARGET_DIR — отладочный override с наивысшим приоритетом.
+// Fallback — старый путь + WARN: конфигурации без общего target-dir работают
+// как раньше, ничего не падает.
+
+const targetDirCache = new Map(); // projectRoot -> dir
+
+function cargoTargetDirFromMetadata(root) {
+    // Cargo.toml может быть в корне (workspace) или в src-tauri — пробуем оба.
+    for (const cwd of [root, path.join(root, 'src-tauri')]) {
+        try {
+            const out = execSync('cargo metadata --no-deps --format-version 1', {
+                cwd,
+                encoding: 'utf8',
+                maxBuffer: 64 * 1024 * 1024,
+                stdio: ['ignore', 'pipe', 'ignore'],
+            });
+            const meta = JSON.parse(out);
+            if (meta && meta.target_directory) return meta.target_directory;
+        } catch (e) {
+            // нет Cargo.toml в этом каталоге или cargo недоступен — пробуем следующий.
+        }
+    }
+    return null;
+}
+
+function resolveTargetDir(cfg) {
+    const root = cfg.projectRoot;
+    if (targetDirCache.has(root)) return targetDirCache.get(root);
+
+    let dir = null;
+    let source = null;
+
+    const envDir = process.env.TAURI_CARGO_TARGET_DIR;
+    if (envDir && envDir.trim()) {
+        dir = path.resolve(envDir.trim());
+        source = 'env TAURI_CARGO_TARGET_DIR';
+    } else {
+        dir = cargoTargetDirFromMetadata(root);
+        if (dir) source = 'cargo metadata';
+    }
+
+    if (!dir) {
+        dir = path.join(root, 'src-tauri', 'target');
+        source = 'fallback (src-tauri/target)';
+        console.warn(`[target-dir] WARN: cargo metadata недоступен, использую ${dir}`);
+    }
+
+    targetDirCache.set(root, dir);
+    console.log(`[target-dir] ${dir} (источник: ${source})`);
+    return dir;
+}
+
 module.exports = {
+    resolveTargetDir,
     loadProjectConfig,
     resolveProjectRoot,
     readJson,

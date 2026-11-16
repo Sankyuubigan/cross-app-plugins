@@ -9,6 +9,7 @@
 const fs = require('fs');
 const path = require('path');
 const { readVersion } = require('./version.cjs');
+const { resolveTargetDir } = require('./config.cjs');
 
 // Жёсткие проверки §3.3:
 //   - имя установщика ОБЯЗАНО содержать версию;
@@ -36,7 +37,7 @@ function generateLatestJson(cfg, opts = {}) {
     }
 
     // Содержимое сигнатуры берём из локального установщика в bundle/nsis.
-    const localDir = path.join(cfg.projectRoot, 'src-tauri', 'target', 'release', 'bundle', 'nsis');
+    const localDir = path.join(resolveTargetDir(cfg), 'release', 'bundle', 'nsis');
     const localSig = path.join(localDir, sigFile);
     if (!fs.existsSync(localSig)) {
         throw new Error(`Signature "${sigFile}" is missing next to the installer (${localSig}). Unsigned release is forbidden.`);

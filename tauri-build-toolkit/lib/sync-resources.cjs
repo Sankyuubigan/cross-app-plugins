@@ -11,6 +11,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { resolveTargetDir } = require('./config.cjs');
 
 function syncDir(src, dest) {
     if (!fs.existsSync(dest)) fs.mkdirSync(dest, { recursive: true });
@@ -35,7 +36,7 @@ function syncConfiguredResources(cfg) {
         console.log('syncDirs: not configured, skip resource sync.');
         return;
     }
-    const targetDir = path.join(cfg.projectRoot, 'src-tauri', 'target');
+    const targetDir = resolveTargetDir(cfg);
     for (const rel of entries) {
         const src = path.join(cfg.projectRoot, rel);
         if (!fs.existsSync(src)) {
@@ -45,7 +46,11 @@ function syncConfiguredResources(cfg) {
         const relName = path.basename(rel);
         for (const profile of ['debug', 'release']) {
             const dest = path.join(targetDir, profile, relName);
-            if (!fs.existsSync(path.dirname(dest))) continue;
+            // Каталог назначения создаём: в свежем общем target-dir папки
+            // release/debug до первой сборки нет, но ресурсы обязаны попасть
+            // в бинарь (раньше был тихий skip — в общем target-dir это
+            // безвозвратно теряло ресурсы первой сборки).
+            fs.mkdirSync(path.dirname(dest), { recursive: true });
             syncDir(src, dest);
             console.log(`[sync-resources] ${relName}/ -> ${dest}`);
         }

@@ -5,6 +5,7 @@
 const { execSync, spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const { resolveTargetDir } = require('./config.cjs');
 
 function quoteArg(a) {
     const s = String(a);
@@ -63,7 +64,7 @@ function launchApp(cfg, exePath, opts = {}) {
     // 2. WEBVIEW2_USER_DATA_FOLDER — отдельный профиль для dev-инстанса.
     //    Иначе dev и установленная релизная копия делят один каталог
     //    %LOCALAPPDATA%\<имя exe>\EBWebView → конфликт при параллельной работе.
-    env.WEBVIEW2_USER_DATA_FOLDER = path.join(cfg.projectRoot, 'src-tauri', 'target', 'webview2-dev');
+    env.WEBVIEW2_USER_DATA_FOLDER = path.join(resolveTargetDir(cfg), 'webview2-dev');
 
     // 3. APPDATA НЕ подменяем: app_data_dir() хоста резолвится через WinAPI
     //    (SHGetKnownFolderPath) и игнорирует env APPDATA, а плагины читают
@@ -137,7 +138,7 @@ function findAppPidsInDir(cfg, nameFilter, dir) {
 function killApp(cfg, opts = {}) {
     if (!cfg.appExe) return;
     const exeName = `${cfg.appExe}.exe`;
-    const targetDir = path.join(cfg.projectRoot, 'src-tauri', 'target');
+    const targetDir = resolveTargetDir(cfg);
     const profiles = opts.profiles || ['release', 'debug'];
 
     for (const profile of profiles) {

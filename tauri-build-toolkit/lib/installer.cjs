@@ -6,6 +6,7 @@ const path = require('path');
 
 const { run: sh, killApp } = require('./run.cjs');
 const { prep, ensureBundleActive, BUNDLE_DIR } = require('./build.cjs');
+const { resolveTargetDir } = require('./config.cjs');
 const { findInstallerBundle } = require('./selector.cjs');
 const { setupSigningEnv, signInstaller } = require('./signing.cjs');
 const { copyVcRedistTo } = require('./copy-vc-redist.cjs');
@@ -33,7 +34,7 @@ async function run(cfg) {
     ensureBundleActive(cfg);
 
     // VC++ runtime DLL РєРѕРїРёСЂСѓСЋС‚СЃСЏ Р”Рћ СЃР±РѕСЂРєРё, С‡С‚РѕР±С‹ РїРѕРїР°СЃС‚СЊ РІ NSIS-Р±Р°РЅРґР».
-    copyVcRedistTo(cfg, path.join(cfg.projectRoot, 'src-tauri', 'target', 'release'));
+    copyVcRedistTo(cfg, path.join(resolveTargetDir(cfg), 'release'));
 
     sh(cfg, 'npx', ['tauri', 'build', '--bundles', 'nsis'], { echo: true });
 

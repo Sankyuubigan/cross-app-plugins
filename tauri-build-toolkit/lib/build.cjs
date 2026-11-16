@@ -5,6 +5,7 @@
 const fs = require('fs');
 const path = require('path');
 
+const { resolveTargetDir } = require('./config.cjs');
 const { run: sh, launchApp, killApp } = require('./run.cjs');
 const { bumpVersion, readVersion } = require('./version.cjs');
 const { ensureIcons } = require('./icons.cjs');
@@ -12,9 +13,9 @@ const { syncConfiguredResources } = require('./sync-resources.cjs');
 const { copyVcRedistIfConfigured } = require('./copy-vc-redist.cjs');
 const { checkProjectEncodings } = require('./encoding-check.cjs');
 
-const BUNDLE_DIR = (cfg) => path.join(cfg.projectRoot, 'src-tauri', 'target', 'release', 'bundle');
+const BUNDLE_DIR = (cfg) => path.join(resolveTargetDir(cfg), 'release', 'bundle');
 const RELEASE_EXE = (cfg) =>
-    cfg.appExe ? path.join(cfg.projectRoot, 'src-tauri', 'target', 'release', `${cfg.appExe}.exe`) : null;
+    cfg.appExe ? path.join(resolveTargetDir(cfg), 'release', `${cfg.appExe}.exe`) : null;
 
 function readTauriJson(cfg) {
     const p = path.join(cfg.projectRoot, 'src-tauri', 'tauri.conf.json');
