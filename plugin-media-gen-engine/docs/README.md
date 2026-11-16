@@ -82,6 +82,10 @@ API (все IN-PLACE, правка голоса не создаёт v2-дубл�
 в `ref_audios` движка: `generate_video_simple(.., ref_audio_paths, ..)`, гейт
 `ref_audios_supported(caps)` (`features_by_mode.vid_gen.ref_audios === true`).
 
+Историческое ТЗ движка и справочник RefMod (формат `*_refmod.safetensors`,
+возможности официального бинаря sd.cpp, решение «без лор, всё в Rust») —
+[refmods-info.md](refmods-info.md).
+
 ## LoRA-стек (PRP 29.10.26; F3 29.10.26 — папки по базам)
 
 
