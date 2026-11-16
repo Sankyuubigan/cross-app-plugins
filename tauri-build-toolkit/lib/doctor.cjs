@@ -6,6 +6,7 @@ const path = require('path');
 const { getRemoteOrigin, checkRepoMatches, checkCommittedFilesNotIgnored } = require('./github.cjs');
 const { resolveKeyPath } = require('./signing.cjs');
 const { checkProjectEncodings } = require('./encoding-check.cjs');
+const { readVersion } = require('./version.cjs');
 
 function run(cfg) {
     const version = cfg.configRaw && cfg.configRaw._version ? cfg.configRaw._version : null;
@@ -17,6 +18,9 @@ function run(cfg) {
     console.log('config file     :', cfg.configPath, fs.existsSync(cfg.configPath) ? '' : '(not found)');
     console.log('appExe          :', cfg.appExe);
     console.log('productName     :', cfg.productName);
+    console.log('kind            :', cfg.kind);
+    console.log('crateDir        :', cfg.crateDir);
+    console.log('version         :', readVersion(cfg));
     console.log('repo (config)   :', cfg.repo);
     console.log('branch          :', cfg.branch);
     console.log('git origin      :', getRemoteOrigin(cfg) || '(none)');
@@ -25,6 +29,17 @@ function run(cfg) {
     console.log('vcRedist        :', cfg.vcRedist);
     console.log('npmInstallArgs  :', cfg.npmInstallArgs.join(' '));
     console.log('syncPkgVersion  :', cfg.syncPackageJsonVersion);
+
+    // Проверка по kind: манифест, на который опирается сборка этого проекта.
+    console.log('\n--- kind check ---');
+    if (cfg.kind === 'tauri') {
+        const conf = path.join(cfg.projectRoot, 'src-tauri', 'tauri.conf.json');
+        console.log('tauri.conf.json :', fs.existsSync(conf) ? 'OK' : 'MISSING');
+    } else {
+        const cargoToml = path.join(cfg.crateDir, 'Cargo.toml');
+        console.log('Cargo.toml      :', fs.existsSync(cargoToml) ? 'OK' : 'MISSING');
+        console.log('nsisPath        :', cfg.nsisPath || '(autodetect: tauri-NSIS / Program Files)');
+    }
 
     const keyPath = resolveKeyPath(cfg);
     console.log('signing key     :', keyPath, fs.existsSync(keyPath) ? '(present)' : '(MISSING)');

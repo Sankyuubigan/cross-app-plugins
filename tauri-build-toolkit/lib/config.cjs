@@ -145,7 +145,15 @@ function loadProjectConfig(projectArg, cwd) {
     }
 
     const kind = detectProjectKind(projectRoot, cfgRaw);
-    const crateDir = resolveCrateDir(projectRoot, kind);
+    // Явный crateDir из конфига перекрывает автодетект — обязателен для
+    // воркспейсов, где корневой Cargo.toml — [workspace] без [package]
+    // (версии/имя лежат в member-крейте).
+    const crateDir = cfgRaw.crateDir
+        ? path.resolve(projectRoot, cfgRaw.crateDir)
+        : resolveCrateDir(projectRoot, kind);
+    if (!fs.existsSync(path.join(crateDir, 'Cargo.toml'))) {
+        throw new Error(`crateDir="${cfgRaw.crateDir}" не содержит Cargo.toml (${crateDir})`);
+    }
     // tauri.conf.json есть только у tauri-проекта; cargo-конфигурации читают
     // имя/продукт из Cargo.toml.
     const tauriConf = kind === 'tauri' ? readTauriConf(projectRoot) : null;
@@ -189,6 +197,12 @@ function loadProjectConfig(projectArg, cwd) {
         vcRedistDlls: Array.isArray(cfgRaw.vcRedistDlls) && cfgRaw.vcRedistDlls.length
             ? cfgRaw.vcRedistDlls
             : ['vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll', 'msvcp140_1.dll', 'concrt140.dll'],
+
+        // kind=cargo: NSIS-упаковка. nsisPath — путь к makensis.exe ИЛИ папке
+        // NSIS (Bin/makensis.exe резолвится); null → автодетект (tauri-NSIS,
+        // Program Files). publisher — метаданные установщика (дефолт productName).
+        nsisPath: cfgRaw.nsisPath || null,
+        publisher: cfgRaw.publisher || null,
 
         signing: {
             keyPath: signing.keyPath || null,

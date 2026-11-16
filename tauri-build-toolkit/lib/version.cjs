@@ -13,6 +13,10 @@ const path = require('path');
 
 const TAURI_VERSION_RE = /"version"\s*:\s*"(\d+)\.(\d+)\.(\d+)"/;
 const CARGO_VERSION_RE = /^version\s*=\s*"(\d+)\.(\d+)\.(\d+)"/m;
+// Наследование версии из воркспейса: [package] пишет `version.workspace = true`
+// (dot-синтаксис cargo 1.64+), литерал лежит в [workspace.package] корневого
+// Cargo.toml (VibeBridge и др.).
+const CARGO_WORKSPACE_VERSION_RE = /^version\s*\.\s*workspace\s*=\s*true/m;
 
 // Папка крейта: cfg.crateDir (ставит loadProjectConfig) либо скан
 // (корень → src-tauri → src). Локальная копия скана нужна, чтобы version.cjs
@@ -27,6 +31,24 @@ function crateDirOf(cfg) {
     throw new Error(`Cargo.toml не найден (${cfg.projectRoot}, src-tauri, src)`);
 }
 
+// Корень воркспейса для крейта: ближайший ПРЕДОК с Cargo.toml, содержащим
+// [workspace.package]. Сам крейт не проверяется: комбинация «я и пакет, и
+// воркспейс с само-наследованием» запрещена cargo, а package-часть и так
+// несёт версию.
+function workspaceRootOf(crateDir) {
+    let dir = path.dirname(crateDir);
+    for (;;) {
+        const p = path.join(dir, 'Cargo.toml');
+        if (fs.existsSync(p)) {
+            const text = fs.readFileSync(p, 'utf8');
+            if (text.indexOf('[workspace.package]') !== -1) return dir;
+        }
+        const parent = path.dirname(dir);
+        if (parent === dir) return null;
+        dir = parent;
+    }
+}
+
 // --- чтение ---
 function readVersion(cfg) {
     if (cfg.kind === 'cargo') {
@@ -35,6 +57,18 @@ function readVersion(cfg) {
         const pkgIdx = text.indexOf('[package]');
         // Только [package]: в воркспейсе `version = "..."` встречается и у зависимостей.
         const scope = pkgIdx === -1 ? text : text.slice(pkgIdx);
+        if (CARGO_WORKSPACE_VERSION_RE.test(scope)) {
+            const crateDir = crateDirOf(cfg);
+            const wsDir = workspaceRootOf(crateDir);
+            if (!wsDir) {
+                throw new Error(`version.workspace = true, но Cargo.toml с [workspace.package] не найден вверх от ${crateDir}`);
+            }
+            const wsText = fs.readFileSync(path.join(wsDir, 'Cargo.toml'), 'utf8');
+            const wsIdx = wsText.indexOf('[workspace.package]');
+            const m = wsText.slice(wsIdx).match(CARGO_VERSION_RE);
+            if (!m) throw new Error(`Версия не найдена в [workspace.package] (${path.join(wsDir, 'Cargo.toml')})`);
+            return `${m[1]}.${m[2]}.${m[3]}`;
+        }
         const m = scope.match(CARGO_VERSION_RE);
         if (!m) throw new Error(`Версия не найдена в [package] (${cargoPath})`);
         return `${m[1]}.${m[2]}.${m[3]}`;
@@ -87,11 +121,33 @@ function writeVersionToConf(cfg, version, syncPackageJson) {
 
 // В воркспейсе `version = "..."` встречается и у зависимостей — меняем только
 // первый match ПОСЛЕ заголовка [package] (это и есть версия самого пакета).
+// Если [package] наследует (`version.workspace = true`) — пишем литерал в
+// [workspace.package] корня воркспейса (первый match после заголовка).
 function writeVersionToCargo(cfg, version) {
     const cargoPath = path.join(crateDirOf(cfg), 'Cargo.toml');
     const text = fs.readFileSync(cargoPath, 'utf8');
     const pkgIdx = text.indexOf('[package]');
     if (pkgIdx === -1) throw new Error(`Секция [package] не найдена в ${cargoPath}`);
+    const scope = text.slice(pkgIdx);
+    if (CARGO_WORKSPACE_VERSION_RE.test(scope)) {
+        const crateDir = crateDirOf(cfg);
+        const wsDir = workspaceRootOf(crateDir);
+        if (!wsDir) {
+            throw new Error(`version.workspace = true, но Cargo.toml с [workspace.package] не найден вверх от ${crateDir}`);
+        }
+        const wsPath = path.join(wsDir, 'Cargo.toml');
+        const wsText = fs.readFileSync(wsPath, 'utf8');
+        const wsIdx = wsText.indexOf('[workspace.package]');
+        const head = wsText.slice(0, wsIdx);
+        let tail = wsText.slice(wsIdx);
+        if (!CARGO_VERSION_RE.test(tail)) {
+            throw new Error(`version не найден в [workspace.package] (${wsPath})`);
+        }
+        tail = tail.replace(CARGO_VERSION_RE, `version = "${version}"`);
+        fs.writeFileSync(wsPath, head + tail, 'utf8');
+        console.log(`  [workspace.package]: ${version} (${wsPath})`);
+        return;
+    }
     const head = text.slice(0, pkgIdx);
     let tail = text.slice(pkgIdx);
     if (!CARGO_VERSION_RE.test(tail)) {

@@ -23,7 +23,9 @@
 | `init --with-logs` | то же + вкладывает `LOGS_SETUP.md` — пошаговый гайд подключения `plugin-log-collector` (вкладка «Логи», `log::Log`, файл лога рядом с exe)      |
 
 > Для `kind: "cargo"` (без Tauri): `build` = `cargo build --release` (без npm/иконок/tauri-CLI),
-> `test` = `cargo test` в `crateDir`; `installer`/`release` пока не поддерживаются (раздел ниже).
+> `test` = `cargo test` в `crateDir`, `installer` = прямой makensis (шаблон `templates/app.nsi`,
+> per-user, uninstaller, ярлыки; без NSIS → portable-zip) или через `"nsisPath"` в конфиге;
+> артефакт `<product>_<version>_x64-setup.exe` + `.sig` — тот же контракт, что у tauri.
 
 ## Подключение к проекту (механизм интеграции)
 
@@ -79,10 +81,12 @@
   иконки (`ensureIcons` — обязанность проекта: winres/embed-resource в `build.rs`), и
   `syncDirs` (sync-resources предупреждает и пропускает). `npm install` пропускается
   при отсутствии `package.json` (штатно для cargo).
-- **Статус поддержки**: `test`/`version`/`build` — работают (верифицировано 16.11.2026
-  на toy-проекте). `installer`/`release`/`latest.json`/updater для cargo — этапы 3-5
-  плана универсализации (16.11.26), ещё НЕ реализованы — команда вернёт ошибку, а не
-  тихо соберёт не то.
+- **Статус поддержки**: `test`/`version`/`build`/`installer` — работают (верифицировано
+  16.11.2026 на toy-проекте и toy-воркспейсе; installer — NSIS setup + minisign .sig).
+  `version` понимает воркспейсы (`version.workspace = true` в `[package]` → литерал
+  читается/пишется в `[workspace.package]` корня; для нестандартной раскладки задайте
+  `"crateDir"` в конфиге). `release`/`latest.json`/updater для cargo — этап 4
+  плана универсализации (16.11.26), ещё НЕ реализован.
 
 ## Правила, которые встроены (не нарушать)
 
