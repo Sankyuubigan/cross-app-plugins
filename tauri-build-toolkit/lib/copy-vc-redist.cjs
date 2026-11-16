@@ -72,17 +72,42 @@ function copyVcRedistTo(cfg, destDir) {
 
     for (const d of dests) fs.mkdirSync(d, { recursive: true });
 
+    // Копия рядом с exe может быть залочена живым процессом (exe берёт DLL сначала
+    // из своей папки). С общим target-dir (cargo target-dir на все проекты) в одной
+    // папке живут exe разных проектов — перезапись идентичной DLL падала EBUSY и
+    // валила сборку ПОСЛЕ успешного линка (инцидент 16.11.2026, king_orch).
+    // Решение: идентичную копию не трогаем вовсе; залоченную отличающуюся — честный
+    // warn вместо падения сборки (старая копия продолжает работать).
     let copied = 0;
+    let identical = 0;
+    let locked = 0;
     for (const dll of cfg.vcRedistDlls) {
         const src = sourceDirs.map((s) => path.join(s, dll)).find((p) => fs.existsSync(p));
         if (!src) {
             console.warn(`vcRedist: DLL not found: ${dll}`);
             continue;
         }
-        for (const d of dests) fs.copyFileSync(src, path.join(d, dll));
-        copied++;
+        const srcBuf = fs.readFileSync(src);
+        for (const d of dests) {
+            const dstPath = path.join(d, dll);
+            try {
+                if (fs.existsSync(dstPath) && fs.readFileSync(dstPath).equals(srcBuf)) {
+                    identical++;
+                    continue;
+                }
+            } catch (e) {
+                // не смогли прочитать текущую копию — пробуем скопировать как раньше
+            }
+            try {
+                fs.copyFileSync(src, dstPath);
+                copied++;
+            } catch (e) {
+                locked++;
+                console.warn(`vcRedist: ${dll} -> ${dstPath} skipped (${e.code || e.message}): файл залочен запущенным процессом, оставлена существующая копия`);
+            }
+        }
     }
-    console.log(`VC redist copied (${copied}/${cfg.vcRedistDlls.length}) to ${dests.join(', ')}`);
+    console.log(`VC redist: copied ${copied}, identical ${identical}, locked-skip ${locked} (${cfg.vcRedistDlls.length} dlls) -> ${dests.join(', ')}`);
 }
 
 // Копирование рядом с собранным exe (для dev-сборки после билда).

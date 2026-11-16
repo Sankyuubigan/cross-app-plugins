@@ -1,6 +1,10 @@
-// test.bat-Р°РЅР°Р»РѕРі: cargo test (СЃ РѕРїС†РёРѕРЅР°Р»СЊРЅС‹Рј С„РёР»СЊС‚СЂРѕРј) РІ src-tauri.
-// РљР°Рє РІ СЌС‚Р°Р»РѕРЅРµ: Сѓ РїР°РєРµС‚Р° РЅРµС‚ lib-С‚Р°СЂРіРµС‚Р°, РїРѕСЌС‚РѕРјСѓ `cargo test` Р±РµР· С„Р»Р°РіР°
-// РїРѕРєСЂС‹РІР°РµС‚ РІСЃРµ С‚Р°СЂРіРµС‚С‹ (bin unit-С‚РµСЃС‚С‹). MSVC-РѕРєСЂСѓР¶РµРЅРёРµ РёРЅРёС†РёР°Р»РёР·РёСЂСѓРµС‚ .bat.
+// test.bat-аналог: cargo test в src-tauri.
+// Дефолт профиля — release (решение владельца 16.11.2026):
+// 1) debug-харнесс на части машин не стартует (0xc0000139, desktop §6.2);
+// 2) target/debug раздувается до десятков ГБ на проект (кейс king_orch: 127 ГБ),
+//    build/release от debug-артефактов не зависят.
+// Явный --profile отменяет дефолт (cargo запрещает --release + --profile).
+// Явный --release дубль не создаёт. Вставка --release строго ДО `--`.
 
 const path = require('path');
 const { run: sh } = require('./run.cjs');
@@ -9,8 +13,13 @@ const { checkProjectEncodings } = require('./encoding-check.cjs');
 function run(cfg, extras) {
     checkProjectEncodings(cfg);
     const args = ['test', ...(extras || [])];
-    // РўРµСЃС‚С‹ СЃ СЂРµР°Р»СЊРЅРѕР№ РјРѕРґРµР»СЊСЋ вЂ” РІСЃРµРіРґР° СЃ #[ignore]; РёС… Р·Р°РїСѓСЃРє С‚РѕР»СЊРєРѕ РїРѕ СЏРІРЅРѕР№
-    // РїСЂРѕСЃСЊР±Рµ С‡РµСЂРµР· `cargo test -- --ignored` (РїСЂР°РІРёР»Рѕ РїСЂРѕРµРєС‚Р°).
+    const hasProfile = args.some((a) => a === '--profile' || a.startsWith('--profile='));
+    const hasRelease = args.includes('--release');
+    if (!hasProfile && !hasRelease) {
+        const dd = args.indexOf('--');
+        if (dd === -1) args.push('--release');
+        else args.splice(dd, 0, '--release');
+    }
     sh(cfg, 'cargo', args, { echo: true, cwd: path.join(cfg.projectRoot, 'src-tauri') });
     console.log('\n[test] done.');
 }

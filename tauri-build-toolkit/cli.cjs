@@ -32,10 +32,10 @@ function parseArgs(argv) {
         } else if (t === '--prep-only') {
             args.flags.prepOnly = true;
         } else if (t === '--release' || t === '--workspace') {
-            // Флаги cargo, а не флаги тулкита: `--release` — test_release.bat
-            // (debug-харнесс на некоторых машинах не стартует, 0xc0000139
-            // STATUS_ENTRYPOINT_NOT_FOUND, desktop §6.2); `--workspace` —
-            // cargo-воркспейс, где без флага cargo выбирает только пакет из cwd.
+            // Флаги cargo, а не флаги тулкита. `--release` сейчас дефолт профиля
+            // тестов (lib/test.cjs добавляет его сам) — явный флаг tolerated
+            // (дубль не создаётся); `--workspace` — cargo-воркспейс, где без
+            // флага cargo выбирает только пакет из cwd.
             args.extras.push(t);
         } else if (t.startsWith('--')) {
             args.flags[t.slice(2)] = true;

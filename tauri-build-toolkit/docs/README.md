@@ -37,7 +37,7 @@
    - `branch` — дефолт: `git branch --show-current`.
    - `syncDirs` — каталоги, копируемые в `src-tauri/resources` перед сборкой.
    - `devWindow` — окно dev-сборки (title, размеры, `additionalBrowserArgs` для CDP-порта). Dev-override в `build` отключает бандлинг (`bundle.active=false`).
-   - `vcRedist` — копировать VC++ runtime DLL рядом с exe.
+   - `vcRedist` — копировать VC++ runtime DLL рядом с exe. Идентичная копия на месте — не перезаписывается; DLL залочена запущенным процессом (EBUSY, общий target-dir) — warn, сборка не падает (16.11.2026).
    - `npmInstallArgs` — аргументы `npm install` (дефолт `["--legacy-peer-deps"]`).
    - `signing.*` — переопределение пути ключа/пароля подписи (подробнее → `docs/build_release_rules.md` §3.1).
    - `syncPackageJsonVersion` — синхронизировать версию и в `package.json` (дефолт `false`).
