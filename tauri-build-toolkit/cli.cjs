@@ -89,7 +89,7 @@ async function main() {
             return require('./lib/test.cjs').run(cfg, argv.extras);
         case 'version': {
             const { bumpVersion } = require('./lib/version.cjs');
-            const v = bumpVersion(cfg.projectRoot, { syncPackageJson: cfg.syncPackageJsonVersion });
+            const v = bumpVersion(cfg, { syncPackageJson: cfg.syncPackageJsonVersion });
             console.log(`Version: ${v}`);
             return;
         }

@@ -6,7 +6,6 @@
 // Явный --profile отменяет дефолт (cargo запрещает --release + --profile).
 // Явный --release дубль не создаёт. Вставка --release строго ДО `--`.
 
-const path = require('path');
 const { run: sh } = require('./run.cjs');
 const { checkProjectEncodings } = require('./encoding-check.cjs');
 
@@ -20,7 +19,10 @@ function run(cfg, extras) {
         if (dd === -1) args.push('--release');
         else args.splice(dd, 0, '--release');
     }
-    sh(cfg, 'cargo', args, { echo: true, cwd: path.join(cfg.projectRoot, 'src-tauri') });
+    // Крейт: src-tauri для tauri-проектов; для cargo — cfg.crateDir
+    // (корень / src-tauri / src — резолвит loadProjectConfig).
+    const crateDir = cfg.crateDir || path.join(cfg.projectRoot, 'src-tauri');
+    sh(cfg, 'cargo', args, { echo: true, cwd: crateDir });
     console.log('\n[test] done.');
 }
 

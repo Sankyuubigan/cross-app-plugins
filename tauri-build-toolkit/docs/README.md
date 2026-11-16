@@ -1,8 +1,9 @@
 # tauri-build-toolkit
 
-Общий набор скриптов сборки/релизов Tauri-приложений (Windows), вынесенный из
-эталонного проекта King Orch. Внутри — как собирать, как подключать, какие
-гарантии безопасности git/gh.
+Общий набор скриптов сборки/релизов Windows-приложений (Rust), вынесенный из
+эталонного проекта King Orch. Поддерживает два `kind` проекта: **tauri**
+(Tauri 2.0 + фронтенд) и **cargo** (чистый Rust без Tauri — GPUI/egui/CLI и т.п.).
+Внутри — как собирать, как подключать, какие гарантии безопасности git/gh.
 
 > **Zero-dependency**: чистый Node (CommonJS), без `npm i`. Для САMОГО пакета
 > ставить ничего не нужно. `npx tauri ...` / `gh` / `cargo` вызываются из проекта.
@@ -20,6 +21,9 @@
 | `doctor`    | read-only диагностика: конфиг, git origin, repo-guard, путь ключа подписи                                                                     |
 | `init`      | раскладка `.bat`-шаблонов и `.build-config.json` в корень проекта                                                                            |
 | `init --with-logs` | то же + вкладывает `LOGS_SETUP.md` — пошаговый гайд подключения `plugin-log-collector` (вкладка «Логи», `log::Log`, файл лога рядом с exe)      |
+
+> Для `kind: "cargo"` (без Tauri): `build` = `cargo build --release` (без npm/иконок/tauri-CLI),
+> `test` = `cargo test` в `crateDir`; `installer`/`release` пока не поддерживаются (раздел ниже).
 
 ## Подключение к проекту (механизм интеграции)
 
@@ -39,8 +43,10 @@
    - `devWindow` — окно dev-сборки (title, размеры, `additionalBrowserArgs` для CDP-порта). Dev-override в `build` отключает бандлинг (`bundle.active=false`).
    - `vcRedist` — копировать VC++ runtime DLL рядом с exe. Идентичная копия на месте — не перезаписывается; DLL залочена запущенным процессом (EBUSY, общий target-dir) — warn, сборка не падает (16.11.2026).
    - `npmInstallArgs` — аргументы `npm install` (дефолт `["--legacy-peer-deps"]`).
+   - `kind` — тип проекта: `"tauri"` (дефолт-автодетект по `tauri.conf.json`) или `"cargo"` (без Tauri). Явное значение перекрывает автодетект.
+   - `crateDir` — каталог крейта (где `Cargo.toml` с `[package]`). Дефолт: `src-tauri` для tauri; для cargo — автодетект (корень проекта или `src/`). Задавайте явно для нестандартной раскладки (воркспейс).
    - `signing.*` — переопределение пути ключа/пароля подписи (подробнее → `docs/build_release_rules.md` §3.1).
-   - `syncPackageJsonVersion` — синхронизировать версию и в `package.json` (дефолт `false`).
+   - `syncPackageJsonVersion` — синхронизировать версию и в `package.json` (дефолт `false`; актуально только для tauri).
 4. **Запускай всё через `.bat`** (они инициализируют MSVC: vswhere → vcvarsall x64), либо:
    ```powershell
    node <toolkit>\cli.cjs doctor --project "D:\Projects\<my_app>"
@@ -55,6 +61,28 @@
 
 Это гарантирует, что свежие артефакты `dist-js/` и `api-iife.js` всегда
 попадают в сборку — не нужно вручную пересобирать плагины после правки `guest-js/*`.
+
+## cargo-проекты (без Tauri: GPUI, egui, CLI)
+
+Для проекта без Tauri укажите в `.build-config.json` `"kind": "cargo"` (либо
+положите `Cargo.toml` с `[package]` в корень — автодетект примет его за cargo).
+
+- **SSOT версии** — `[package] version` в `Cargo.toml` крейта (не `tauri.conf.json`).
+  Схема та же `YY.M.P`; `syncPackageJsonVersion` не применяется (нет `package.json`).
+- **`build`** — `cargo build --release` в `crateDir`, далее тот же конвейер:
+  `killApp → checkExeFresh (mtime) → vcRedist → launchApp`. `devWindow` не поддерживается
+  (окно создаёт само приложение); GUI-запуск приложения — обязанность приложения.
+- **`test`** — `cargo test --release` (дефолт) в `crateDir`.
+- **`version`** — бамп `YY.M.P` в `[package]` `Cargo.toml` (только секция `[package]`,
+  версии зависимостей воркспейса не трогаются).
+- **Не поддерживается для cargo** (честный отказ/предупреждение, не тихий пропуск):
+  иконки (`ensureIcons` — обязанность проекта: winres/embed-resource в `build.rs`), и
+  `syncDirs` (sync-resources предупреждает и пропускает). `npm install` пропускается
+  при отсутствии `package.json` (штатно для cargo).
+- **Статус поддержки**: `test`/`version`/`build` — работают (верифицировано 16.11.2026
+  на toy-проекте). `installer`/`release`/`latest.json`/updater для cargo — этапы 3-5
+  плана универсализации (16.11.26), ещё НЕ реализованы — команда вернёт ошибку, а не
+  тихо соберёт не то.
 
 ## Правила, которые встроены (не нарушать)
 

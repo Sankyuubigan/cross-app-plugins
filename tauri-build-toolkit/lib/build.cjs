@@ -106,6 +106,7 @@ function newestInputMtime(cfg) {
         path.join(cfg.projectRoot, 'Cargo.lock'),
         path.join(cfg.projectRoot, '.cargo'),
         path.join(cfg.projectRoot, 'crates'),
+        path.join(cfg.projectRoot, 'src'),
         path.join(cfg.projectRoot, 'src-tauri'),
     ];
     const walk = (p) => {
@@ -158,16 +159,27 @@ function prep(cfg, opts = {}) {
     checkProjectEncodings(cfg);
     const bump = opts.bump !== false;
     if (bump) {
-        const oldVersion = readVersion(cfg.projectRoot);
-        const newVersion = bumpVersion(cfg.projectRoot, { syncPackageJson: cfg.syncPackageJsonVersion });
+        const oldVersion = readVersion(cfg);
+        const newVersion = bumpVersion(cfg, { syncPackageJson: cfg.syncPackageJsonVersion });
         console.log(`Version: ${oldVersion} -> ${newVersion}`);
     } else {
-        console.log(`Version: ${readVersion(cfg.projectRoot)} (kept)`);
+        console.log(`Version: ${readVersion(cfg)} (kept)`);
     }
-    syncConfiguredResources(cfg);
+    if (cfg.kind === 'cargo') {
+        // cargo/GPUI-проекты: tauri-ресурсов нет; syncDirs туда копировать не в
+        // что — честно предупредить, если владелец их задал.
+        if (cfg.syncDirs && cfg.syncDirs.length) {
+            console.warn(`[prep] kind=cargo: sync-resources не поддерживается, syncDirs игнорируются: ${cfg.syncDirs.join(', ')}`);
+        }
+    } else {
+        syncConfiguredResources(cfg);
+    }
     buildLocalPlugins(cfg);
     runNpmInstall(cfg);
-    return ensureIcons(cfg);
+    // Иконки — только Tauri (src-tauri/icons + `npx tauri icon`). Cargo/GPUI-
+    // проекты встраивают .ico сами (winres в build.rs) — тулкит не лезет.
+    if (cfg.kind === 'tauri') return ensureIcons(cfg);
+    return null;
 }
 
 // --- build (dev) ---
@@ -182,15 +194,23 @@ async function run(cfg, opts = {}) {
     }
 
     console.log('\n=== build (dev) ===');
-    const ovrPath = path.join(cfg.projectRoot, 'src-tauri', 'tauri-dev-override.json');
 
     killApp(cfg); // освободить file lock exe до пересборки
-    fs.writeFileSync(ovrPath, JSON.stringify(buildDevOverride(cfg), null, 2) + '\n', 'utf8');
     const buildStart = Date.now();
-    try {
-        sh(cfg, 'npx', ['tauri', 'build', '--config', ovrPath], { echo: true });
-    } finally {
-        fs.rmSync(ovrPath, { force: true });
+
+    if (cfg.kind === 'cargo') {
+        // Универсальная cargo-ветка (GPUI и любые Rust-приложения без Tauri):
+        // прямой `cargo build --release`; exe — <target>/release/<appExe>.exe.
+        // MSVC-окружение инициализирует .bat, sccache подключает ~/.cargo/config.
+        sh(cfg, 'cargo', ['build', '--release'], { echo: true, cwd: cfg.crateDir });
+    } else {
+        const ovrPath = path.join(cfg.projectRoot, 'src-tauri', 'tauri-dev-override.json');
+        fs.writeFileSync(ovrPath, JSON.stringify(buildDevOverride(cfg), null, 2) + '\n', 'utf8');
+        try {
+            sh(cfg, 'npx', ['tauri', 'build', '--config', ovrPath], { echo: true });
+        } finally {
+            fs.rmSync(ovrPath, { force: true });
+        }
     }
 
     const exe = checkExeFresh(cfg, buildStart);

@@ -20,15 +20,59 @@ function hasTauriProject(root) {
     return fs.existsSync(path.join(root, 'src-tauri', 'tauri.conf.json'));
 }
 
+// Cargo-проект (без Tauri): Cargo.toml в корне / src-tauri / src.
+// С 16.11.2026 тулкит универсален: tauri И cargo (GPUI и прочие Rust-приложения).
+function hasCargoProject(root) {
+    for (const d of [root, path.join(root, 'src-tauri'), path.join(root, 'src')]) {
+        if (fs.existsSync(path.join(d, 'Cargo.toml'))) return true;
+    }
+    return false;
+}
+
+// kind проекта: явный cfgRaw.kind ('tauri'|'cargo') сильнее автодетекта.
+// Автодетект: tauri.conf.json → tauri; иначе Cargo.toml → cargo.
+function detectProjectKind(root, cfgRaw) {
+    const explicit = cfgRaw && typeof cfgRaw.kind === 'string' ? cfgRaw.kind.trim().toLowerCase() : null;
+    if (explicit) {
+        if (explicit !== 'tauri' && explicit !== 'cargo') {
+            throw new Error(`kind="${cfgRaw.kind}" не поддерживается (разрешено: "tauri" | "cargo")`);
+        }
+        return explicit;
+    }
+    if (hasTauriProject(root)) return 'tauri';
+    if (hasCargoProject(root)) return 'cargo';
+    throw new Error(
+        `Не удалось определить тип проекта: нет src-tauri/tauri.conf.json и нет Cargo.toml (корень / src-tauri / src).\n` +
+        `Явно укажи "kind": "tauri" или "kind": "cargo" в .build-config.json.`
+    );
+}
+
+// Папка крейта: src-tauri для tauri; для cargo — где нашёлся Cargo.toml.
+function resolveCrateDir(root, kind) {
+    if (kind === 'tauri') return path.join(root, 'src-tauri');
+    for (const d of [root, path.join(root, 'src-tauri'), path.join(root, 'src')]) {
+        if (fs.existsSync(path.join(d, 'Cargo.toml'))) return d;
+    }
+    throw new Error(`Cargo.toml не найден для cargo-проекта (${root}, src-tauri, src)`);
+}
+
+function looksLikeProject(root) {
+    return (
+        hasTauriProject(root) ||
+        hasCargoProject(root) ||
+        fs.existsSync(path.join(root, CONFIG_FILENAME))
+    );
+}
+
 function resolveProjectRoot(projectArg, cwd) {
-    if (projectArg && hasTauriProject(projectArg)) {
+    if (projectArg && looksLikeProject(projectArg)) {
         return path.resolve(projectArg);
     }
-    if (hasTauriProject(cwd)) {
+    if (looksLikeProject(cwd)) {
         return path.resolve(cwd);
     }
     throw new Error(
-        `Не найден корень Tauri-проекта (нужен src-tauri/tauri.conf.json).\n` +
+        `Не найден корень проекта (нужны src-tauri/tauri.conf.json ИЛИ Cargo.toml ИЛИ .build-config.json).\n` +
         `  --project: ${projectArg}\n  cwd: ${cwd}\n` +
         `Запускай скрипт из корня проекта или передай --project "<корень>".`
     );
@@ -38,8 +82,8 @@ function readTauriConf(projectRoot) {
     return readJson(path.join(projectRoot, 'src-tauri', 'tauri.conf.json'));
 }
 
-function readCargoName(projectRoot) {
-    const text = fs.readFileSync(path.join(projectRoot, 'src-tauri', 'Cargo.toml'), 'utf8');
+function readCargoName(crateDir) {
+    const text = fs.readFileSync(path.join(crateDir, 'Cargo.toml'), 'utf8');
     const articles = text.match(/^name\s*=\s*"([^"]+)"/m);
     return articles ? articles[1] : null;
 }
@@ -100,10 +144,17 @@ function loadProjectConfig(projectArg, cwd) {
         cfgRaw = readJson(cfgPath) || {};
     }
 
-    const tauriConf = readTauriConf(projectRoot);
-    const cargoName = readCargoName(projectRoot);
+    const kind = detectProjectKind(projectRoot, cfgRaw);
+    const crateDir = resolveCrateDir(projectRoot, kind);
+    // tauri.conf.json есть только у tauri-проекта; cargo-конфигурации читают
+    // имя/продукт из Cargo.toml.
+    const tauriConf = kind === 'tauri' ? readTauriConf(projectRoot) : null;
+    const cargoName = readCargoName(crateDir);
     const origin = gitRemoteOrigin(projectRoot);
-    const fallbackRepo = normalizeRepo(cfgRaw.repo) || normalizeRepo(detectRepoFromTauri(tauriConf)) || normalizeRepo(origin);
+    const fallbackRepo =
+        normalizeRepo(cfgRaw.repo) ||
+        normalizeRepo(kind === 'tauri' ? detectRepoFromTauri(tauriConf) : null) ||
+        normalizeRepo(origin);
 
     const signing = cfgRaw.signing && typeof cfgRaw.signing === 'object' ? cfgRaw.signing : {};
 
@@ -112,8 +163,13 @@ function loadProjectConfig(projectArg, cwd) {
         configPath: cfgPath,
         configRaw: cfgRaw,
 
+        // Тип проекта ('tauri' | 'cargo') и папка крейта — всюду ниже по пайплайну
+        // ветвление идёт по этим полям, а не по наличию файлов.
+        kind,
+        crateDir,
+
         appExe: cfgRaw.appExe || cargoName || null,
-        productName: cfgRaw.productName || tauriConf.productName || cargoName || null,
+        productName: cfgRaw.productName || (tauriConf && tauriConf.productName) || cargoName || null,
         repo: fallbackRepo,
         branch: cfgRaw.branch || gitCurrentBranch(projectRoot) || 'main',
 
@@ -196,8 +252,8 @@ function resolveTargetDir(cfg) {
     }
 
     if (!dir) {
-        dir = path.join(root, 'src-tauri', 'target');
-        source = 'fallback (src-tauri/target)';
+        dir = cfg.kind === 'tauri' ? path.join(root, 'src-tauri', 'target') : path.join(root, 'target');
+        source = 'fallback';
         console.warn(`[target-dir] WARN: cargo metadata недоступен, использую ${dir}`);
     }
 
@@ -213,6 +269,8 @@ module.exports = {
     readJson,
     readTauriConf,
     readCargoName,
+    detectProjectKind,
+    resolveCrateDir,
     normalizeRepo,
     gitCurrentBranch,
     gitRemoteOrigin,

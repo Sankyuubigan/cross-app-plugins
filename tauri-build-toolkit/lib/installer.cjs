@@ -38,7 +38,7 @@ async function run(cfg) {
 
     sh(cfg, 'npx', ['tauri', 'build', '--bundles', 'nsis'], { echo: true });
 
-    const version = readVersion(cfg.projectRoot);
+    const version = readVersion(cfg);
     const installer = findInstallerBundle(BUNDLE_DIR(cfg), version);
     if (!installer) {
         throw new Error(`Installer not found in ${BUNDLE_DIR(cfg)} for version ${version}`);

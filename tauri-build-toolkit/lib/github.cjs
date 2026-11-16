@@ -234,7 +234,7 @@ function assertNotAlreadyPartiallyPublished(cfg, probes = {}) {
     const branchAhead = probes.branchAhead || (() => getBranchAhead(cfg, getBranch(cfg)));
     const headSubject = probes.headSubject || (() => String(getHeadCommitSubject(cfg) || '').trim());
 
-    const version = readVersion(cfg.projectRoot);
+    const version = readVersion(cfg);
     const tag = `v${version}`;
     const info = tagExists(tag);
     if (!info.exists) return;

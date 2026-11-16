@@ -17,7 +17,7 @@ const { resolveTargetDir } = require('./config.cjs');
 //   - итоговый URL обязан содержать версию (и в теге, и в имени файла);
 //   - требуется config.repo (иначе нельзя построить статический URL).
 function generateLatestJson(cfg, opts = {}) {
-    const version = opts.version || readVersion(cfg.projectRoot);
+    const version = opts.version || readVersion(cfg);
     const exeFileName = opts.exeFileName;
     const platform = opts.platform || 'windows-x86_64';
     const repo = cfg.repo;
