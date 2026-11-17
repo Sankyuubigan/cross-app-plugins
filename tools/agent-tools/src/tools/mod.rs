@@ -9,6 +9,7 @@
 
 use crate::exit::Exit;
 
+pub mod anim;
 pub mod code;
 pub mod codemap;
 pub mod consult;
@@ -16,7 +17,7 @@ pub mod websearch;
 
 /// Реестр инструментов: единственный список, по которому печатается справка
 /// и который обходится при добавлении нового инструмента.
-pub const ALL: &[Tool] = &[Tool::Consult, Tool::Codemap, Tool::Code, Tool::Websearch];
+pub const ALL: &[Tool] = &[Tool::Consult, Tool::Codemap, Tool::Code, Tool::Websearch, Tool::Anim];
 
 /// Инструмент набора.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,6 +30,8 @@ pub enum Tool {
     Code,
     /// Мульти-движковый поиск в интернете без API-ключей (порт web_search.ts).
     Websearch,
+    /// «Сделать анимацию»: kimodo.cpp → гейт хореографии → neuro_soma.
+    Anim,
 }
 
 impl Tool {
@@ -39,6 +42,7 @@ impl Tool {
             Tool::Codemap => "codemap",
             Tool::Code => "code",
             Tool::Websearch => "websearch",
+            Tool::Anim => "anim",
         }
     }
 
@@ -55,7 +59,10 @@ impl Tool {
                 "Файловые/поисковые/shell тула ядра code-tools (read_file, grep, bash, ...) — CLI и MCP"
             }
             Tool::Websearch => {
-                "Поиск в интернете по 17 движкам без API-ключей (chain/parallel, multi-query, MCP-режим)"
+                "Поиск в интернете по 17 движкам без API-ключей (порт web_search.ts)"
+            }
+            Tool::Anim => {
+                "«Сделать анимацию» одной командой: kimodo.cpp → гейт хореографии → neuro_soma"
             }
         }
     }
@@ -70,6 +77,7 @@ impl Tool {
             Some("codemap") => Some(Tool::Codemap),
             Some("code") => Some(Tool::Code),
             Some("websearch") => Some(Tool::Websearch),
+            Some("anim") => Some(Tool::Anim),
             _ => None,
         }
     }
@@ -82,6 +90,7 @@ impl Tool {
             Tool::Codemap => codemap::run(args),
             Tool::Code => code::run(args),
             Tool::Websearch => websearch::run(args),
+            Tool::Anim => anim::run(args),
         }
     }
 }
@@ -125,7 +134,13 @@ mod tests {
     fn registry_lists_every_tool() {
         assert_eq!(
             ALL,
-            &[Tool::Consult, Tool::Codemap, Tool::Code, Tool::Websearch],
+            &[
+                Tool::Consult,
+                Tool::Codemap,
+                Tool::Code,
+                Tool::Websearch,
+                Tool::Anim
+            ],
             "новый инструмент обязан попасть в ALL"
         );
     }
