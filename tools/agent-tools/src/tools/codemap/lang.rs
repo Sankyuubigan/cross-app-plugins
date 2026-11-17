@@ -18,6 +18,10 @@ pub enum Lang {
     /// Разбор заголовков: `#`-уровни становятся определениями секций, тело
     /// остаётся доступно полнотекстовому поиску через плоские чанки.
     Markdown,
+    /// Легковесный структурный разбор (по образцу Markdown): объявления
+    /// `func`/`class_name`/`signal`/`const`/`enum` плюс ссылки — атрибуты,
+    /// типы, `extends` и пути `preload`/`load`.
+    GdScript,
     /// Парсера нет. Файл не выбрасывается, а попадает в плоский индекс:
     /// инвентарь и текстовые чанки, доступные поиску.
     Flat,
@@ -35,6 +39,7 @@ impl Lang {
             "ts" | "tsx" | "mts" | "cts" | "js" | "jsx" | "mjs" | "cjs" => Lang::TsJs,
             "py" | "pyi" => Lang::Python,
             "md" | "markdown" | "mdx" => Lang::Markdown,
+            "gd" => Lang::GdScript,
             _ => Lang::Flat,
         }
     }
@@ -57,6 +62,7 @@ impl Lang {
             Lang::TsJs => "ts/js",
             Lang::Python => "python",
             Lang::Markdown => "markdown",
+            Lang::GdScript => "gdscript",
             Lang::Flat => "flat",
         }
     }
@@ -87,6 +93,13 @@ mod tests {
         assert_eq!(Lang::of_extension("MD"), Lang::Markdown);
         assert_eq!(Lang::of_extension("markdown"), Lang::Markdown);
         assert!(Lang::of_extension("md").has_parser(), "у markdown есть структура — заголовки");
+    }
+
+    #[test]
+    fn gdscript_maps_to_its_backend() {
+        assert_eq!(Lang::of_extension("gd"), Lang::GdScript);
+        assert_eq!(Lang::of_extension("GD"), Lang::GdScript);
+        assert!(Lang::of_extension("gd").has_parser(), "у gdscript есть структура — объявления");
     }
 
     #[test]

@@ -298,12 +298,29 @@ impl Cli {
                     self.display_root()
                 ));
             }
+            // Диагностика вместо тупика (урок бага с GDScript): пустая карта при
+            // непустом дереве почти всегда значит «язык без парсера». Показываем
+            // разбор по языкам, чтобы причина была видна из одного сообщения.
+            let mut counts: std::collections::BTreeMap<&str, (usize, usize)> =
+                std::collections::BTreeMap::new();
+            for file in &index.files {
+                let entry = counts.entry(file.lang.name()).or_insert((0, 0));
+                entry.0 += 1;
+                if file.parsed {
+                    entry.1 += 1;
+                }
+            }
+            let breakdown: Vec<String> = counts
+                .iter()
+                .map(|(name, (total, parsed))| format!("{name} {parsed}/{total}"))
+                .collect();
             return Err(format!(
-                "Карта пуста: в {} найдено файлов: {}, но ни одно определение не связано \
-                 ссылками с другими файлами — карте нечего показывать. Для маленьких деревьев \
-                 используй search/skeleton.",
+                "Карта пуста: в {} найдено файлов: {} ({}). Ни одно определение не связано \
+                 ссылками с другими файлами. Языки с «0/…» — парсера нет, определения не \
+                 извлекаются; если это твой основной язык — добавь бэкенд в lang.rs.",
                 self.display_root(),
-                index.files.len()
+                index.files.len(),
+                breakdown.join(", ")
             ));
         }
         log::info!("codemap: карта {} токенов при бюджете {}", used, tokens);

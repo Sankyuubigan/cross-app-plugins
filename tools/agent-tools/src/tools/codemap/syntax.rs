@@ -53,7 +53,10 @@ pub fn inspect(rel_path: &str, source: &str, lang: Lang) -> SyntaxStatus {
         Lang::Python => python_status(rel_path, source),
         // Markdown имеет структуру (заголовки), но не синтаксис с ошибками:
         // разбор заголовков не бывает ошибочным, и «валиден» был бы ложью.
-        Lang::Markdown | Lang::Flat => SyntaxStatus::Unsupported,
+        // Markdown и GDScript имеют структуру (заголовки / объявления), но не
+        // синтаксическую проверку: наши разборы этих языков построчные и ошибок
+        // не выдают, поэтому «валиден» был бы проверкой, которой не было.
+        Lang::Markdown | Lang::GdScript | Lang::Flat => SyntaxStatus::Unsupported,
     }
 }
 

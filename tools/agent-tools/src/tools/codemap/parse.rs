@@ -5,6 +5,7 @@
 //! расширение начнут читать по-разному, а расхождение будет выглядеть как
 //! «индекс построен, но пуст».
 
+use super::gd_lang;
 use super::lang::Lang;
 use super::md_lang;
 use super::py_lang;
@@ -26,6 +27,7 @@ pub fn tags_of(rel_path: &str, source: &str, lang: Lang) -> Result<Vec<Tag>, Str
         Lang::TsJs => ts_lang::tags(rel_path, source, lang),
         Lang::Python => py_lang::tags(rel_path, source),
         Lang::Markdown => Ok(md_lang::tags(rel_path, source)),
+        Lang::GdScript => Ok(gd_lang::tags(rel_path, source)),
         Lang::Flat => Ok(super::flat_lang::tags(rel_path, source)),
     }
 }
@@ -33,6 +35,7 @@ pub fn tags_of(rel_path: &str, source: &str, lang: Lang) -> Result<Vec<Tag>, Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::codemap::tags::TagKind;
 
     #[test]
     fn each_language_uses_its_own_backend() {
@@ -52,6 +55,18 @@ mod tests {
             .expect("markdown разбирается без ошибок");
         let names: Vec<&str> = tags.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(names, vec!["Правила", "Установка"]);
+    }
+
+    #[test]
+    fn gdscript_yields_definitions_and_module_name() {
+        let tags = tags_of(
+            "a.gd",
+            "extends Node\n\nfunc _ready():\n    pass\n",
+            Lang::GdScript,
+        )
+        .expect("gdscript разбирается без ошибок");
+        assert!(tags.iter().any(|t| t.kind == TagKind::Def && t.name == "a"), "файл без class_name всё равно именованный модуль");
+        assert!(tags.iter().any(|t| t.kind == TagKind::Def && t.name == "_ready"));
     }
 
     #[test]

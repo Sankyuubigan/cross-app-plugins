@@ -31,6 +31,7 @@ pub mod cli;
 pub use cli::run;
 
 pub mod flat_lang;
+pub mod gd_lang;
 pub mod graph;
 pub mod inventory;
 pub mod lang;
