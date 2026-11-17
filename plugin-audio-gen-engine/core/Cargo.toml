@@ -1,0 +1,31 @@
+[package]
+name = "audio-gen-core"
+version = "0.1.0"
+edition = "2021"
+description = "Pure core of the audio-gen plugin (audio.cpp engine runner, model registry, job queue, WAV post-processing) — no tauri"
+license = "MIT"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+log = { workspace = true }
+chrono = { workspace = true }
+
+# Асинхронный HTTP-клиент к audiocpp_server (движок audio.cpp) и к HF для весов
+tokio = { workspace = true }
+reqwest = { workspace = true }
+
+# Процессы движка: SSOT PID-registry + taskkill /F /T + Windows kill-job.
+# (потребители media-gen-core / mesh-gen-core — тот же паттерн)
+engine-proc-util = { path = "../../engine-proc-util" }
+
+# Скачивание движков/весов — ЕДИНЫЙ движок загрузок проекта (6 фолбэков).
+# plugin-downloader (tauri-фасад) ядру запрещён.
+downloader-core = { path = "../../plugin-downloader/core" }
+
+# Атомарные записи JSON (настройки, реестр сгенерированных клипов) — fs::write запрещён.
+json-store = { path = "../../json-store" }
+
+# WAV-чтение/запись для постобработки (нормализация, луп-кроссфейд)
+hound = { workspace = true }

@@ -16,6 +16,13 @@ members = [
     "plugin-downloader/core",
     "plugin-media-gen-engine",
     "plugin-media-gen-engine/core",
+    # SSOT утилит процессов движков (PID-реестр + kill-job): потребители
+    # media-gen-core и mesh-gen-core (вынесено 17.11.26 из media-gen-core).
+    "engine-proc-util",
+    "plugin-mesh-engine",
+    "plugin-mesh-engine/core",
+    "plugin-audio-gen-engine",
+    "plugin-audio-gen-engine/core",
     "plugin-ytdlp-wrapper",
     "plugin-ytdlp-wrapper/core",
     "plugin-ffmpeg-wrapper",

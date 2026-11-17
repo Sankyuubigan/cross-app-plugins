@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-audio-gen-open-output-dir"
+description = "Enables the audio_gen_open_output_dir command without any pre-configured scope."
+commands.allow = ["audio_gen_open_output_dir"]
+
+[[permission]]
+identifier = "deny-audio-gen-open-output-dir"
+description = "Denies the audio_gen_open_output_dir command without any pre-configured scope."
+commands.deny = ["audio_gen_open_output_dir"]

@@ -1,0 +1,26 @@
+{
+  "name": "@my-tauri-plugins/plugin-audio-gen",
+  "version": "0.1.0",
+  "description": "Reusable local audio generation plugin (SFX/music via audio.cpp engine, SA3/MOSS/ACE-Step) — framework-agnostic TS API + Web Components.",
+  "type": "module",
+  "main": "dist-js/index.js",
+  "types": "dist-js/index.d.ts",
+  "files": [
+    "dist-js",
+    "guest-js",
+    "api-iife.js"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "build:watch": "tsc -p tsconfig.json --watch",
+    "build:global": "node scripts/build-global.cjs"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2",
+    "typescript": "^5.4.0"
+  },
+  "license": "MIT"
+}

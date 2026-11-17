@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-audio-gen-list-models"
+description = "Enables the audio_gen_list_models command without any pre-configured scope."
+commands.allow = ["audio_gen_list_models"]
+
+[[permission]]
+identifier = "deny-audio-gen-list-models"
+description = "Denies the audio_gen_list_models command without any pre-configured scope."
+commands.deny = ["audio_gen_list_models"]

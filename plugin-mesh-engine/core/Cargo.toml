@@ -1,0 +1,33 @@
+[package]
+name = "mesh-gen-core"
+version = "0.1.0"
+edition = "2021"
+description = "Pure core of the trellis.cpp mesh plugin (image → GLB via trellis-server process, GGUF weights) — no tauri"
+license = "MIT"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+log = { workspace = true }
+# HTTP к trellis-server: blocking + multipart (/generate) + rustls — тот же
+# профиль reqwest, что в media-gen-core (default-features=false, чтобы не
+# конфликтовать с native-tls воркспейса).
+reqwest = { version = "0.12", features = ["json", "rustls-tls-native-roots", "stream", "blocking", "multipart"], default-features = false }
+
+# Жизненный цикл процессов движков (SSOT): PID-реестр + Windows Job Object
+# + kill дерева. Потребители — media-gen-core и mesh-gen-core.
+engine-proc-util = { path = "../../engine-proc-util" }
+
+# Скачивание движка/весов (SSOT хоста): multi-chunk + прогресс `downloader:progress`.
+# tauri-фасад plugin-downloader ядру запрещён — события идут через emit-хук.
+downloader-core = { path = "../../plugin-downloader/core" }
+
+# Ключ `trellis_dir` в общем app_config.json хоста (прецедент sdcpp_dir).
+json-store = { path = "../../json-store" }
+
+# Распаковка server-бандла trellis.cpp (zip из GitHub releases).
+zip = { workspace = true }
+
+[lib]
+name = "mesh_gen_core"
+path = "src/lib.rs"

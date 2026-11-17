@@ -41,6 +41,11 @@ downloader-core = { path = "../../plugin-downloader/core" }
 # Атомарные записи JSON (app_config.json): tmp->rename + sidecar lock.
 json-store = { path = "../../json-store" }
 
+# Жизненный цикл процессов движков (SSOT, вынесено 17.11.26 из этого крейта
+# в общий lib-крейт: потребители — media-gen-core и mesh-gen-core):
+# PID-реестр + Windows Job Object + kill дерева.
+engine-proc-util = { path = "../../engine-proc-util" }
+
 [dev-dependencies]
 # Бенч: серверные строки sd-server (pipe_log → log::info!) должны попадать
 # в bench_run.log, иначе диагностика темпа невозможна.

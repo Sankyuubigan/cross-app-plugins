@@ -1,0 +1,24 @@
+[package]
+name = "plugin-audio-gen-engine"
+version = "0.1.0"
+edition = "2021"
+links = "tauri-plugin-audio-gen"
+description = "Reusable local audio generation (SFX/music via audio.cpp engine, SA3/MOSS/ACE-Step models) with settings panel for Tauri apps"
+license = "MIT"
+
+[dependencies]
+tauri = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+log = { workspace = true }
+
+# Чистое ядро (ССОТ, без tauri): реестр моделей, движок audio.cpp, очередь задач,
+# постобработка WAV. Tauri-плагин — тонкий фасад (мост config_dir, событий в emit).
+audio-gen-core = { path = "core" }
+
+[lib]
+name = "plugin_audio_gen_engine"
+path = "src/lib.rs"
+
+[build-dependencies]
+tauri-plugin = { version = "2", features = ["build"] }

@@ -1,0 +1,53 @@
+"$schema" = "../gen/schemas/acl.json"
+
+[[permission]]
+identifier = "allow-mesh-engine-status"
+description = "Разрешить чтение статуса mesh-движка (trellis-server + веса)"
+commands.allow = ["mesh_engine_status"]
+
+[[permission]]
+identifier = "allow-mesh-generate"
+description = "Разрешить генерацию GLB из прикреплённого изображения"
+commands.allow = ["mesh_generate"]
+
+[[permission]]
+identifier = "allow-mesh-engine-install"
+description = "Разрешить установку движка trellis.cpp (server-бандл + веса)"
+commands.allow = ["mesh_engine_install"]
+
+[[permission]]
+identifier = "allow-mesh-engine-check-update"
+description = "Разрешить проверку обновлений mesh-движка (GitHub API vs мета тега)"
+commands.allow = ["mesh_engine_check_update"]
+
+[[permission]]
+identifier = "allow-mesh-engine-set-dir"
+description = "Разрешить смену папки установки mesh-движка"
+commands.allow = ["mesh_engine_set_dir"]
+
+[[permission]]
+identifier = "allow-mesh-rig-engine-status"
+description = "Разрешить чтение статуса раскладки риггинга (skintokens-cli + веса)"
+commands.allow = ["mesh_rig_engine_status"]
+
+[[permission]]
+identifier = "allow-mesh-rig-engine-install"
+description = "Разрешить скачивание весов риггинга SkinTokens-GGUF (F16, 3 файла)"
+commands.allow = ["mesh_rig_engine_install"]
+
+[[permission]]
+identifier = "allow-mesh-rig-engine-set-dir"
+description = "Разрешить смену папки движка риггинга (skintokens_dir)"
+commands.allow = ["mesh_rig_engine_set_dir"]
+
+[default]
+permissions = [
+    "allow-mesh-engine-status",
+    "allow-mesh-generate",
+    "allow-mesh-engine-install",
+    "allow-mesh-engine-check-update",
+    "allow-mesh-engine-set-dir",
+    "allow-mesh-rig-engine-status",
+    "allow-mesh-rig-engine-install",
+    "allow-mesh-rig-engine-set-dir",
+]

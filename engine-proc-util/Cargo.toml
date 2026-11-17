@@ -1,0 +1,13 @@
+[package]
+name = "engine-proc-util"
+version = "0.1.0"
+edition = "2021"
+description = "Shared child-process lifecycle utilities for engine plugins (PID registry, kill tree, Windows kill-job) — no tauri"
+license = "MIT"
+
+[dependencies]
+log = { workspace = true }
+
+[lib]
+name = "engine_proc_util"
+path = "src/lib.rs"

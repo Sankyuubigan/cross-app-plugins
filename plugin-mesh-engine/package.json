@@ -1,0 +1,22 @@
+{
+  "name": "@my-tauri-plugins/plugin-mesh-engine",
+  "version": "0.1.0",
+  "description": "Reusable trellis.cpp mesh engine plugin (image to GLB via trellis-server process)",
+  "license": "MIT",
+  "type": "module",
+  "main": "dist-js/index.js",
+  "types": "dist-js/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "build:watch": "tsc --watch",
+    "build:global": "node scripts/build-global.cjs"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.0.0",
+    "@tauri-apps/plugin-dialog": "^2"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2",
+    "typescript": "^5.4.0"
+  }
+}

@@ -22,6 +22,14 @@ pub struct DialogSettings {
     pub name: String,
     /// Персона персонажа (WS `start.persona`); пусто = не задавать.
     pub persona: String,
+    /// Имя собеседника (WS `start.other_name`); пусто = модель придумает сама
+    /// (и обычно выдумывает произвольное — потому поле и стоит заполнять).
+    #[serde(default)]
+    pub other_name: String,
+    /// Частота backchannel-реплик («да», «угу») — WS `start.backchannel`,
+    /// значения low/mid/high (docs/models/haru.md). Пусто = «low».
+    #[serde(default)]
+    pub backchannel: String,
     /// Путь к файлу голоса (клонирование, WS `start.voice`); пусто = голос модели.
     pub voice: String,
     /// Seed генерации (WS `start.seed`; 0 = не задавать).
@@ -42,8 +50,14 @@ impl Default for DialogSettings {
             model: "haru-4b:q8_0".into(),
             port: 0,
             language: "ru".into(),
-            name: String::new(),
-            persona: String::new(),
+            // Дефолтная карточка НЕ пустая: без name/persona карточки нет и
+            // модель говорит «как хочет» (китайский). Дубль фолбэка в хосте
+            // (session.rs start_message) покрывает старые файлы с пустыми
+            // полями.
+            name: "Хару".into(),
+            persona: "Дружелюбная собеседница. Говори только по-русски, коротко и живо, как в живом разговоре.".into(),
+            other_name: String::new(),
+            backchannel: String::new(),
             voice: String::new(),
             seed: 0,
             speak_first: false,

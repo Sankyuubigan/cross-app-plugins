@@ -1,0 +1,36 @@
+"$schema" = "../gen/schemas/acl.json"
+
+[[permission]]
+identifier = "allow-audio-gen-list-models"
+description = "Allow listing known audio models (SA3/MOSS/ACE-Step) with install status."
+commands.allow = ["audio_gen_list_models"]
+
+[[permission]]
+identifier = "allow-audio-gen-generate"
+description = "Allow starting a local SFX/music generation job (audio.cpp engine)."
+commands.allow = ["audio_gen_generate"]
+
+[[permission]]
+identifier = "allow-audio-gen-status"
+description = "Allow polling job status/progress."
+commands.allow = ["audio_gen_status"]
+
+[[permission]]
+identifier = "allow-audio-gen-cancel"
+description = "Allow cancelling the running/queued generation job."
+commands.allow = ["audio_gen_cancel"]
+
+[[permission]]
+identifier = "allow-audio-gen-open-output-dir"
+description = "Allow opening the output folder in Explorer."
+commands.allow = ["audio_gen_open_output_dir"]
+
+[default]
+description = "Default permissions for the audio-gen plugin (local audio.cpp generation)."
+permissions = [
+  "allow-audio-gen-list-models",
+  "allow-audio-gen-generate",
+  "allow-audio-gen-status",
+  "allow-audio-gen-cancel",
+  "allow-audio-gen-open-output-dir",
+]
