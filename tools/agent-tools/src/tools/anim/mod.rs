@@ -132,8 +132,7 @@ fn execute(a: &AnimArgs) -> Result<String, String> {
     // 5) Отчёт + next steps (этапы 5–7 ССОТ — явные команды Godot)
     let godot = a.godot.display();
     Ok(format!(
-        "anim: '{}'
- установлен (seed {}, источник {})\n\
+        "anim: '{}' установлен (seed {}, источник {})\n\
          Далее (ССОТ docs/animation_generation.md §2):\n\
          \x20 \"{}\" --headless -s res://Generators/retarget_soma_anims.gd\n\
          \x20 \"{}\" --headless -s res://Generators/test_soma_invariants.gd\n\

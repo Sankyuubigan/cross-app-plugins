@@ -13,6 +13,7 @@ CLI-набор инструментов для ИИ-агентов кодеро�
 | [`code`](#code--ядро-кодо-тулов) | ядро кодо-тулов агента: чтение/запись/поиск/shell — тот же код, что у хостовых тулов (крейт `code-tools`) |
 | [`consult`](#consult--эскалация-к-умной-модели) | отчёт рабочего агента → умная модель через шлюз 9Router, с жёстким лимитом вызовов |
 | [`websearch`](#websearch--мульти-движковый-поиск) | интернет-поиск через 11 keyless-движков: цепочка фолбэков, multi-query, кеш и статистика отказов |
+| [`anim`](#anim--сделать-анимацию) | «сделать анимацию» одной командой: kimodo.cpp (нейро-движение) → гейт хореографии → neuro_soma проекта 3d_game |
 
 # полезные источники
 https://mcp.so/
@@ -550,6 +551,23 @@ agent-tools websearch mcp                                 # MCP: JSON-RPC 2.0 st
 `{"name":"WebSearch","arguments":{"query":"...","limit":N}}`. Ответы
 построчно, весь лог — в stderr, stdout принадлежит протоколу.
 
+## anim — сделать анимацию
+
+Обёртка нейро-пайплайна kimodo.cpp (SOMA30) для проекта 3d_game: одна команда
+закрывает шаги 1–4 ССОТ `docs/animation_generation.md` — промпт, генерацию
+сидов, численный гейт хореографии, установку победителя в neuro_soma. Ретаргет
+и тесты Godot тул сознательно НЕ запускает — печатает их как next steps
+(мусорная генерация не доезжает до игры молча).
+
+```bash
+agent-tools anim --name cast_zap --prompt "The character raises his right hand..." --type cast_push
+```
+
+- сиды генерируются параллельно (RAM ~8 ГБ на процесс); победителя выбирает
+  гейт `probe_hand_path.gd`, не глаз;
+- без PASS ни один клип в проект не попадает (exit ≠ 0, в stdout вердикты гейтов);
+- перезапись существующего клипа — только с `--force`.
+
 ## Архитектура
 
 ```text
@@ -558,6 +576,7 @@ src/exit.rs                  контракт «тул ↔ агент»: код�
 src/logging.rs               минимальный log::Log → stderr
 src/tools/mod.rs             реестр инструментов (Tool, ALL)
 src/tools/websearch/mod.rs   дверь модуля + handler WebSearch (CLI и MCP-вопросы)
+src/tools/anim/{mod,cli}.rs  «сделать анимацию»: kmd-generate → гейт → neuro_soma
 src/tools/websearch/…        http.rs, cache.rs, stats.rs, mcp.rs,
                              engines/{duckduckgo,wiby,marginalia,brave,
                              startpage,sogou,baidu,bing,juejin,csdn,exa}.rs,

@@ -46,7 +46,8 @@ USAGE:
     --steps <N>          50    (шаги диффузии)
     --seeds <N>          3     (лотерея хореографии; победителя берёт гейт)
     --seed-base <N>      42
-    --type <T>           none  (гейт: pistol_shoot | pistol_shoot_l | throw | none)
+    --type <T>           none  (гейт: cast_push | cast_push_l | pistol_shoot |
+                               pistol_shoot_l | left_bent_front | throw | none)
     --kimodo <DIR>       D:\\nn\\kimodo.cpp
     --godot <EXE>        D:\\Programs\\Godot\\Godot_v4.8-beta3\\Godot_v4.8-beta3_win64_console.exe
     --project <DIR>      D:\\Projects\\3d_game
@@ -85,7 +86,7 @@ pub fn parse(args: &[String]) -> Result<AnimArgs, String> {
     let mut name_set = false;
     while i < args.len() {
         let flag = args[i].as_str();
-        let mut value = |i: &mut usize| -> Result<String, String> {
+        let value = |i: &mut usize| -> Result<String, String> {
             *i += 1;
             args.get(*i).cloned().ok_or_else(|| format!("нет значения для {}", args[*i - 1]))
         };
@@ -118,11 +119,89 @@ pub fn parse(args: &[String]) -> Result<AnimArgs, String> {
         return Err("--name: только латиница, цифры и _ (имя становится каталогами)".into());
     }
     match a.gate_type.as_str() {
-        "pistol_shoot" | "pistol_shoot_l" | "throw" | "none" => {}
+        "pistol_shoot" | "pistol_shoot_l" | "cast_push" | "cast_push_l" | "left_bent_front"
+        | "throw" | "none" => {}
         other => return Err(format!("--type {}: нет такого типа гейта", other)),
     }
     if a.prompt.is_some() && a.prompt_file.is_some() {
         return Err("--prompt и --prompt-file взаимоисключающи".into());
     }
     Ok(a)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn argv(items: &[&str]) -> Vec<String> {
+        let mut v = vec!["agent-tools".to_string(), "anim".to_string()];
+        v.extend(items.iter().map(|s| s.to_string()));
+        v
+    }
+
+    #[test]
+    fn parse_minimal_uses_defaults() {
+        let a = parse(&argv(&["--name", "cast_zap", "--prompt", "a short cast"]))
+            .expect("минимальный вызов обязан парситься");
+        assert_eq!(a.name, "cast_zap");
+        assert_eq!(a.frames, 24);
+        assert_eq!(a.steps, 50);
+        assert_eq!(a.seeds, 3);
+        assert_eq!(a.seed_base, 42);
+        assert_eq!(a.gate_type, "none");
+        assert!(!a.force);
+    }
+
+    #[test]
+    fn parse_requires_name() {
+        assert!(parse(&argv(&["--prompt", "x"])).is_err());
+    }
+
+    #[test]
+    fn parse_rejects_bad_name() {
+        // Имя становится каталогами: дефис/слэш/юникод запрещены.
+        for bad in ["cast-zap", "a/b", "клип"] {
+            let res = parse(&argv(&["--name", bad, "--prompt", "x"]));
+            assert!(res.is_err(), "имя '{}' обязано отбраковаться", bad);
+        }
+    }
+
+    #[test]
+    fn parse_accepts_every_probe_gate_type() {
+        // Whitelist тулa обязан совпадать с типами probe_hand_path.gd (§5 ССОТ).
+        for gate in [
+            "pistol_shoot",
+            "pistol_shoot_l",
+            "cast_push",
+            "cast_push_l",
+            "left_bent_front",
+            "throw",
+            "none",
+        ] {
+            let res = parse(&argv(&["--name", "clip", "--prompt", "x", "--type", gate]));
+            assert!(res.is_ok(), "гейт '{}' обязан парситься", gate);
+        }
+        assert!(parse(&argv(&["--name", "clip", "--prompt", "x", "--type", "kick"])).is_err());
+    }
+
+    #[test]
+    fn parse_rejects_conflicting_prompts() {
+        let res = parse(&argv(&[
+            "--name", "clip", "--prompt", "x", "--prompt-file", "p.txt",
+        ]));
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn parse_rejects_flag_without_value() {
+        assert!(parse(&argv(&["--name", "clip", "--prompt"])).is_err());
+    }
+
+    #[test]
+    fn help_flag_returns_usage() {
+        match parse(&argv(&["--help"])) {
+            Err(msg) => assert!(msg.contains("USAGE")),
+            Ok(_) => panic!("--help обязан вернуть справку, а не аргументы"),
+        }
+    }
 }
