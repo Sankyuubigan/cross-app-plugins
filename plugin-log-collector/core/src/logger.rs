@@ -21,11 +21,16 @@ use log::{Level, LevelFilter, Log, Metadata, Record};
 use std::sync::Arc;
 
 /// Хост-колбэк live-строки лога (Tauri-плагин эмитит `logs:message`,
-/// GPUI-хост кладёт строку в свою панель). Повторный `set_emit_hook`
-/// заменяет колбэк; `None` отключает доставку.
+/// GPUI-хост кладёт строку в свою панель; пер-сессионный архив King Orch
+/// дописывает строку в файл сессии). Подписчики живут списком — см.
+/// `push_emit_hook` / `set_emit_hook`.
 pub type EmitHook = Arc<dyn Fn(&str) + Send + Sync>;
 
-static EMIT_HOOK: OnceLock<Mutex<Option<EmitHook>>> = OnceLock::new();
+/// Live-подписчики строк лога. Исторически был single-slot (`set_emit_hook`),
+/// стал списком (19.11.26): у строки несколько потребителей (UI-вкладка
+/// плагина + пер-сессионный архив хоста), и порядок установки подписчиков
+/// (хост-код в main vs plugin setup) не должен решать, кто выживет.
+static EMIT_HOOKS: OnceLock<Mutex<Vec<EmitHook>>> = OnceLock::new();
 static FILE_LOCK: Mutex<()> = Mutex::new(());
 static LOG_FILE: OnceLock<std::path::PathBuf> = OnceLock::new();
 static LAST_LOGS: OnceLock<std::path::PathBuf> = OnceLock::new();
@@ -136,10 +141,17 @@ pub fn write_regular(level: &str, msg: &str) {
         eprintln!("{entry}");
     }
     write_entries_to_files(&entries);
-    let hook = EMIT_HOOK.get().and_then(|cell| lock(cell).clone());
-    if let Some(hook) = hook {
+    // Клон списка под коротким локом: подписчик вызывается вне лока,
+    // поэтому медленный подписчик не блокирует запись и другие потоки.
+    let hooks = EMIT_HOOKS
+        .get()
+        .map(|cell| lock(cell).clone())
+        .unwrap_or_default();
+    if !hooks.is_empty() {
         for entry in &entries {
-            hook(entry);
+            for hook in &hooks {
+                hook(entry);
+            }
         }
     }
 }
@@ -359,11 +371,23 @@ pub fn early_log(level: &str, msg: &str) {
     write_entries_to_files(&entries);
 }
 
-/// Установить/снять live-колбэк лога (см. `EmitHook`). Повторный вызов
-/// заменяет колбэк; `None` отключает доставку live-событий.
+/// Установить ЕДИНСТВЕННОГО live-подписчика лога (совместимость): заменяет
+/// весь список; `None` отключает доставку live-событий. Для добавления
+/// потребителя без затирания соседей — `push_emit_hook`.
 pub fn set_emit_hook(hook: Option<EmitHook>) {
-    let cell = EMIT_HOOK.get_or_init(|| Mutex::new(None));
-    *lock(cell) = hook;
+    let cell = EMIT_HOOKS.get_or_init(|| Mutex::new(Vec::new()));
+    let mut guard = lock(cell);
+    *guard = hook.map(|h| vec![h]).unwrap_or_default();
+}
+
+/// Добавить live-подписчика строк лога (19.11.26): строка может быть нужна
+/// нескольким потребителям одновременно (UI-вкладка + пер-сессионный архив),
+/// single-slot затирал раннего подписчика (кейс King Orch: хост ставит
+/// архивный хук в main(), plugin setup позже ставит UI-хук). Вызов хуков —
+/// по порядку добавления. ЗАПРЕЩЕНО звать push/set_emit_hook изнутри хука.
+pub fn push_emit_hook(hook: EmitHook) {
+    let cell = EMIT_HOOKS.get_or_init(|| Mutex::new(Vec::new()));
+    lock(cell).push(hook);
 }
 
 /// Установка логгера для хостов без Tauri (GPUI-фронтенд и др.): тот же
@@ -447,6 +471,42 @@ mod tests {
         append_file(&file, "current session\n");
         let content = std::fs::read_to_string(&file).unwrap();
         assert_eq!(content, "current session\n");
+    }
+
+    #[test]
+    fn emit_hooks_push_set_and_none_semantics() {
+        // Тесты одного процесса делят static EMIT_HOOKS — семантику push/set/None
+        // проверяем в одном тесте последовательно.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let hits = Arc::new(AtomicUsize::new(0));
+
+        push_emit_hook({
+            let hits = Arc::clone(&hits);
+            Arc::new(move |_e: &str| {
+                hits.fetch_add(1, Ordering::SeqCst);
+            })
+        });
+        push_emit_hook({
+            let hits = Arc::clone(&hits);
+            Arc::new(move |_e: &str| {
+                hits.fetch_add(1, Ordering::SeqCst);
+            })
+        });
+        write_regular("INFO", "первая");
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "оба push-подписчика получили строку");
+
+        set_emit_hook(Some({
+            let hits = Arc::clone(&hits);
+            Arc::new(move |_e: &str| {
+                hits.fetch_add(10, Ordering::SeqCst);
+            })
+        }));
+        write_regular("INFO", "вторая");
+        assert_eq!(hits.load(Ordering::SeqCst), 12, "set заменяет весь список одним подписчиком");
+
+        set_emit_hook(None);
+        write_regular("INFO", "третья");
+        assert_eq!(hits.load(Ordering::SeqCst), 12, "None отключает доставку live-событий");
     }
 
     #[test]
