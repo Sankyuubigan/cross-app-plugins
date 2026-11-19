@@ -139,21 +139,14 @@ impl VendorProtocol for KiroProtocol {
         let url = models_url(&region, profile_arn.as_deref())?;
         let api_key_mode = is_api_key_mode(provider);
         let mut headers = Self::headers(credential, api_key_mode, profile_arn.as_deref())?;
-        // Релей: absolute target + заголовки поверх (та же схема, что OpenAI).
+        // Релей/прокси: единый источник вида слота (route_with_relay_slot);
+        // заголовки воркера ставятся только для Relay, у прокси их нет.
         let route = if provider.relay_id.is_some() {
-            // Единый источник правила боковой настройки (проверка «настроен,
-            // но без схемы» живёт в relay_route_base, а не в копиях).
-            let relay = crate::upstream::relay_route_base(provider, config)?;
-            let route = Route::Relay {
-                url: format!("{relay}{}/ListAvailableModels", crate::upstream::RELAY_PATH_PREFIX),
-                target_url: url,
-                token: crate::upstream::relay_route_token(provider, config)?,
-            };
-            crate::upstream::apply_route_headers(&route, &mut headers);
-            route
+            crate::upstream::route_with_relay_slot(provider, config, url, "ListAvailableModels")?
         } else {
             Route::Direct { url }
         };
+        crate::upstream::apply_route_headers(&route, &mut headers);
         Ok(UpstreamRequest { route, method: reqwest::Method::GET, headers, body: Vec::new() })
     }
 
@@ -175,16 +168,13 @@ impl VendorProtocol for KiroProtocol {
             .map_err(|e| format!("Не удалось сериализовать тело Kiro-запроса: {e}"))?;
         let first = CHAT_ENDPOINTS[0].to_string();
         let (route, target) = if provider.relay_id.is_some() {
-            let relay = crate::upstream::relay_route_base(provider, config)?;
-            let target = first.clone();
-            let route = Route::Relay {
-                url: format!(
-                    "{relay}{}/generateAssistantResponse",
-                    crate::upstream::RELAY_PATH_PREFIX
-                ),
-                    target_url: target.clone(),
-                    token: crate::upstream::relay_route_token(provider, config)?,
-            };
+            let route = crate::upstream::route_with_relay_slot(
+                provider,
+                config,
+                first.clone(),
+                "generateAssistantResponse",
+            )?;
+            let target = route.target_url().to_string();
             (route, target)
         } else {
             (Route::Direct { url: first.clone() }, first)

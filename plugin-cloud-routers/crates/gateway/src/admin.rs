@@ -28,7 +28,8 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 
 use cloud_routers_core::config::{
-    AccountKey, ProviderConfig, RELAY_KIND_CLOUDFLARE, RELAY_KIND_VERCEL, trim_base_url,
+    AccountKey, ProviderConfig, PROXY_TYPE_HTTP, PROXY_TYPE_SOCKS5, RELAY_KIND_CLOUDFLARE,
+    RELAY_KIND_PROXY, RELAY_KIND_VERCEL, trim_base_url,
 };
 use cloud_routers_core::presets;
 use cloud_routers_core::store as core_store;
@@ -1606,6 +1607,10 @@ struct RelaySlotDto {
     relay_secret_set: bool,
     cf_account_id: Option<String>,
     cf_script_name: Option<String>,
+    /// Для proxy-слота: тип/хост/порт — публичные поля, не секреты.
+    proxy_type: Option<String>,
+    host: Option<String>,
+    port: Option<u16>,
     active: bool,
 }
 
@@ -1628,6 +1633,9 @@ async fn relay_slots_list(State(state): State<AppState>) -> Json<serde_json::Val
                 .unwrap_or(false),
             cf_account_id: s.cf_account_id.clone(),
             cf_script_name: s.cf_script_name.clone(),
+            proxy_type: s.proxy_type.clone(),
+            host: s.host.clone(),
+            port: s.port,
             active: config.active_relay.as_deref() == Some(s.id.as_str()),
         })
         .collect();
@@ -1706,6 +1714,127 @@ async fn relay_slot_delete(
     }
     notify_host(&state, "relay-slot-deleted");
     Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+/// Тело создания прокси-слота.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RelaySlotCreateBody {
+    id: String,
+    proxy_type: String,
+    host: String,
+    port: Option<u16>,
+    username: Option<String>,
+    password: Option<String>,
+}
+
+/// Создать прокси-слот (вид `proxy`) — панель, вкладка «Релей».
+///
+/// Это единственный путь создания слотов из панели: воркер-релеи появляются
+/// деплоем, прокси — здесь. Правила совпадают с [`GatewayConfig::validate`]
+/// (id непуст и без «/», host непуст, порт 1..=65535, тип socks5|http), а
+/// сохранение через `update_config` повторно валидирует весь конфиг — битый
+/// слот на диск не попадает даже при пропуске локальной проверки.
+async fn relay_slot_create(
+    State(state): State<AppState>,
+    Json(body): Json<RelaySlotCreateBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let id = body.id.trim().to_string();
+    if id.is_empty() || id.contains('/') {
+        return Err(bad_request(
+            "Имя прокси обязано быть непустым и без «/»".to_string(),
+        ));
+    }
+    if state.config().relays.iter().any(|s| s.id == id) {
+        return Err(bad_request(format!("Слот «{id}» уже существует")));
+    }
+    let kind = body.proxy_type.trim().to_string();
+    if kind != PROXY_TYPE_SOCKS5 && kind != PROXY_TYPE_HTTP {
+        return Err(bad_request(format!(
+            "Тип прокси обязан быть socks5 или http (сейчас «{kind}»)"
+        )));
+    }
+    let host = body.host.trim().to_string();
+    if host.is_empty() {
+        return Err(bad_request("Хост прокси обязателен".to_string()));
+    }
+    let port = body.port.unwrap_or(0);
+    if port == 0 {
+        return Err(bad_request("Порт прокси обязателен (1–65535)".to_string()));
+    }
+    // Слот собирается ДО замыкания: update_config забирает closure move'ом,
+    // а id/kind/host нужны ещё в журнале и ответе ниже.
+    let slot = cloud_routers_core::config::RelaySlot {
+        id: id.clone(),
+        kind: RELAY_KIND_PROXY.into(),
+        proxy_type: Some(kind.clone()),
+        host: Some(host.clone()),
+        port: Some(port),
+        proxy_user: body.username.clone().filter(|u| !u.trim().is_empty()),
+        proxy_password: body.password.clone().filter(|p| !p.trim().is_empty()),
+        ..Default::default()
+    };
+    state
+        .update_config(move |c| {
+            c.relays.push(slot);
+            Ok(())
+        })
+        .map_err(|e| internal(e))?;
+    state
+        .events()
+        .info(format!("добавлен прокси-релей «{id}»: {kind}://{host}:{port}"));
+    notify_host(&state, "relay-slot-created");
+    Ok(Json(serde_json::json!({ "ok": true, "id": id })))
+}
+
+/// Проверка прокси-слота: GET `https://api.ipify.org` через его прокси.
+///
+/// Цель без ключей: ответ — публичный IP выхода, пользователь видит, через
+/// кого пойдут запросы. Латентность — честный сетевой замер. Ошибка
+/// возвращается целиком (текст ответа прокси — причина, а не молчание).
+async fn relay_slot_test(
+    State(state): State<AppState>,
+    Json(body): Json<RelaySlotIdBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let config = state.config();
+    let slot = config
+        .relays
+        .iter()
+        .find(|s| s.id == body.id)
+        .ok_or_else(|| not_found(format!("Слот «{}» не найден", body.id)))?;
+    let spec = crate::upstream::proxy_spec_from_slot(slot).map_err(|e| bad_request(e))?;
+    let client = crate::app::build_proxy_client(&spec).map_err(|e| bad_request(e))?;
+    let started = std::time::Instant::now();
+    let resp = client
+        .get("https://api.ipify.org")
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await
+        .map_err(|e| {
+            let msg = format!("прокси {}: {}", spec.describe(), crate::neterr::describe(&e));
+            log::warn!("cloud-routers: проверка прокси: {msg}");
+            bad_request(msg)
+        })?;
+    let status = resp.status();
+    let ip = resp.text().await.unwrap_or_default();
+    if !status.is_success() || ip.trim().is_empty() {
+        return Err(bad_request(format!(
+            "прокси {} ответил HTTP {}, тело: {}",
+            spec.describe(),
+            status.as_u16(),
+            ip.chars().take(120).collect::<String>()
+        )));
+    }
+    let latency_ms = started.elapsed().as_millis() as u64;
+    state
+        .events()
+        .info(format!("прокси «{}»: проверка прошла, IP выхода {}", body.id, ip.trim()));
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "ip": ip.trim(),
+        "latency_ms": latency_ms,
+        "via": spec.describe(),
+    })))
 }
 
 // ────────────────────────────── Журнал ──────────────────────────────
@@ -1960,6 +2089,8 @@ pub fn router(state: AppState) -> axum::Router<AppState> {
         .route("/api/relay/deploy", axum::routing::post(relay_deploy))
         .route("/api/relay/test", axum::routing::post(relay_test))
         .route("/api/relay/slots", axum::routing::get(relay_slots_list))
+        .route("/api/relay/slots/create", axum::routing::post(relay_slot_create))
+        .route("/api/relay/slots/test", axum::routing::post(relay_slot_test))
         .route("/api/relay/slots/activate", axum::routing::post(relay_slot_activate))
         .route("/api/relay/slots/delete", axum::routing::post(relay_slot_delete))
         .route("/api/events", axum::routing::get(get_events))

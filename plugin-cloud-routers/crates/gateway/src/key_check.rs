@@ -232,6 +232,9 @@ pub struct CheckPlan {
     pub kind: KeyCheckKind,
     pub models: Vec<String>,
     pub via_relay: bool,
+    /// Сетевой прокси плана (слот вида proxy): URL запроса остаётся прямым,
+    /// клиент — выделенный. `None` при воркер-релее и прямых проверках.
+    pub proxy: Option<crate::upstream::ProxySpec>,
     /// Абсолютные URL целей: у Gemini `{root}/models/{model}:countTokens` —
     /// по одному на модель; у OpenRouter один `GET {base}/key`.
     pub target_urls: Vec<String>,
@@ -284,15 +287,33 @@ fn build_gemini_plan(
         .map(|model| check_target_url(&provider.base_url, model))
         .collect::<Result<Vec<_>, _>>()?;
     let via_relay = provider.relay_id.is_some();
-    if via_relay {
-        ensure_relay_route(provider, config)?;
-    }
+    let proxy = resolve_plan_route(provider, config)?;
     Ok(CheckPlan {
         kind: KeyCheckKind::GeminiCountTokens,
         models,
         via_relay,
+        proxy,
         target_urls,
     })
+}
+
+/// Разрешение вида слота для плана проверки — SSOT для Gemini- и
+/// OpenRouter-планов: прокси-слот даёт спеку прокси, воркер-слот проходит
+/// существующий релей-гейт ([`ensure_relay_route`]).
+pub fn resolve_plan_route(
+    provider: &ProviderConfig,
+    config: &GatewayConfig,
+) -> Result<Option<crate::upstream::ProxySpec>, String> {
+    if provider.relay_id.is_none() {
+        return Ok(None);
+    }
+    let slot = crate::upstream::provider_relay_slot(provider, config)?;
+    if slot.kind == cloud_routers_core::config::RELAY_KIND_PROXY {
+        Ok(Some(crate::upstream::proxy_spec_from_slot(slot)?))
+    } else {
+        ensure_relay_route(provider, config)?;
+        Ok(None)
+    }
 }
 
 /// Релей-гейт плана проверки: слот существует (иначе жёсткая ошибка —
@@ -336,22 +357,27 @@ pub async fn run_plan(
     }
 
     let config = state.config();
-    let relay_url = if plan.via_relay {
+    // Прокси-слот: URL запроса остаётся прямым, весь трафик идёт выделенным
+    // клиентом; воркер-заголовки (`x-target-url`/`x-relay-token`) не ставятся.
+    let (relay_url, relay_token) = if plan.proxy.is_some() {
+        (None, None)
+    } else if plan.via_relay {
         let relay = relay_route_base(provider, &config)?;
-        Some(format!("{relay}{RELAY_PATH_PREFIX}"))
+        let token = crate::upstream::relay_route_token(provider, &config)?;
+        (Some(format!("{relay}{RELAY_PATH_PREFIX}")), token)
     } else {
-        None
-    };
-    let relay_token = if plan.via_relay {
-        crate::upstream::relay_route_token(provider, &config)?
-    } else {
-        None
+        (None, None)
     };
 
-    let client = reqwest::Client::builder()
-        .timeout(REQUEST_TIMEOUT)
-        .build()
-        .map_err(|e| format!("не удалось собрать HTTP-клиент: {}", crate::neterr::chain_text(&e)))?;
+    let client = match plan.proxy.as_ref() {
+        Some(spec) => crate::app::build_proxy_client(spec)?,
+        None => reqwest::Client::builder()
+            .timeout(REQUEST_TIMEOUT)
+            .build()
+            .map_err(|e| format!("не удалось собрать HTTP-клиент: {}", crate::neterr::chain_text(&e)))?,
+    };
+    // Воркер-заголовки ставятся только для воркер-релея: у прокси их нет.
+    let use_worker = plan.via_relay && plan.proxy.is_none();
 
     // Метод и способ авторизации — по роду проверки: Gemini шлёт POST с
     // JSON-телом (`x-goog-api-key`), OpenRouter — GET без тела (Bearer).
@@ -371,7 +397,7 @@ pub async fn run_plan(
             let (status, body) = send_one(
                 &client,
                 &request_url,
-                plan.via_relay,
+                use_worker,
                 target,
                 relay_token.as_deref(),
                 // Method не Copy — клон дёшев (внутри Arc).
@@ -456,11 +482,15 @@ pub async fn run_plan(
     }
 
     let (valid, limited, invalid, unknown) = counts(&results);
+    let through = match plan.proxy.as_ref() {
+        Some(spec) => format!("прокси {}", spec.describe()),
+        None if plan.via_relay => "релей".to_string(),
+        None => "напрямую".to_string(),
+    };
     state.events().info(format!(
-        "проверка ключей «{}» (моделей {}) через {}: валидных {valid}, в лимите {limited}, невалидных {invalid}, неизвестно {unknown}",
+        "проверка ключей «{}» (моделей {}) через {through}: валидных {valid}, в лимите {limited}, невалидных {invalid}, неизвестно {unknown}",
         provider.name,
-        plan.models.len(),
-        if plan.via_relay { "релей" } else { "напрямую" }
+        plan.models.len()
     ));
 
     let free_usage = match plan.kind {

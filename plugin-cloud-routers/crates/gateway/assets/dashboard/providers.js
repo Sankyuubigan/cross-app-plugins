@@ -105,13 +105,19 @@ function providerCard(p) {
     : '';
 
   // Релей — селект привязки (27.10.2026): «напрямую» или конкретный слот.
-  // Слоты без URL показаны заблокированными: привязывать к ним нечего,
-  // маршрут упал бы честной ошибкой «URL релея не задан».
+  // Воркер-слоты без URL показаны заблокированными: привязывать к ним нечего,
+  // маршрут упал бы честной ошибкой «URL релея не задан». Прокси-слот валиден
+  // по host:port — подпись показывает адрес, битый блокируется.
   const relayOptions = (state.relaySlots || [])
-    .map(s =>
-      `<option value="${esc(s.id)}" ${s.url ? '' : 'disabled'}${
-        p.relay_id === s.id ? ' selected' : ''}>${esc(s.id)}${s.url ? '' : ' (нет URL)'}</option>`
-    )
+    .map(s => {
+      const isProxy = s.kind === 'proxy';
+      const ok = isProxy ? Boolean(s.host && s.port) : Boolean(s.url);
+      const label = isProxy
+        ? `${esc(s.id)} ${esc(s.host || '')}:${esc(String(s.port ?? ''))}`
+        : `${esc(s.id)}${s.url ? '' : ' (нет URL)'}`;
+      return `<option value="${esc(s.id)}" ${ok ? '' : 'disabled'}${
+        p.relay_id === s.id ? ' selected' : ''}>${label}</option>`;
+    })
     .join('');
   const relaySelect =
     `<label class="gw-inline">релей ` +

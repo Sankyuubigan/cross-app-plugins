@@ -50,6 +50,9 @@ struct Inner {
     write_lock: Mutex<()>,
     rotation: KeyRotation,
     http: reqwest::Client,
+    /// Кеш выделенных прокси-клиентов (слоты вида proxy). Ключ — полная спека
+    /// «тип|хост|порт|логин|пароль»: пул соединений живёт между запросами.
+    proxy_clients: Mutex<std::collections::BTreeMap<String, reqwest::Client>>,
     events: EventLog,
     oauth: crate::kiro_oauth::OAuthState,
     /// Счётчик бесплатных (`:free`) запросов OpenRouter — файл состояния
@@ -90,6 +93,7 @@ impl AppState {
                 write_lock: Mutex::new(()),
                 rotation: KeyRotation::new(),
                 http,
+                proxy_clients: Mutex::new(std::collections::BTreeMap::new()),
                 events: EventLog::new(),
                 oauth: crate::kiro_oauth::OAuthState::new(),
                 free_usage: crate::free_usage::FreeUsageState::new(data_dir),
@@ -113,6 +117,39 @@ impl AppState {
 
     pub fn http(&self) -> &reqwest::Client {
         &self.inner.http
+    }
+
+    /// Клиент для маршрута: общий (без прокси) или выделенный прокси-клиент.
+    ///
+    /// Прокси-клиенты кешируются по полной спеке (включая логин/пароль —
+    /// смена креденшелов обязана менять клиент): `reqwest::Client` — дешёвый
+    /// клон поверх Arc, пул соединений живёт между запросами.
+    pub fn http_for(
+        &self,
+        proxy: Option<&crate::upstream::ProxySpec>,
+    ) -> Result<reqwest::Client, String> {
+        let Some(spec) = proxy else {
+            return Ok(self.inner.http.clone());
+        };
+        let key = format!(
+            "{}|{}|{}|{}|{}",
+            spec.kind,
+            spec.host,
+            spec.port,
+            spec.user.as_deref().unwrap_or(""),
+            spec.password.as_deref().unwrap_or("")
+        );
+        let mut cache = self
+            .inner
+            .proxy_clients
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if let Some(client) = cache.get(&key) {
+            return Ok(client.clone());
+        }
+        let client = build_proxy_client(spec)?;
+        cache.insert(key, client.clone());
+        Ok(client)
     }
 
     pub fn events(&self) -> &EventLog {
@@ -214,6 +251,50 @@ fn build_http_client() -> Result<reqwest::Client, String> {
         .map_err(|e| format!("Не удалось создать HTTP-клиент: {}", crate::neterr::chain_text(&e)))
 }
 
+/// Клиент, весь трафик которого идёт через указанный сетевой прокси.
+///
+/// Явный прокси из конфига: reqwest при наличии явного `.proxy()` не читает
+/// env/системный прокси (документированное поведение), значит «прокси в
+/// прокси» конструктивно невозможен. SOCKS5 передаёт имена хостов прокси-
+/// серверу (`socks5h`): цель фичи — обход локальных блокировок, на которых
+/// локальный DNS может резолвить целевой домен в заглушку.
+pub(crate) fn build_proxy_client(spec: &crate::upstream::ProxySpec) -> Result<reqwest::Client, String> {
+    use cloud_routers_core::config::{PROXY_TYPE_HTTP, PROXY_TYPE_SOCKS5};
+    let scheme = match spec.kind.as_str() {
+        PROXY_TYPE_SOCKS5 => "socks5h",
+        PROXY_TYPE_HTTP => "http",
+        other => {
+            return Err(format!("Неизвестный тип прокси «{other}» (ожидали socks5 или http)"));
+        }
+    };
+    let mut proxy = reqwest::Proxy::all(format!("{}://{}:{}", scheme, spec.host, spec.port))
+        .map_err(|e| {
+            format!(
+                "Прокси «{}» не собрался: {}",
+                spec.describe(),
+                crate::neterr::chain_text(&e)
+            )
+        })?;
+    if let Some(user) = spec.user.as_deref().filter(|u| !u.trim().is_empty()) {
+        proxy = proxy.basic_auth(user, spec.password.as_deref().unwrap_or(""));
+    }
+    reqwest::Client::builder()
+        .proxy(proxy)
+        .connect_timeout(CONNECT_TIMEOUT)
+        .read_timeout(READ_TIMEOUT)
+        .pool_idle_timeout(Duration::from_secs(90))
+        .tcp_keepalive(Duration::from_secs(30))
+        .user_agent(format!("cloud-routers-gateway/{}", cloud_routers_core::VERSION))
+        .build()
+        .map_err(|e| {
+            format!(
+                "Не удалось создать прокси-клиент {}: {}",
+                spec.describe(),
+                crate::neterr::chain_text(&e)
+            )
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,6 +344,54 @@ mod tests {
             src.contains(".no_proxy()"),
             "build_http_client потерял `no_proxy()` — reqwest снова начнёт читать системный/env-прокси при сборке, и невалидный прокси окружения даст «builder error» на каждом запросе"
         );
+    }
+
+    #[test]
+    fn proxy_client_is_built_for_valid_specs_and_named_on_bad_type() {
+        let ok = crate::upstream::ProxySpec {
+            kind: "socks5".into(),
+            host: "127.0.0.1".into(),
+            port: 1080,
+            user: None,
+            password: None,
+        };
+        build_proxy_client(&ok).expect("socks5 клиент собирается без сети");
+        let ok_http = crate::upstream::ProxySpec { kind: "http".into(), ..ok.clone() };
+        build_proxy_client(&ok_http).expect("http клиент собирается без сети");
+        let bad = crate::upstream::ProxySpec { kind: "gre".into(), ..ok };
+        let err = build_proxy_client(&bad).expect_err("неизвестный тип обязан падать");
+        assert!(err.contains("Неизвестный тип прокси"), "{err}");
+    }
+
+    #[test]
+    fn proxy_client_cache_reuses_entries_per_spec() {
+        // Две разные спеки — две записи кеша; повторный вызов по той же спеке
+        // новых записей не добавляет (пул соединений переиспользуется).
+        let d = tmp_dir("proxycache");
+        let st = AppState::new(&d).expect("state");
+        let spec_a = crate::upstream::ProxySpec {
+            kind: "socks5".into(),
+            host: "127.0.0.1".into(),
+            port: 1080,
+            user: None,
+            password: None,
+        };
+        st.http_for(Some(&spec_a)).expect("первый вызов");
+        st.http_for(Some(&spec_a)).expect("второй вызов");
+        let spec_b = crate::upstream::ProxySpec { port: 1081, ..spec_a.clone() };
+        st.http_for(Some(&spec_b)).expect("другая спека");
+        let cache = st.inner.proxy_clients.lock().unwrap();
+        assert_eq!(cache.len(), 2, "спеки A и B — две записи; дубликат A не добавляет");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn http_for_without_proxy_returns_shared_client_and_skips_cache() {
+        let d = tmp_dir("noproxy");
+        let st = AppState::new(&d).expect("state");
+        assert!(st.http_for(None).is_ok());
+        assert!(st.inner.proxy_clients.lock().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

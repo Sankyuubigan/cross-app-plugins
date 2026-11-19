@@ -421,7 +421,18 @@ async fn route_provider(
                 ))
             }
         };
-        let req = build_reqwest(&state, &up);
+        let req = match build_reqwest(&state, &up) {
+            Ok(r) => r,
+            // Сборка запроса упала на конфигурации сервера (битый прокси-клиент),
+            // а не на запросе клиента: ретраи другим ключом не починят её.
+            Err(e) => {
+                return AttemptOutcome::Broken(openai_error(
+                    StatusCode::BAD_GATEWAY,
+                    e,
+                    "configuration_error",
+                ))
+            }
+        };
         if !request_dumped {
             request_dumped = true;
             // Query не пишется: у части провайдеров ключ живёт в query-параметре
@@ -430,9 +441,14 @@ async fn route_provider(
             let stream = payload.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
             state.dump().request(requested_model, &provider_id, &key_id, url, stream, &up.body);
         }
+        let via_proxy = up
+            .route
+            .proxy()
+            .map(|spec| format!(" (через прокси {})", spec.describe()))
+            .unwrap_or_default();
         state.events().info(format!(
-            "запрос {} → провайдер «{}» модель «{}» ключ {}",
-            requested_model, provider_id, upstream_model, key_id
+            "запрос {} → провайдер «{}» модель «{}» ключ {}{}",
+            requested_model, provider_id, upstream_model, key_id, via_proxy
         ));
 
         let attempt_started = Instant::now();
@@ -705,22 +721,31 @@ async fn build_passthrough_response(
 ///
 /// Вся политика (метод, путь, заголовки, `content-type` только при непустом
 /// теле) живёт в адаптерах (`protocol.rs`). Здесь только перенос в `reqwest`:
-/// дублировать политику в двух местах запрещено.
+/// дублировать политику в двух местах запрещено. Клиент берётся по маршруту:
+/// прокси-маршрут идёт выделенным клиентом (`AppState::http_for`), остальные —
+/// общим.
 ///
 /// `accept-encoding` намеренно не пересылается: клиентский клиент сжатия не
 /// должен влиять на то, что получит шлюз. Ответ приходит без сжатия, и поток
 /// читается без распаковки на лету.
-fn build_reqwest(state: &AppState, up: &crate::protocol::UpstreamRequest) -> reqwest::Request {
-    let mut req = state.http().request(up.method.clone(), up.route.request_url());
+fn build_reqwest(
+    state: &AppState,
+    up: &crate::protocol::UpstreamRequest,
+) -> Result<reqwest::Request, String> {
+    let client = state.http_for(up.route.proxy())?;
+    let mut req = client.request(up.method.clone(), up.route.request_url());
     for (name, value) in up.headers.iter() {
         req = req.header(name, value);
     }
-    // `body()` уже проверяет, что тело — `Vec<u8>`, поэтому `build()` здесь не
-    // падает: единственная причина ошибки здесь — сетевой уровень, и она
-    // всплывёт при отправке с понятным текстом.
-    req.body(up.body.clone()).build().expect(
-        "тело — Vec<u8>; ошибку сборки дать не может (бывший инвариант build_request)",
-    )
+    // Тело — `Vec<u8>`, ошибка сборки при этом не ожидается; на всякий случай
+    // она конвертируется честно (panic в сервере — не вариант).
+    req.body(up.body.clone()).build().map_err(|e| {
+        format!(
+            "не собрался запрос к {}: {}",
+            up.route.request_url(),
+            crate::neterr::chain_text(&e)
+        )
+    })
 }
 
 /// Ответ клиенту по последней неуспешной попытке.
@@ -822,7 +847,7 @@ pub async fn fetch_provider_models(
     let adapter = crate::protocol::adapter_for(provider.protocol)?;
     let credential = credential_for(state, provider).await?;
     let up = adapter.models_request(provider, config, &credential)?;
-    let req = build_reqwest(state, &up);
+    let req = build_reqwest(state, &up)?;
     let response = state.http().execute(req).await.map_err(|e| {
         format!("Не удалось получить список моделей у «{}»: {}", provider.name, crate::neterr::describe(&e))
     })?;
@@ -895,7 +920,8 @@ pub async fn ping_provider(
     let credential = credential_for(state, provider).await?;
     let up = adapter.models_request(provider, config, &credential)?;
     let started = std::time::Instant::now();
-    let response = state.http().execute(build_reqwest(state, &up)).await.map_err(|e| {
+    let req = build_reqwest(state, &up)?;
+    let response = state.http().execute(req).await.map_err(|e| {
         format!("Не удалось связаться с провайдером «{}»: {}", provider.name, crate::neterr::describe(&e))
     })?;
     let status = response.status();
@@ -913,7 +939,8 @@ pub async fn ping_provider(
     Ok(PingResult {
         latency_ms,
         models_count,
-        via_relay: up.route.is_relay(),
+        // Прокси тоже релей для пользователя: подпись «(через релей)» честна.
+        via_relay: up.route.is_relay() || up.route.proxy().is_some(),
         target: trim_base_url(&provider.base_url),
     })
 }

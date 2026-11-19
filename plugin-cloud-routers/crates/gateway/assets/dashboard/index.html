@@ -84,9 +84,10 @@
 <!-- ────────────────────────────── Релей ────────────────────────────── -->
 <section class="gw-page" id="page-relay" hidden>
   <div class="gw-note">
-    Релей — воркер на Vercel или Cloudflare Workers. Он нужен, когда провайдер
-    недоступен из вашей сети (региональная блокировка или фильтрация трафика):
-    запросы выходят с территории платформы релея.
+    Релей — воркер на Vercel или Cloudflare Workers либо сетевой прокси. Нужен,
+    когда провайдер недоступен из вашей сети (региональная блокировка или
+    фильтрация трафика): воркер выводит запросы с территории платформы релея,
+    прокси — через ваш прокси-сервер.
   </div>
 
   <div class="gw-card">
@@ -105,11 +106,46 @@
     <h3>Мои релеи</h3>
     <div id="relay-slots" class="gw-cards"></div>
     <div class="gw-hint">
-      Каждый провайдер выбирает свой релей в своей карточке на вкладке
-      «Провайдеры»; новые провайдеры наследуют релей по умолчанию (кнопка
-      «Назначить по умолчанию»). Секрет <code>RELAY_TOKEN</code> общий для всех
-      релеев.
+      Каждый провайдер выбирает свой релей (воркер или прокси) в своей карточке
+      на вкладке «Провайдеры»; новые провайдеры наследуют релей по умолчанию
+      (кнопка «Назначить по умолчанию»). Секрет <code>RELAY_TOKEN</code> общий
+      для всех воркер-релеев.
     </div>
+  </div>
+
+  <div class="gw-card">
+    <h3>Добавить сетевой прокси</h3>
+    <div class="gw-hint">
+      Прокси — ещё один вид релея: запросы к привязанному провайдеру идут через
+      ваш прокси-сервер (SOCKS5 или HTTP). SOCKS5 передаёт имена хостов прокси —
+      DNS тоже работает через него. Логин и пароль нужны только если прокси
+      требует авторизации.
+    </div>
+    <label>Имя прокси
+      <input id="proxy-name-input" type="text" placeholder="my-proxy" autocomplete="off">
+    </label>
+    <label>Тип
+      <select id="proxy-type-input">
+        <option value="socks5">SOCKS5</option>
+        <option value="http">HTTP</option>
+      </select>
+    </label>
+    <label>Хост
+      <input id="proxy-host-input" type="text" placeholder="127.0.0.1" autocomplete="off">
+    </label>
+    <label>Порт
+      <input id="proxy-port-input" type="number" min="1" max="65535" placeholder="1080">
+    </label>
+    <label>Логин (необязательно)
+      <input id="proxy-user-input" type="text" autocomplete="off">
+    </label>
+    <label>Пароль (необязательно)
+      <input id="proxy-password-input" type="password" autocomplete="off">
+    </label>
+    <div class="gw-row">
+      <button id="btn-proxy-add" class="gw-primary">Добавить прокси</button>
+    </div>
+    <div id="proxy-add-result" class="gw-hint"></div>
   </div>
 
   <div class="gw-card">

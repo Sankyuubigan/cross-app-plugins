@@ -21,8 +21,13 @@
 //! Список кандидатов — [`source_candidates`]. Первый пункт (рядом с exe хоста)
 //! срабатывает, когда сборка хоста кладёт шлюз в комплект как ресурс. Второй
 //! (каталог `target` этого workspace) — на машине, где плагин собирается из
-//! исходников. Ни один не найден → ошибка со **всеми** проверенными путями:
-//! молчаливый отказ выглядел бы в UI как «установлено».
+//! исходников при workspace-выводе cargo. Третий — глобальный target-dir cargo
+//! (env `CARGO_TARGET_DIR` / `~/.cargo/config.toml → build.target-dir`):
+//! 16.11.2026 все проекты этой машины собираются в `D:/Programs/cargo-target`,
+//! и без этого кандидата «Проверить обновления» падало «не найден бинарь» при
+//! живой release-сборке (кейс Задачи 1, 19.11.2026). Ни один не найден →
+//! ошибка со **всеми** проверенными путями: молчаливый отказ выглядел бы в UI
+//! как «установлено».
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -39,6 +44,96 @@ use crate::router::installer::{InstalledInfo, ProgressFn};
 /// переименование крейта тихо оставило бы установщик искать несуществующий файл.
 pub fn gateway_binary_name(exe_file: &str) -> String {
     format!("{}.exe", exe_file)
+}
+
+/// Каталог cargo home (для чтения `config.toml`): env `CARGO_HOME`, иначе
+/// профиль пользователя. Крейт `dirs` ради одного пути не тянем.
+fn cargo_home() -> Option<PathBuf> {
+    if let Ok(home) = std::env::var("CARGO_HOME") {
+        if !home.trim().is_empty() {
+            return Some(PathBuf::from(home));
+        }
+    }
+    let profile = if cfg!(windows) {
+        std::env::var("USERPROFILE").ok()
+    } else {
+        std::env::var("HOME").ok()
+    };
+    profile
+        .filter(|p| !p.trim().is_empty())
+        .map(|h| PathBuf::from(h).join(".cargo"))
+}
+
+/// Значение TOML-строки: кавычки (двойные/одинарные) снимаются до закрывающей,
+/// голое значение обрезается по inline-комменту. `None` — пусто.
+fn quoted_value(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if let Some(rest) = raw.strip_prefix('"') {
+        let end = rest.find('"')?;
+        return Some(rest[..end].to_string());
+    }
+    if let Some(rest) = raw.strip_prefix('\'') {
+        let end = rest.find('\'')?;
+        return Some(rest[..end].to_string());
+    }
+    let bare = raw.split('#').next().unwrap_or("").trim();
+    if bare.is_empty() {
+        None
+    } else {
+        Some(bare.to_string())
+    }
+}
+
+/// Распарсить `build.target-dir` из текста cargo-конфига. Полный TOML-парсер
+/// ради одной строки не нужен: секция `[build]`, в ней `target-dir = "…"`.
+/// Секции заголовками перещёлкиваются, поэтому ключ из другой секции не примет.
+fn parse_build_target_dir(text: &str) -> Option<PathBuf> {
+    let mut in_build = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('[') && line.ends_with(']') {
+            in_build = line == "[build]";
+            continue;
+        }
+        if in_build {
+            if let Some(rest) = line.strip_prefix("target-dir") {
+                if let Some(value) = rest.trim_start().strip_prefix('=') {
+                    if let Some(dir) = quoted_value(value) {
+                        if !dir.trim().is_empty() {
+                            return Some(PathBuf::from(dir));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Глобальный target-dir cargo, если он переопределён: env `CARGO_TARGET_DIR`,
+/// затем `config.toml` из [`cargo_home`] (`[build] target-dir`). Порядок — как
+/// у самого cargo (env сильнее конфига). Пустой результат = сборки идут в
+/// workspace `target/`, дополнительный кандидат не нужен.
+fn cargo_target_dirs() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(dir) = std::env::var("CARGO_TARGET_DIR") {
+        let dir = dir.trim();
+        if !dir.is_empty() {
+            out.push(PathBuf::from(dir));
+        }
+    }
+    let Some(home) = cargo_home() else {
+        return out;
+    };
+    let Ok(text) = std::fs::read_to_string(home.join("config.toml")) else {
+        return out;
+    };
+    if let Some(dir) = parse_build_target_dir(&text) {
+        if !out.iter().any(|d| d == &dir) {
+            out.push(dir);
+        }
+    }
+    out
 }
 
 /// Кандидаты на путь к готовому бинарю, в порядке приоритета.
@@ -66,6 +161,15 @@ pub fn source_candidates(exe_file: &str) -> Vec<PathBuf> {
         let target = workspace.join("target");
         out.push(target.join("release").join(&name));
         out.push(target.join("debug").join(&name));
+    }
+
+    // Глобальный target-dir cargo: 16.11.2026 на этой машине `build.target-dir`
+    // в `~/.cargo/config.toml` уводит ВСЕ сборки в общий каталог, и workspace
+    // `target/` остаётся пустым. Без этих кандидатов «Проверить обновления»
+    // перечисляла пути, мимо которых бинарь собран (кейс Задачи 1, 19.11.2026).
+    for dir in cargo_target_dirs() {
+        out.push(dir.join("release").join(&name));
+        out.push(dir.join("debug").join(&name));
     }
 
     out
@@ -372,6 +476,49 @@ mod tests {
         let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("workspace");
         assert!(cands.contains(&workspace.join("target").join("release").join("cloud-routers-gateway.exe")));
         assert!(cands.contains(&workspace.join("target").join("debug").join("cloud-routers-gateway.exe")));
+    }
+
+    #[test]
+    fn parse_build_target_dir_reads_global_config_format() {
+        // Формат реального `~/.cargo/config.toml` этой машины (16.11.2026):
+        // секция [build] с комментариями и соседними ключами.
+        let text = r#"
+[build]
+rustc-wrapper = "sccache"
+# ОБЩИЙ target-dir (16.11.2026): все проекты строятся в одну папку.
+target-dir = "D:/Programs/cargo-target"
+jobs = 12
+"#;
+        assert_eq!(
+            parse_build_target_dir(text).as_deref(),
+            Some(std::path::Path::new("D:/Programs/cargo-target")),
+            "глобальный target-dir — источник кандидатов для find_source"
+        );
+    }
+
+    #[test]
+    fn parse_build_target_dir_honest_none_cases() {
+        assert_eq!(parse_build_target_dir(""), None, "пустой конфиг");
+        assert_eq!(
+            parse_build_target_dir("[env]\ntarget-dir = \"elsewhere\"\n"),
+            None,
+            "ключ вне [build] не принимается"
+        );
+        assert_eq!(
+            parse_build_target_dir("[build]\nrustc-wrapper = \"sccache\"\n"),
+            None,
+            "секция есть, ключа нет — workspace target/ остаётся источником"
+        );
+        assert_eq!(
+            parse_build_target_dir("[build]\ntarget-dir = 'D:/x'\n").as_deref(),
+            Some(std::path::Path::new("D:/x")),
+            "одинарные кавычки — тоже TOML-строка"
+        );
+        assert_eq!(
+            parse_build_target_dir("[build]\ntarget-dir = D:/bare # comment\n").as_deref(),
+            Some(std::path::Path::new("D:/bare")),
+            "голое значение обрезается по inline-комменту"
+        );
     }
 
     #[test]

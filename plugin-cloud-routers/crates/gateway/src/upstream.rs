@@ -41,7 +41,9 @@
 //! routing-заголовок.
 
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
-use cloud_routers_core::config::{GatewayConfig, ProviderConfig, RelaySlot};
+use cloud_routers_core::config::{
+    GatewayConfig, ProviderConfig, RelaySlot, RELAY_KIND_PROXY, PROXY_TYPE_HTTP, PROXY_TYPE_SOCKS5,
+};
 
 /// Префикс пути релея, под которым живёт Edge-воркер.
 pub const RELAY_PATH_PREFIX: &str = "/api/gateway";
@@ -70,26 +72,69 @@ const FORWARD_EXACT: &[&str] = &["content-type", "accept", "accept-language"];
 /// провайдера (он по ней видит, что запрос пришёл из совместимого SDK).
 const FORWARD_PREFIXES: &[&str] = &["openai-", "anthropic-", "x-stainless-"];
 
-/// Куда уходит запрос: напрямую провайдеру или через релей.
+/// Спецификация сетевого прокси (слот вида [`RELAY_KIND_PROXY`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProxySpec {
+    /// Тип: [`PROXY_TYPE_SOCKS5`] или [`PROXY_TYPE_HTTP`].
+    pub kind: String,
+    /// Хост прокси-сервера (имя или IP).
+    pub host: String,
+    /// Порт прокси-сервера.
+    pub port: u16,
+    /// Логин прокси (не задан/пуст — без авторизации).
+    pub user: Option<String>,
+    /// Пароль прокси (опционален).
+    pub password: Option<String>,
+}
+
+impl ProxySpec {
+    /// Человекочитаемый адрес для логов, вида «socks5://host:port».
+    pub fn describe(&self) -> String {
+        format!("{}://{}:{}", self.kind, self.host, self.port)
+    }
+}
+
+/// Куда уходит запрос: напрямую, через воркер-релей или через сетевой прокси.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Route {
     /// Прямое подключение.
     Direct { url: String },
-    /// Через Vercel-релей.
+    /// Через воркер-релей (Vercel/Cloudflare): запрос уходит на релей, цель —
+    /// абсолютным URL в заголовке `x-target-url`.
     Relay { url: String, target_url: String, token: Option<String> },
+    /// Через сетевой прокси: URL остаётся прямым, но соединение идёт через
+    /// прокси-сервер (SOCKS5/HTTP). Проксируется только трафик к провайдерам.
+    Proxied { url: String, proxy: ProxySpec },
 }
 
 impl Route {
     /// URL, который будет запрошен у релея или у провайдера.
     pub fn request_url(&self) -> &str {
         match self {
-            Route::Direct { url } => url,
+            Route::Direct { url } | Route::Proxied { url, .. } => url,
             Route::Relay { url, .. } => url,
+        }
+    }
+
+    /// Целевой URL апстрима: для воркер-релея — то, что уйдёт в
+    /// `x-target-url`; для прямых и прокси-маршрутов — сам URL.
+    pub fn target_url(&self) -> &str {
+        match self {
+            Route::Relay { target_url, .. } => target_url,
+            Route::Direct { url } | Route::Proxied { url, .. } => url,
         }
     }
 
     pub fn is_relay(&self) -> bool {
         matches!(self, Route::Relay { .. })
+    }
+
+    /// Сетевой прокси маршрута, если он есть.
+    pub fn proxy(&self) -> Option<&ProxySpec> {
+        match self {
+            Route::Proxied { proxy, .. } => Some(proxy),
+            _ => None,
+        }
     }
 }
 
@@ -166,12 +211,76 @@ pub fn relay_route_base(provider: &ProviderConfig, config: &GatewayConfig) -> Re
     }
 }
 
+/// Сетевой прокси из слота вида proxy — или причина невозможности.
+///
+/// Жёсткая ошибка при битой спеке: пользователь привязал прокси, потому что
+/// прямой доступ не работает; молчаливый прямой запрос выглядел бы как
+/// «прокси сломался» (тот же принцип, что у воркер-релея без URL — тест
+/// `broken_proxy_slot_is_a_hard_error_not_silent_direct`).
+pub fn proxy_spec_from_slot(slot: &RelaySlot) -> Result<ProxySpec, String> {
+    let mut missing: Vec<&str> = Vec::new();
+    let host = slot.host.as_deref().map(str::trim).filter(|h| !h.is_empty());
+    if host.is_none() {
+        missing.push("хост");
+    }
+    let port = slot.port.filter(|p| *p != 0);
+    if port.is_none() {
+        missing.push("порт");
+    }
+    let kind = slot.proxy_type.as_deref().unwrap_or("");
+    if kind != PROXY_TYPE_SOCKS5 && kind != PROXY_TYPE_HTTP {
+        missing.push("тип (socks5|http)");
+    }
+    if !missing.is_empty() {
+        return Err(format!(
+            "Прокси-релей «{}» настроен не полностью: не задан(ы) {}. Заполните слот на вкладке «Релей».",
+            slot.id,
+            missing.join(", ")
+        ));
+    }
+    Ok(ProxySpec {
+        kind: kind.to_string(),
+        host: host.expect("проверено выше").to_string(),
+        port: port.expect("проверено выше"),
+        user: slot.proxy_user.clone().filter(|u| !u.trim().is_empty()),
+        password: slot.proxy_password.clone().filter(|p| !p.trim().is_empty()),
+    })
+}
+
+/// Маршрут с учётом вида слота, когда прямой URL уже собран (Kiro-протокол).
+///
+/// Общий источник вида слота для `resolve_route` и Kiro: воркер-релей
+/// (`Relay`, склейка `{relay}{RELAY_PATH_PREFIX}{relay_suffix}`) или сетевой
+/// прокси (`Proxied`, URL остаётся прямым). Так правило вида слота действует
+/// во всех маршрутизаторах сразу, а не в копиях, до которых дошли руки.
+pub fn route_with_relay_slot(
+    provider: &ProviderConfig,
+    config: &GatewayConfig,
+    direct_url: String,
+    relay_suffix: &str,
+) -> Result<Route, String> {
+    let slot = provider_relay_slot(provider, config)?;
+    if slot.kind == RELAY_KIND_PROXY {
+        return Ok(Route::Proxied {
+            url: direct_url,
+            proxy: proxy_spec_from_slot(slot)?,
+        });
+    }
+    let relay = relay_route_base(provider, config)?;
+    Ok(Route::Relay {
+        url: format!("{relay}{RELAY_PATH_PREFIX}{relay_suffix}"),
+        target_url: direct_url,
+        token: relay_route_token(provider, config)?,
+    })
+}
+
 /// Собрать маршрут для апстрим-пути — ресурс **относительно** `base_url`.
 ///
 /// `base_url` включает версионный сегмент (конвенция модуля), путь ресурса —
 /// без версии: `MODELS_PATH`, `CHAT_COMPLETIONS_PATH`. Релей получает
 /// `{relay}{RELAY_PATH_PREFIX}{path}`, а цель — абсолютным URL в
-/// `x-target-url`.
+/// `x-target-url`; сетевой прокси оставляет URL прямым (спека — в
+/// `Route::Proxied`).
 pub fn resolve_route(
     provider: &ProviderConfig,
     config: &GatewayConfig,
@@ -181,12 +290,7 @@ pub fn resolve_route(
     if provider.relay_id.is_none() {
         return Ok(Route::Direct { url: direct });
     }
-    let relay = relay_route_base(provider, config)?;
-    Ok(Route::Relay {
-        url: format!("{relay}{RELAY_PATH_PREFIX}{upstream_path}"),
-        target_url: direct,
-        token: relay_route_token(provider, config)?,
-    })
+    route_with_relay_slot(provider, config, direct, upstream_path)
 }
 
 /// Отобрать заголовки клиента для пересылки апстриму.
@@ -250,7 +354,7 @@ pub fn auth_header(api_key: &str) -> HeaderValue {
 /// Добавить служебные заголовки маршрута (релей или `User-Agent`).
 pub fn apply_route_headers(route: &Route, headers: &mut HeaderMap) {
     match route {
-        Route::Direct { .. } => {}
+        Route::Direct { .. } | Route::Proxied { .. } => {}
         Route::Relay { target_url, token, .. } => {
             if let Ok(v) = HeaderValue::from_str(target_url) {
                 headers.insert(HeaderName::from_static(HDR_TARGET_URL), v);
@@ -377,6 +481,80 @@ mod tests {
         let err = resolve_route(&p, &config_with_slots(&[]), CHAT_COMPLETIONS_PATH)
             .expect_err("must fail");
         assert!(err.contains("ghost"), "{err}");
+    }
+
+    #[test]
+    fn proxy_slot_routes_direct_url_with_spec() {
+        // Прокси-слот не переписывает URL (у воркера — своя склейка путей):
+        // запрос идёт на прямую цель, проксируются только соединения.
+        let p = provider("https://api.groq.com/openai/v1", Some("px"));
+        let mut s = slot("px", None, None);
+        s.kind = RELAY_KIND_PROXY.into();
+        s.proxy_type = Some(PROXY_TYPE_SOCKS5.into());
+        s.host = Some("127.0.0.1".into());
+        s.port = Some(1080);
+        let r = resolve_route(&p, &config_with_slots(&[s]), CHAT_COMPLETIONS_PATH).expect("route");
+        match &r {
+            Route::Proxied { url, proxy } => {
+                assert_eq!(url, "https://api.groq.com/openai/v1/chat/completions");
+                assert_eq!(proxy.kind, PROXY_TYPE_SOCKS5);
+                assert_eq!(proxy.port, 1080);
+            }
+            other => panic!("ожидался Proxied, получен {:?}", other),
+        }
+        assert!(!r.is_relay());
+        assert!(r.proxy().is_some());
+    }
+
+    #[test]
+    fn broken_proxy_slot_is_a_hard_error_not_silent_direct() {
+        // Пользователь привязал прокси, потому что прямой доступ не работает:
+        // битая спека обязана ронять запрос с именем недостающего поля.
+        let p = provider("https://api.groq.com/openai/v1", Some("px"));
+        let mut s = slot("px", None, None);
+        s.kind = RELAY_KIND_PROXY.into();
+        let err = resolve_route(&p, &config_with_slots(&[s]), CHAT_COMPLETIONS_PATH)
+            .expect_err("must fail");
+        assert!(err.contains("настроен не полностью"), "{err}");
+        assert!(err.contains("хост"), "{err}");
+    }
+
+    #[test]
+    fn proxied_route_adds_no_relay_headers() {
+        let p = provider("https://api.groq.com/openai/v1", Some("px"));
+        let mut s = slot("px", None, None);
+        s.kind = RELAY_KIND_PROXY.into();
+        s.proxy_type = Some(PROXY_TYPE_HTTP.into());
+        s.host = Some("proxy.local".into());
+        s.port = Some(3128);
+        let route = resolve_route(&p, &config_with_slots(&[s]), CHAT_COMPLETIONS_PATH).expect("route");
+        let mut h = HeaderMap::new();
+        apply_route_headers(&route, &mut h);
+        assert!(h.get(HDR_TARGET_URL).is_none());
+        assert!(h.get(HDR_RELAY_TOKEN).is_none());
+    }
+
+    #[test]
+    fn kiro_route_helper_supports_proxy_slot() {
+        // route_with_relay_slot — общий источник вида слота для Kiro: прокси
+        // обязан резолвиться так же, как в resolve_route.
+        let p = provider("https://kiro.api", Some("px"));
+        let mut s = slot("px", None, None);
+        s.kind = RELAY_KIND_PROXY.into();
+        s.proxy_type = Some(PROXY_TYPE_HTTP.into());
+        s.host = Some("proxy.local".into());
+        s.port = Some(3128);
+        let r = route_with_relay_slot(
+            &p,
+            &config_with_slots(&[s]),
+            "https://kiro.api/models".into(),
+            "ListAvailableModels",
+        )
+        .expect("route");
+        match &r {
+            Route::Proxied { url, .. } => assert_eq!(url, "https://kiro.api/models"),
+            other => panic!("ожидался Proxied, получен {:?}", other),
+        }
     }
 
     #[test]

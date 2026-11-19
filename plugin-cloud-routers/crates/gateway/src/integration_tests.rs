@@ -1009,6 +1009,7 @@ fn gemini_check_plan(base: &str) -> crate::key_check::CheckPlan {
         kind: crate::key_check::KeyCheckKind::GeminiCountTokens,
         models: vec!["gemini-2.0-flash".into()],
         via_relay: false,
+        proxy: None,
         target_urls: vec![format!("{base}/v1beta/models/gemini-2.0-flash:countTokens")],
     }
 }

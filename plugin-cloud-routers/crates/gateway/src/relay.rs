@@ -528,6 +528,7 @@ fn save_deployed_url(state: &AppState, url: &str, relay_secret: &str) -> Result<
                 relay_secret: Some(secret),
                 cf_account_id: None,
                 cf_script_name: None,
+                ..Default::default()
             });
             "vercel".to_string()
         };
@@ -947,6 +948,7 @@ mod tests {
                     relay_secret: Some("old-tok".into()),
                     cf_account_id: None,
                     cf_script_name: None,
+                    ..Default::default()
                 });
                 c.relays.push(cloud_routers_core::config::RelaySlot {
                     id: "cloudflare".into(),
@@ -955,6 +957,7 @@ mod tests {
                     relay_secret: Some("cf-tok".into()),
                     cf_account_id: Some("acc".into()),
                     cf_script_name: Some("relay".into()),
+                    ..Default::default()
                 });
                 Ok(())
             })

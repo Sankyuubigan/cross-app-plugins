@@ -175,7 +175,7 @@ function relayKindSync() {
 
 // ─────────────────────── слоты релеев ───────────────────────
 
-const SLOT_KIND_NAMES = { vercel: 'Vercel', cloudflare: 'Cloudflare Workers' };
+const SLOT_KIND_NAMES = { vercel: 'Vercel', cloudflare: 'Cloudflare Workers', proxy: 'Сетевой прокси' };
 
 function renderRelaySlots(r) {
   const box = $('#relay-slots');
@@ -187,6 +187,7 @@ function renderRelaySlots(r) {
     return;
   }
   box.innerHTML = slots.map((s) => {
+    const isProxy = s.kind === 'proxy';
     const urlRow = s.url
       ? `<div class="gw-kv"><span>URL</span><b class="gw-break"><a href="${esc(s.url)}" target="_blank" rel="noopener">${esc(s.url)}</a></b></div>`
       : '';
@@ -194,18 +195,26 @@ function renderRelaySlots(r) {
       ? (s.cf_script_name ? `<div class="gw-kv"><span>Воркер</span><b>${esc(s.cf_script_name)}</b></div>` : '') +
         (s.cf_account_id ? `<div class="gw-kv"><span>Аккаунт</span><b>${esc(s.cf_account_id)}</b></div>` : '')
       : '';
+    // Прокси-слот маршрутизируется по host:port — вместо URL и секрета.
+    const proxyRows = isProxy
+      ? `<div class="gw-kv"><span>Тип</span><b>${esc(String(s.proxy_type || '').toUpperCase())}</b></div>` +
+        `<div class="gw-kv"><span>Хост</span><b class="gw-break">${esc(s.host || '')}:${esc(String(s.port ?? ''))}</b></div>`
+      : '';
     const secret = s.relay_secret_set ? 'задан' : 'не задан — релей отвечает 503 на каждый запрос';
     return `<div class="gw-card">` +
       `<div class="gw-card-head"><span class="gw-name">${esc(SLOT_KIND_NAMES[s.kind] || s.kind)}</span>` +
       `<span class="gw-id">${esc(s.id)}</span>` +
       `${s.active ? '<span class="gw-badge">по умолчанию</span>' : ''}</div>` +
-      urlRow + cfRows +
-      `<div class="gw-kv"><span>Секрет RELAY_TOKEN</span><b>${secret}</b></div>` +
+      proxyRows + urlRow + cfRows +
+      (isProxy ? '' : `<div class="gw-kv"><span>Секрет RELAY_TOKEN</span><b>${secret}</b></div>`) +
       `<div class="gw-row">` +
+      (isProxy ? `<button class="gw-ghost" data-slot-test="${esc(s.id)}">Проверить</button>` : '') +
       `${s.active ? '' : `<button class="gw-ghost" data-slot-activate="${esc(s.id)}">Назначить по умолчанию</button>`}` +
       `<button class="gw-ghost" data-slot-delete="${esc(s.id)}">Удалить</button>` +
       `</div></div>`;
   }).join('');
+  $$('#relay-slots [data-slot-test]').forEach(btn =>
+    btn.addEventListener('click', () => void testProxySlot(btn.dataset.slotTest, btn)));
   $$('#relay-slots [data-slot-activate]').forEach(btn =>
     btn.addEventListener('click', () => void activateRelaySlot(btn.dataset.slotActivate, btn)));
   $$('#relay-slots [data-slot-delete]').forEach(btn =>
@@ -223,8 +232,64 @@ async function activateRelaySlot(id, btn) {
   finally { busy(btn, false); }
 }
 
+/** Добавить прокси-слот (POST /api/relay/slots/create). Поля формы: имя,
+ *  тип, хост, порт, опциональные логин/пароль. Локальная проверка — чтобы не
+ *  гонять заведомо пустую форму на сервер; серверная валидация остаётся SSOT. */
+async function addProxySlot(btn) {
+  const out = $('#proxy-add-result');
+  const id = $('#proxy-name-input').value.trim();
+  const host = $('#proxy-host-input').value.trim();
+  const port = Number($('#proxy-port-input').value);
+  if (!id || !host || !port || port < 1 || port > 65535) {
+    out.textContent = 'Заполните имя, хост и порт (1–65535).';
+    out.style.color = 'var(--danger)';
+    return;
+  }
+  busy(btn, true);
+  try {
+    await api('/api/relay/slots/create', {
+      method: 'POST',
+      body: JSON.stringify({
+        id,
+        proxy_type: $('#proxy-type-input').value,
+        host,
+        port,
+        username: $('#proxy-user-input').value.trim() || null,
+        password: $('#proxy-password-input').value || null,
+      }),
+    });
+    out.textContent = `Прокси «${id}» добавлен.`;
+    out.style.color = '';
+    for (const sel of ['#proxy-name-input', '#proxy-host-input', '#proxy-user-input', '#proxy-password-input']) {
+      $(sel).value = '';
+    }
+    $('#proxy-port-input').value = '';
+    toast(`Прокси добавлен: ${id}`);
+    await refreshAll();
+    notifyHost('relay-slot-created');
+  } catch (e) {
+    out.textContent = `не удалось: ${e.message}`;
+    out.style.color = 'var(--danger)';
+  } finally { busy(btn, false); }
+}
+
+/** Проверка прокси-слота: проба через него на ipify — пользователь видит IP
+ *  выхода и латентность. Ошибка показывается целиком (fail). */
+async function testProxySlot(id, btn) {
+  busy(btn, true);
+  try {
+    const r = await api('/api/relay/slots/test', { method: 'POST', body: JSON.stringify({ id }) });
+    toast(`Прокси «${id}»: IP выхода ${r.ip}, ${r.latency_ms} мс`);
+  } catch (e) { fail('Проверка прокси не удалась', e); }
+  finally { busy(btn, false); }
+}
+
 async function deleteRelaySlot(id, btn) {
-  if (!window.confirm(`Удалить релей «${id}»? Удалится только привязка в шлюзе — воркер на Vercel/Cloudflare останется работать; чтобы его убрать, удаляйте деплой в панели соответствующего сервиса. Провайдеры, привязанные к этому релею, потеряют привязку и пойдут напрямую.`)) return;
+  const slot = (state.relaySlots || []).find((s) => s.id === id);
+  const extra = slot && slot.kind === 'proxy'
+    ? 'Это сетевой прокси: сам прокси-сервер не удаляется, только слот в шлюзе.'
+    : 'воркер на Vercel/Cloudflare останется работать; чтобы его убрать, удаляйте деплой в панели соответствующего сервиса.';
+  if (!window.confirm(`Удалить релей «${id}»? Удалится только привязка в шлюзе — ${extra} Провайдеры, привязанные к этому релею, потеряют привязку и пойдут напрямую.`)) return;
   busy(btn, true);
   try {
     await api('/api/relay/slots/delete', { method: 'POST', body: JSON.stringify({ id }) });
@@ -429,6 +494,7 @@ function init() {
   $('#btn-relay-test').addEventListener('click', () => void testRelay());
   $('#btn-relay-deploy').addEventListener('click', () => void deployRelay());
   $('#btn-relay-save').addEventListener('click', () => void saveRelayUrl());
+  $('#btn-proxy-add').addEventListener('click', (e) => void addProxySlot(e.currentTarget));
   $('#relay-kind').addEventListener('change', relayKindSync);
   relayKindSync();
   $('#btn-relay-show-token').addEventListener('click', (e) => {

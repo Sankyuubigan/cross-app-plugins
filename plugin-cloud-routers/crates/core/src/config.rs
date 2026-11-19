@@ -30,6 +30,12 @@ pub const DEFAULT_HOST: &str = "127.0.0.1";
 pub const RELAY_KIND_VERCEL: &str = "vercel";
 /// Вид релея: Cloudflare Workers.
 pub const RELAY_KIND_CLOUDFLARE: &str = "cloudflare";
+/// Вид релея: сетевой прокси (socks5/http) — трафик к провайдерам идёт через него напрямую.
+pub const RELAY_KIND_PROXY: &str = "proxy";
+/// Тип сетевого прокси: SOCKS5.
+pub const PROXY_TYPE_SOCKS5: &str = "socks5";
+/// Тип сетевого прокси: HTTP CONNECT.
+pub const PROXY_TYPE_HTTP: &str = "http";
 
 /// Подключённый релей («слот»).
 ///
@@ -43,7 +49,7 @@ pub struct RelaySlot {
     /// Slug-идентификатор ("vercel", "cf-main"). На него ссылается
     /// `active_relay`; `/` в id запрещён тем же запретом, что у провайдеров.
     pub id: String,
-    /// Вид - [`RELAY_KIND_VERCEL`] или [`RELAY_KIND_CLOUDFLARE`].
+    /// Вид - [`RELAY_KIND_VERCEL`], [`RELAY_KIND_CLOUDFLARE`] или [`RELAY_KIND_PROXY`].
     pub kind: String,
     /// Публичный base релея; при `None` запрос со слотами хранит настройки
     /// деплоя, но сам релей может быть ещё не развёрнут.
@@ -55,6 +61,16 @@ pub struct RelaySlot {
     pub cf_account_id: Option<String>,
     /// Для cloudflare: имя Worker-скрипта (из него собирается workers.dev URL).
     pub cf_script_name: Option<String>,
+    /// Для вида [`RELAY_KIND_PROXY`]: тип прокси ([`PROXY_TYPE_SOCKS5`] или [`PROXY_TYPE_HTTP`]).
+    pub proxy_type: Option<String>,
+    /// Для вида [`RELAY_KIND_PROXY`]: хост прокси-сервера (имя или IP).
+    pub host: Option<String>,
+    /// Для вида [`RELAY_KIND_PROXY`]: порт прокси-сервера (1..=65535).
+    pub port: Option<u16>,
+    /// Для вида [`RELAY_KIND_PROXY`]: логин прокси (не задан/пуст — без авторизации).
+    pub proxy_user: Option<String>,
+    /// Для вида [`RELAY_KIND_PROXY`]: пароль прокси (опционален).
+    pub proxy_password: Option<String>,
 }
 
 impl Default for RelaySlot {
@@ -66,6 +82,11 @@ impl Default for RelaySlot {
             relay_secret: None,
             cf_account_id: None,
             cf_script_name: None,
+            proxy_type: None,
+            host: None,
+            port: None,
+            proxy_user: None,
+            proxy_password: None,
         }
     }
 }
@@ -620,6 +641,7 @@ impl GatewayConfig {
             relay_secret: self.vercel_relay_token.clone(),
             cf_account_id: None,
             cf_script_name: None,
+            ..Default::default()
         });
         self.active_relay = Some("vercel".to_string());
         self.vercel_relay_url = None;
@@ -696,9 +718,12 @@ impl GatewayConfig {
             if slot.id.trim().is_empty() {
                 problems.push("релей: пустой id слота".to_string());
             }
-            if slot.kind != RELAY_KIND_VERCEL && slot.kind != RELAY_KIND_CLOUDFLARE {
+            if slot.kind != RELAY_KIND_VERCEL
+                && slot.kind != RELAY_KIND_CLOUDFLARE
+                && slot.kind != RELAY_KIND_PROXY
+            {
                 problems.push(format!(
-                    "релей «{}»: неизвестный вид «{}» (ожидали vercel или cloudflare)",
+                    "релей «{}»: неизвестный вид «{}» (ожидали vercel, cloudflare или proxy)",
                     slot.id, slot.kind
                 ));
             }
@@ -707,6 +732,26 @@ impl GatewayConfig {
                     problems.push(format!(
                         "релей «{}»: URL «{raw}» не начинается с http:// или https://",
                         slot.id
+                    ));
+                }
+            }
+            // Прокси-слот маршрутизируется по host/port, URL не используется.
+            if slot.kind == RELAY_KIND_PROXY {
+                if slot.host.as_deref().map_or(true, |h| h.trim().is_empty()) {
+                    problems.push(format!("релей «{}»: хост прокси обязателен", slot.id));
+                }
+                if slot.port.unwrap_or(0) == 0 {
+                    problems.push(format!(
+                        "релей «{}»: порт прокси обязателен (1–65535)",
+                        slot.id
+                    ));
+                }
+                let ptype = slot.proxy_type.as_deref().unwrap_or("");
+                if ptype != PROXY_TYPE_SOCKS5 && ptype != PROXY_TYPE_HTTP {
+                    problems.push(format!(
+                        "релей «{}»: тип прокси должен быть socks5 или http (сейчас {})",
+                        slot.id,
+                        if ptype.is_empty() { "не задан".to_string() } else { format!("«{ptype}»") }
                     ));
                 }
             }
@@ -915,6 +960,7 @@ mod tests {
             relay_secret: Some("cf-tok".into()),
             cf_account_id: Some("acc".into()),
             cf_script_name: Some("relay".into()),
+            ..Default::default()
         });
         c.vercel_relay_url = Some("https://new-relay.vercel.app".into());
         c.vercel_relay_token = Some("tok".into());
@@ -948,6 +994,7 @@ mod tests {
             relay_secret: Some("slot-tok".into()),
             cf_account_id: None,
             cf_script_name: None,
+            ..Default::default()
         });
         c.vercel_relay_url = Some("https://legacy.vercel.app".into());
         c.vercel_relay_token = Some("legacy-tok".into());
@@ -1078,6 +1125,39 @@ mod tests {
             ..Default::default()
         });
         c.active_relay = Some("cf-main".into());
+        assert!(c.validate().iter().all(|m| !m.contains("релей")), "{:?}", c.validate());
+    }
+
+    #[test]
+    fn validate_catches_broken_proxy_slot() {
+        // Прокси-слот маршрутизируется по host/port/типу: каждый из трёх битых
+        // элементов конфигурации обязан быть назван, а не проглочен.
+        let mut c = GatewayConfig::default();
+        c.relays.push(RelaySlot {
+            id: "p1".into(),
+            kind: RELAY_KIND_PROXY.into(),
+            proxy_type: Some("gre".into()),
+            host: Some("   ".into()),
+            port: Some(0),
+            ..Default::default()
+        });
+        let pr = c.validate();
+        assert!(pr.iter().any(|m| m.contains("хост прокси")), "{:?}", pr);
+        assert!(pr.iter().any(|m| m.contains("порт прокси")), "{:?}", pr);
+        assert!(pr.iter().any(|m| m.contains("тип прокси")), "{:?}", pr);
+    }
+
+    #[test]
+    fn validate_accepts_valid_proxy_slot() {
+        let mut c = GatewayConfig::default();
+        c.relays.push(RelaySlot {
+            id: "p1".into(),
+            kind: RELAY_KIND_PROXY.into(),
+            proxy_type: Some(PROXY_TYPE_SOCKS5.into()),
+            host: Some("127.0.0.1".into()),
+            port: Some(1080),
+            ..Default::default()
+        });
         assert!(c.validate().iter().all(|m| !m.contains("релей")), "{:?}", c.validate());
     }
 

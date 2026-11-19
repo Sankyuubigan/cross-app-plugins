@@ -115,14 +115,13 @@ pub fn build_openrouter_plan(
 ) -> Result<CheckPlan, String> {
     let target = key_info_target_url(&provider.base_url)?;
     let via_relay = provider.relay_id.is_some();
-    if via_relay {
-        // Общий релей-гейт обеих проверок (SSOT причины отказа).
-        crate::key_check::ensure_relay_route(provider, config)?;
-    }
+    // Общее разрешение вида слота обеих проверок (SSOT причины отказа).
+    let proxy = crate::key_check::resolve_plan_route(provider, config)?;
     Ok(CheckPlan {
         kind: KeyCheckKind::OpenRouterKeyInfo,
         models: vec!["key".into()],
         via_relay,
+        proxy,
         target_urls: vec![target],
     })
 }
