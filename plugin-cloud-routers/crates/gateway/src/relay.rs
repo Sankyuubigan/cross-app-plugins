@@ -105,49 +105,74 @@ pub struct RelayProbe {
     pub url: String,
 }
 
-/// Проверить, что релей отвечает и что это именно наш воркер.
+/// Нейтральная цель сквозной пробы релея: воркер делает `fetch` на неё,
+/// ipify отвечает голым IP выхода — и видно, что воркер не только жив,
+/// но и вышел во внешнюю сеть. Не тратит квоту провайдеров.
+pub const PROBE_TARGET_URL: &str = "https://api.ipify.org";
+
+/// Проверить, что релей по готовому base-URL отвечает и что это именно наш воркер.
 ///
 /// Проверка **не** тратит квоту провайдера: запрос уходит намеренно
-/// неполным — без `x-target-url`. Наш воркер на такой запрос отвечает `400`
-/// с текстом «missing x-target-url». Если вместо этого пришёл `401` — воркер
-/// есть, но требует секрет; если `404` — по этому пути ничего не развёрнуто;
-/// если соединение не установилось — релей недоступен.
-pub async fn probe_relay(state: &AppState) -> Result<RelayProbe, String> {
-    let config = state.config();
+/// неполным — без `x-target-url`. Наш воркер опознаётся по телам своих
+/// ошибок: `400` «missing x-target-url» (проба с верным секретом), `401`
+/// «missing or invalid x-relay-token» (секрет не совпал / не передан),
+/// `503` «relay is not configured» (env RELAY_TOKEN не задан — fail-closed).
+/// Чужой сервис (или перехват домена) на эти отпечатки не похож; если
+/// соединение не установилось — релей недоступен.
+pub async fn probe_relay_base(
+    state: &AppState,
+    base_raw: &str,
+    token: Option<&str>,
+) -> Result<RelayProbe, String> {
     // Единая проверка базы: негодная (без схемы) база релея иначе дала бы
     // reqwest Kind::Builder («builder error»), а не причину с текстом чинилки.
-    let base = config
-        .relay_url()
-        .as_deref()
-        .filter(|s| !cloud_routers_core::config::trim_base_url(s).is_empty())
-        .and_then(cloud_routers_core::config::relay_base_url)
-        .ok_or_else(|| {
-            let relay_url_owned = config.relay_url();
-            let raw = relay_url_owned
-                .as_deref()
-                .map(|s| s.trim())
-                .unwrap_or_default();
-            if raw.is_empty() {
-                "URL релея не задан".to_string()
-            } else {
-                format!("URL релея «{raw}» не начинается с http:// или https://")
-            }
-        })?;
+    let base = cloud_routers_core::config::relay_base_url(base_raw).ok_or_else(|| {
+        let raw = base_raw.trim();
+        if raw.is_empty() {
+            "URL релея не задан".to_string()
+        } else {
+            format!("URL релея «{raw}» не начинается с http:// или https://")
+        }
+    })?;
     let url = format!("{}{}/__ping", base, crate::upstream::RELAY_PATH_PREFIX);
     let started = std::time::Instant::now();
-    let response = state
+    let mut request = state
         .http()
         .get(&url)
-        .timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(15));
+    // Секрет обязателен: воркер проверяет его ПЕРВЫМ, и без него живой
+    // воркер с настроенным env отвечает 401, тело которого не содержит
+    // отпечатков цели (регресс 20.11.2026: проба шла без секрета и
+    // «не узнавала» исправный релей).
+    if let Some(t) = token.map(str::trim).filter(|t| !t.is_empty()) {
+        request = request.header(crate::upstream::HDR_RELAY_TOKEN, t);
+    }
+    let response = request
         .send()
         .await
         .map_err(|e| format!("Релей недоступен: {}", crate::neterr::describe(&e)))?;
     let status = response.status().as_u16();
     let detail = response.text().await.unwrap_or_default();
     let latency_ms = started.elapsed().as_millis() as u64;
-    // Наш воркер отвечает именно так на запрос без цели.
-    let reachable = detail.contains("x-target-url");
+    let reachable = detail.contains("x-target-url")
+        || detail.contains("x-relay-token")
+        || detail.contains("relay is not configured");
     Ok(RelayProbe { reachable, status, detail: detail.chars().take(300).collect(), latency_ms, url })
+}
+
+/// Проверка активного релея (URL и секрет — `config.relay_url()` /
+/// `config.relay_token()`). Для проверки конкретного слота вкладки «Релей» —
+/// `admin::relay_slot_test` (своя проба с секретом слота).
+pub async fn probe_relay(state: &AppState) -> Result<RelayProbe, String> {
+    let config = state.config();
+    let raw = config
+        .relay_url()
+        .as_deref()
+        .map(|s| s.trim())
+        .unwrap_or_default()
+        .to_string();
+    let token = config.relay_token().map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
+    probe_relay_base(state, &raw, token.as_deref()).await
 }
 
 /// Результат развёртывания релея.

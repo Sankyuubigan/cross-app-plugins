@@ -24,6 +24,10 @@ export const state = {
   // рисует опции из relaySlots, activeRelay — слот по умолчанию.
   relaySlots: [],
   activeRelay: null,
+  // Последний результат проверки слота «Релей» (id → {text, cls}) — живой
+  // статус зонда, а не конфиг: живёт в памяти вкладки до следующей проверки
+  // или перезагрузки страницы, перерисовка карточек его восстанавливает.
+  relayTestResults: new Map(),
 };
 
 export async function api(path, options = {}) {

@@ -273,6 +273,92 @@ pub fn save_config_file(path: &PathBuf, router_id: RouterId, config: &RouterConf
     })
 }
 
+/// Машинный корень установки роутеров (`install_root` в общем конфиге плагина).
+///
+/// Хост, владеющий хранилищем, сообщает его плагину при старте
+/// ([`set_default_install_root`]): King Orch передаёт `KingOrchData`, и
+/// дефолтная папка установки шлюза становится `<хранилище>/gateway`, а не
+/// `%APPDATA%\cloud-routers\gateway`. Хранится в ОБЩЕМ конфиге плагина, а не
+/// в per-app конфиге хоста: путь обязан быть один из любого приложения, иначе
+/// второй хост не увидел бы установку первого (историческая ловушка
+/// `cloud_routers_dir` — ключа, который хост писал себе в конфиг и который
+/// был убран именно из-за развода папки шлюза по приложениям).
+fn load_install_root(app: &AppHandle) -> Option<String> {
+    let raw = load_root(app)
+        .get("install_root")?
+        .as_str()?
+        .trim()
+        .to_string();
+    (!raw.is_empty()).then_some(raw)
+}
+
+/// Записать `install_root` в общий конфиг плагина по явному пути
+/// (версия для тестов; боевой вызов — [`set_default_install_root`]).
+///
+/// **First-wins:** если корень уже задан, НОВОЕ значение не применяется и
+/// функция честно возвращает `Ok(false)` — иначе два хоста с разными
+/// хранилищами перезаписывали бы путь друг друга при каждом старте, и
+/// «одна папка шлюза на машину» развалилась бы. `Ok(true)` — корень записан
+/// этим вызовом. Остальные ключи конфига не затираются (update_json —
+/// field-preserving merge).
+pub fn set_default_install_root_file(path: &PathBuf, root: &Path) -> Result<bool, String> {
+    let proposed = root.to_string_lossy().to_string();
+    if proposed.trim().is_empty() {
+        return Err("Путь хранилища для install_root не может быть пустым".to_string());
+    }
+    let existing = fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|v| v.get("install_root").and_then(|r| r.as_str().map(str::to_string)))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    if let Some(current) = existing {
+        if current != proposed {
+            log::info!(
+                "cloud-routers: install_root уже задан ({}), предложенный {} не применён (first-wins)",
+                current,
+                proposed
+            );
+        }
+        return Ok(false);
+    }
+    if let Some(dir) = path.parent() {
+        if let Err(e) = fs::create_dir_all(dir) {
+            return Err(format!(
+                "Не удалось создать каталог конфига {}: {}",
+                dir.display(),
+                e
+            ));
+        }
+    }
+    json_store::update_json(path, |value: &mut serde_json::Value| {
+        if !value.is_object() {
+            *value = serde_json::json!({});
+        }
+        if let serde_json::Value::Object(map) = value {
+            map.insert(
+                "install_root".to_string(),
+                serde_json::Value::String(proposed.clone()),
+            );
+        }
+    })
+    .map_err(|e| format!("Не удалось записать install_root в {}: {}", path.display(), e))?;
+    log::info!("cloud-routers: install_root установлен: {}", proposed);
+    Ok(true)
+}
+
+/// Задать машинный корень установки роутеров (вызывается хостом при старте).
+///
+/// Первый хост, сообщивший корень, фиксирует его для всей машины: повторные
+/// вызовы (в т.ч. от других хостов с другим путём) значения не меняют —
+/// см. [`set_default_install_root_file`]. Пользователь меняет папку установки
+/// отдельно, кнопкой «Путь» в панели — явное намерение человека сильнее
+/// умолчания. Хост, не вызывающий этот сеттер, ничего не ломает: дефолт
+/// остаётся прежним `%APPDATA%/cloud-routers/<id>`.
+pub fn set_default_install_root(app: &AppHandle, root: &Path) -> Result<bool, String> {
+    set_default_install_root_file(&get_config_path(app), root)
+}
+
 /// Папка установки роутера из уже прочитанных значений (без `AppHandle`).
 ///
 /// ## Приоритет
@@ -280,10 +366,14 @@ pub fn save_config_file(path: &PathBuf, router_id: RouterId, config: &RouterConf
 /// 1. `cloud_routers.<id>.dir` из конфига ПЛАГИНА — путь, выбранный
 ///    пользователем в панели. Выше всего: явное намерение человека сильнее
 ///    умолчания.
-/// 2. `APPDATA/cloud-routers/<id>` — каталог самого плагина. Один на все
-///    проекты: бинарь шлюза и node-роутеры лежат в общем месте, а не внутри
-///    папки каждого приложения. Привязка к хосту (`<exe>/cloud_routers`,
-///    назначение пути из конфига хоста) убрана намеренно — см. [`APP_DATA_DIR_NAME`].
+/// 2. `install_root/<id>` — машинный корень установки, переданный хостом
+///    через [`set_default_install_root`] (19.11.2026: King Orch сообщает своё
+///    хранилище KingOrchData, и дефолт ложится в него).
+/// 3. `APPDATA/cloud-routers/<id>` — каталог самого плагина, фоллбэк для
+///    хостов, которые корень не передали. Один на все проекты: бинарь шлюза
+///    и node-роутеры лежат в общем месте, а не внутри папки каждого
+///    приложения. Привязка к хосту (`<exe>/cloud_routers`, назначение пути
+///    из per-app конфига хоста) убрана намеренно — см. [`APP_DATA_DIR_NAME`].
 ///
 /// ## Почему отдельная функция
 ///
@@ -292,28 +382,40 @@ pub fn save_config_file(path: &PathBuf, router_id: RouterId, config: &RouterConf
 /// разрешении пути — остался бы непроверяемым: компилятор не поймал бы перестав-
 /// ленный уровень, а ошибка всплыла бы у пользователя как «роутер поставился
 /// не туда».
-pub fn choose_router_dir(dir_override: Option<&str>, router_id: RouterId) -> PathBuf {
+pub fn choose_router_dir(
+    dir_override: Option<&str>,
+    install_root: Option<&str>,
+    router_id: RouterId,
+) -> PathBuf {
     if let Some(p) = dir_override.map(str::trim).filter(|s| !s.is_empty()) {
         return PathBuf::from(p);
     }
-    default_router_dir(router_id)
+    default_router_dir(install_root, router_id)
 }
 
 /// Папка установки роутера.
 pub fn router_dir(app: &AppHandle, router_id: RouterId) -> PathBuf {
     let cfg = load_config(app, router_id);
-    choose_router_dir(cfg.dir.as_deref(), router_id)
+    let install_root = load_install_root(app);
+    choose_router_dir(cfg.dir.as_deref(), install_root.as_deref(), router_id)
 }
 
-/// Умолчательная папка установки: подкаталог каталога плагина, общий для всех
-/// проектов (`APPDATA/cloud-routers/<id>`).
+/// Умолчательная папка установки: `install_root/<id>`, если хост передал
+/// машинный корень, иначе подкаталог каталога плагина
+/// (`APPDATA/cloud-routers/<id>`).
 ///
-/// Путь НЕ зависит от хоста намеренно: процесс шлюза один на машину, и папка
-/// с его бинарём обязана быть одна и та же из любого приложения — иначе
-/// сверка «свой процесс / чужой» в `gateway_process::stop_server` отказала бы
-/// работать у второго проекта.
-pub fn default_router_dir(router_id: RouterId) -> PathBuf {
-    app_data_dir().join(router_id.dir_name())
+/// Путь НЕ зависит от того, КАКОЙ хост спросил, намеренно: процесс шлюза
+/// один на машину, и папка с его бинарём обязана быть одна и та же из любого
+/// приложения — иначе сверка «свой процесс / чужой» в
+/// `gateway_process::stop_server` отказала бы работать у второго проекта.
+/// Поэтому `install_root` живёт в общем конфиге плагина и записывается один
+/// раз (first-wins), а не в per-app конфиге каждого хоста.
+pub fn default_router_dir(install_root: Option<&str>, router_id: RouterId) -> PathBuf {
+    let name = router_id.dir_name();
+    match install_root.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(root) => PathBuf::from(root).join(name),
+        None => app_data_dir().join(name),
+    }
 }
 
 /// Папка с распакованным standalone-билдом роутера.
@@ -468,31 +570,50 @@ mod tests {
     #[test]
     fn router_dir_override_wins_over_plugin_default() {
         assert_eq!(
-            choose_router_dir(Some(r"D:\custom\9router"), RouterId::NineRouter),
+            choose_router_dir(Some(r"D:\custom\9router"), None, RouterId::NineRouter),
             PathBuf::from(r"D:\custom\9router")
         );
         assert_eq!(
-            choose_router_dir(Some(r"D:\custom\gateway"), RouterId::Gateway),
+            choose_router_dir(Some(r"D:\custom\gateway"), None, RouterId::Gateway),
+            PathBuf::from(r"D:\custom\gateway")
+        );
+        // ...и сильнее уровня 2 (install_root), а не только фоллбэка.
+        assert_eq!(
+            choose_router_dir(Some(r"D:\custom\gateway"), Some(r"D:\Storage"), RouterId::Gateway),
             PathBuf::from(r"D:\custom\gateway")
         );
     }
 
-    /// Приоритет 2: умолчание — подкаталог КАТАЛОГА ПЛАГИНА, а не папки хоста.
-    ///
-    /// Это и есть свойство «шлюз общий для всех проектов»: путь к его бинарю не
-    /// зависит от того, какое приложение сейчас открыто. Проверяется сравнением
-    /// с [`app_data_dir`] — если бы дефолт снова считался от `current_exe`,
-    /// тест упал бы, а не «просто работал бы у хоста».
+    /// Приоритет 2 (19.11.2026): машинный `install_root` от хоста — дефолт
+    /// установки ложится в хранилище хоста (`KingOrchData/<id>`), а не в
+    /// %APPDATA%. Проверяется для всех роутеров: подкаталог обязан называться
+    /// как `dir_name`, иначе путь установки и поиск установленного разъедутся.
+    #[test]
+    fn install_root_gives_machine_default() {
+        for router in RouterId::ALL.iter().copied() {
+            let expected = choose_router_dir(None, Some(r"D:\Programs\storage"), router);
+            assert_eq!(expected, PathBuf::from(r"D:\Programs\storage").join(router.dir_name()));
+        }
+    }
+
+    /// Приоритет 3 (фоллбэк): без install_root умолчание — подкаталог КАТАЛОГА
+    /// ПЛАГИНА, а не папки хоста. Это и есть свойство «шлюз общий для всех
+    /// проектов»: путь к его бинарю не зависит от того, какое приложение
+    /// сейчас открыто. Проверяется сравнением с [`app_data_dir`] — если бы
+    /// дефолт снова считался от `current_exe`, тест упал бы, а не «просто
+    /// работал бы у хоста».
     #[test]
     fn router_dir_defaults_to_plugin_dir() {
         for router in RouterId::ALL.iter().copied() {
-            let expected = default_router_dir(router);
+            let expected = default_router_dir(None, router);
             assert_eq!(expected.parent(), Some(app_data_dir().as_path()), "роутер {}", router);
             assert_eq!(
                 expected.file_name().and_then(|n| n.to_str()),
                 Some(router.dir_name()),
                 "подкаталог обязан называться как dir_name роутера"
             );
+            // Пустой/пробельный install_root — тоже не выбор (фоллбэк).
+            assert_eq!(choose_router_dir(None, Some("   "), router), expected);
         }
     }
 
@@ -500,17 +621,54 @@ mod tests {
     /// и пользователь не понимал, почему его путь проигнорирован.
     #[test]
     fn blank_override_is_treated_as_absent() {
-        let default = default_router_dir(RouterId::Gateway);
+        let default = default_router_dir(None, RouterId::Gateway);
         assert_eq!(
-            choose_router_dir(Some(""), RouterId::Gateway),
+            choose_router_dir(Some(""), None, RouterId::Gateway),
             default,
             "пустой dir обязан уйти на следующий уровень"
         );
         assert_eq!(
-            choose_router_dir(Some("   "), RouterId::Gateway),
+            choose_router_dir(Some("   "), None, RouterId::Gateway),
             default,
             "пробельный dir — тоже не выбор"
         );
+        // Пустой override обязан уйти и на уровень 2 (install_root).
+        assert_eq!(
+            choose_router_dir(Some(""), Some(r"D:\Storage"), RouterId::Gateway),
+            PathBuf::from(r"D:\Storage\gateway"),
+            "пустой dir не должен глушить install_root"
+        );
+    }
+
+    /// First-wins install_root: первый хост фиксирует машинный корень,
+    /// повторные вызовы (в т.ч. с другим путём) не перезаписывают — иначе
+    /// два хоста с разными хранилищами перебивали бы путь друг друга.
+    #[test]
+    fn set_default_install_root_first_wins() {
+        let root = unique_temp_dir("cr_cfg_install_root");
+        let path = root.join("cloud-routers").join("app_config.json");
+
+        // Пустой путь хоста — честная ошибка, а не запись пустой строки.
+        assert!(set_default_install_root_file(&path, Path::new("")).is_err());
+
+        // Первый вызов записывает корень и НЕ затирает соседние ключи.
+        fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        fs::write(&path, r#"{"cloud_routers":{"gateway":{"dir":"D:\\gw"}}}"#).expect("seed");
+        assert!(set_default_install_root_file(&path, Path::new(r"D:\Storage")).unwrap_or(false));
+        let after: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("read")).expect("json");
+        assert_eq!(after["install_root"], r"D:\Storage");
+        assert_eq!(
+            after["cloud_routers"]["gateway"]["dir"], r"D:\gw",
+            "запись install_root не должна трогать соседние ключи"
+        );
+
+        // Второй хост с другим путём — не применён (Ok(false)), файл прежний.
+        assert!(!set_default_install_root_file(&path, Path::new(r"C:\Elsewhere")).unwrap_or(true));
+        let kept: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("read")).expect("json");
+        assert_eq!(kept["install_root"], r"D:\Storage", "first-wins обязан сохранить первый корень");
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// Перенос настроек из старого per-app конфига хоста.

@@ -115,6 +115,23 @@ button.gw-busy::after {
 
 .gw-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 10px 0; }
 
+/* Результат проверки слота «Релей» (app.js testRelaySlot): строка в карточке,
+   живёт до следующей проверки/перезагрузки — статус не исчезает с тостом. */
+.gw-test-result {
+  margin-top: 8px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  font-size: 12px;
+  background: var(--bg);
+  border-left: 3px solid var(--border);
+  word-break: break-word;
+  display: none;
+}
+.gw-test-result:not(:empty) { display: block; }
+.gw-test-result-ok { border-left-color: var(--success); color: var(--success); }
+.gw-test-result-warn { border-left-color: var(--warning); color: var(--warning); }
+.gw-test-result-err { border-left-color: var(--danger); color: var(--danger); }
+
 label { display: block; margin: 10px 0; color: var(--muted); font-size: 12px; }
 label.gw-inline { display: inline-flex; align-items: center; gap: 5px; margin: 0; }
 input, select, textarea {

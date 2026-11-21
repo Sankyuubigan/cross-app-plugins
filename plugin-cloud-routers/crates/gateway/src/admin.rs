@@ -1801,12 +1801,29 @@ async fn relay_slot_test(
         .relays
         .iter()
         .find(|s| s.id == body.id)
-        .ok_or_else(|| not_found(format!("Слот «{}» не найден", body.id)))?;
+        .ok_or_else(|| not_found(format!("Слот «{}» не найден", body.id)))?
+        .clone();
+    match slot.kind.as_str() {
+        RELAY_KIND_PROXY => relay_slot_test_proxy(&state, &slot).await,
+        RELAY_KIND_VERCEL | RELAY_KIND_CLOUDFLARE => relay_slot_test_worker(&state, &slot).await,
+        other => Err(bad_request(format!(
+            "Слот «{}»: неизвестный вид «{}»",
+            body.id, other
+        ))),
+    }
+}
+
+/// Проверка прокси-слота: проба через прокси на ipify — пользователь видит
+/// IP выхода и латентность (кнопка «Проверить», 19.11.2026).
+async fn relay_slot_test_proxy(
+    state: &AppState,
+    slot: &cloud_routers_core::config::RelaySlot,
+) -> ApiResult<Json<serde_json::Value>> {
     let spec = crate::upstream::proxy_spec_from_slot(slot).map_err(|e| bad_request(e))?;
     let client = crate::app::build_proxy_client(&spec).map_err(|e| bad_request(e))?;
     let started = std::time::Instant::now();
     let resp = client
-        .get("https://api.ipify.org")
+        .get(crate::relay::PROBE_TARGET_URL)
         .timeout(std::time::Duration::from_secs(15))
         .send()
         .await
@@ -1828,13 +1845,144 @@ async fn relay_slot_test(
     let latency_ms = started.elapsed().as_millis() as u64;
     state
         .events()
-        .info(format!("прокси «{}»: проверка прошла, IP выхода {}", body.id, ip.trim()));
+        .info(format!("прокси «{}»: проверка прошла, IP выхода {}", slot.id, ip.trim()));
     Ok(Json(serde_json::json!({
         "ok": true,
         "ip": ip.trim(),
         "latency_ms": latency_ms,
         "via": spec.describe(),
     })))
+}
+
+/// Проверка слота vercel/cloudflare — «проходит или заблокирован» (20.11.2026).
+///
+/// Сквозная проба с секретом слота повторяет РЕАЛЬНЫЙ путь транзита: GET
+/// `{base}{RELAY_PATH_PREFIX}/__ping` с `x-relay-token` и
+/// `x-target-url: PROBE_TARGET_URL` — живой воркер с верным секретом
+/// отвечает телом ipify (IP выхода). Без секрета слота остаётся только
+/// availability-проба без заголовков: наш воркер опознаётся по телам
+/// 401 («missing or invalid x-relay-token») и 503 («relay is not
+/// configured», fail-closed без env).
+async fn relay_slot_test_worker(
+    state: &AppState,
+    slot: &cloud_routers_core::config::RelaySlot,
+) -> ApiResult<Json<serde_json::Value>> {
+    let base_raw = slot
+        .url
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| bad_request("URL релея не задан — проверять нечего"))?;
+    let base = cloud_routers_core::config::relay_base_url(base_raw).ok_or_else(|| {
+        bad_request(format!("URL релея «{base_raw}» не начинается с http:// или https://"))
+    })?;
+    let secret = slot
+        .relay_secret
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let url = format!("{base}{}/__ping", crate::upstream::RELAY_PATH_PREFIX);
+    let started = std::time::Instant::now();
+
+    if let Some(token) = secret {
+        // Сквозная проба — с секретом и целью, как реальный транзит.
+        let resp = state
+            .http()
+            .get(&url)
+            .header(crate::upstream::HDR_RELAY_TOKEN, token)
+            .header(crate::upstream::HDR_TARGET_URL, crate::relay::PROBE_TARGET_URL)
+            .timeout(std::time::Duration::from_secs(15))
+            .send()
+            .await
+            .map_err(|e| relay_slot_unreachable(slot, &e))?;
+        let status = resp.status().as_u16();
+        let text = resp.text().await.unwrap_or_default();
+        let latency_ms = started.elapsed().as_millis() as u64;
+        let body_head: String = text.chars().take(160).collect();
+        return match status {
+            401 => Err(bad_request(format!(
+                "Воркер отвечает (HTTP 401), но секрет слота не совпадает с RELAY_TOKEN деплоя — сквозной проход не проверить. Ответ: {body_head}"
+            ))),
+            503 => Err(bad_request(
+                "Воркер отвечает (HTTP 503): RELAY_TOKEN на деплое не задан — воркер fail-closed и ничего не проксирует",
+            )),
+            s if (200..300).contains(&s) && !text.trim().is_empty() => {
+                let ip = text.trim();
+                if !looks_like_ip(ip) {
+                    return Err(bad_request(format!(
+                        "Сквозной запрос через воркер вернул HTTP {s}, но тело не похоже на IP выхода: {body_head}"
+                    )));
+                }
+                state
+                    .events()
+                    .info(format!("релей «{}»: проверка прошла, IP выхода {}", slot.id, ip));
+                Ok(Json(serde_json::json!({
+                    "ok": true,
+                    "ip": ip,
+                    "latency_ms": latency_ms,
+                    "via": base,
+                })))
+            }
+            s => Err(bad_request(format!(
+                "Сквозной запрос через воркер: HTTP {s}, тело: {body_head}"
+            ))),
+        };
+    }
+
+    // Секрета нет — сквозной проход не проверить; только availability-проба.
+    let resp = state
+        .http()
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await
+        .map_err(|e| relay_slot_unreachable(slot, &e))?;
+    let status = resp.status().as_u16();
+    let text = resp.text().await.unwrap_or_default();
+    let latency_ms = started.elapsed().as_millis() as u64;
+    let body_head: String = text.chars().take(160).collect();
+    let ours = text.contains("x-relay-token")
+        || text.contains("relay is not configured")
+        || text.contains("x-target-url");
+    if !ours {
+        return Err(bad_request(format!(
+            "На URL отвечает не наш воркер (HTTP {status}, тело: {body_head}) — вероятен перехват DNS/блокировка домена или чужой сервис"
+        )));
+    }
+    let note = if status == 503 {
+        "Воркер жив и доступен, но RELAY_TOKEN на деплое не задан (fail-closed); сквозная проверка невозможна — задайте секрет слота и переменную на деплое"
+    } else {
+        "Воркер жив и доступен (ожидаемый 401 без секрета); сквозная проверка невозможна — секрет слота не задан"
+    };
+    state
+        .events()
+        .info(format!("релей «{}»: доступен (HTTP {}), сквозная проба без секрета", slot.id, status));
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "ip": serde_json::Value::Null,
+        "latency_ms": latency_ms,
+        "via": base,
+        "note": note,
+    })))
+}
+
+/// Единый текст ошибки «соединение не установилось» для обеих проб слота.
+fn relay_slot_unreachable(slot: &cloud_routers_core::config::RelaySlot, e: &reqwest::Error) -> Response {
+    let msg = format!(
+        "Релей недоступен: {} (соединение не установилось — вероятные причины: домен заблокирован провайдером/РКН, деплой удалён, URL неверен)",
+        crate::neterr::describe(e)
+    );
+    log::warn!("cloud-routers: проверка релея «{}»: {msg}", slot.id);
+    bad_request(msg)
+}
+
+/// ipify отвечает голым IPv4; другое тело — повод не называть пробу пройденной.
+fn looks_like_ip(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('.').collect();
+    parts.len() == 4
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.len() <= 3 && p.chars().all(|c| c.is_ascii_digit()))
 }
 
 // ────────────────────────────── Журнал ──────────────────────────────
@@ -3591,6 +3739,264 @@ mod tests {
             text.contains("не поддерживается"),
             "валидное тело дошло до планировщика (отказ про апстрим, не про JSON): {text}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ─── проверка слота «Релей» (relay_slot_test, 20.11.2026) ───
+
+    /// Режимы мок-воркера: повторяют поведение relay-worker.js (секрет
+    /// проверяется ПЕРВЫМ), плюс «чужой сервис» и «без env».
+    #[derive(Default, Clone, Copy, PartialEq)]
+    enum ProbeWorkerMode {
+        /// Наш воркер с RELAY_TOKEN="right": без токена — 401, с токеном и
+        /// целью — тело ipify.
+        #[default]
+        Ok,
+        /// Воркер без RELAY_TOKEN в env — 503 fail-closed на любой запрос.
+        NoEnv,
+        /// Чужой/перехвативший сервис: 200 с HTML без отпечатков воркера.
+        Foreign,
+    }
+
+    async fn probe_worker_handler(
+        State(mode): State<ProbeWorkerMode>,
+        headers: axum::http::HeaderMap,
+    ) -> Response {
+        let get = |name: &str| {
+            headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string()
+        };
+        if mode == ProbeWorkerMode::Foreign {
+            return (StatusCode::OK, "<html>blocked page</html>").into_response();
+        }
+        if mode == ProbeWorkerMode::NoEnv {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                r#"{"error":{"message":"relay is not configured: RELAY_TOKEN env var is missing","type":"authentication_error"}}"#,
+            )
+                .into_response();
+        }
+        let provided = get("x-relay-token");
+        if provided != "right" {
+            return (
+                StatusCode::UNAUTHORIZED,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                r#"{"error":{"message":"missing or invalid x-relay-token","type":"authentication_error"}}"#,
+            )
+                .into_response();
+        }
+        if get(crate::upstream::HDR_TARGET_URL).is_empty() {
+            return (
+                StatusCode::BAD_REQUEST,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                r#"{"error":{"message":"missing x-target-url header","type":"invalid_request_error"}}"#,
+            )
+                .into_response();
+        }
+        (StatusCode::OK, "203.0.113.7").into_response()
+    }
+
+    async fn probe_worker_serve(mode: ProbeWorkerMode) -> String {
+        let router = axum::Router::new()
+            .fallback(probe_worker_handler)
+            .with_state(mode);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr: std::net::SocketAddr = listener.local_addr().expect("addr");
+        tokio::spawn(async move { let _ = axum::serve(listener, router).await; });
+        format!("http://127.0.0.1:{}", addr.port())
+    }
+
+    /// Свежий конфиг с одним vercel-слотом; возвращает собранный роутер.
+    fn slot_test_app(tag: &str, url: String, secret: Option<&str>) -> axum::Router {
+        let dir = tmp(tag);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let mut cfg = GatewayConfig::default();
+        cfg.relays.push(cloud_routers_core::config::RelaySlot {
+            id: "vercel".into(),
+            kind: RELAY_KIND_VERCEL.into(),
+            url: Some(url),
+            relay_secret: secret.map(|s| s.to_string()),
+            ..Default::default()
+        });
+        core_store::save(&dir, &cfg).expect("save");
+        crate::server::build(AppState::new(&dir).expect("state"))
+    }
+
+    async fn slot_test_json(app: axum::Router, id: &str) -> (StatusCode, serde_json::Value) {
+        let r = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/api/relay/slots/test")
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(r#"{{"id":"{id}"}}"#)))
+                    .expect("req"),
+            )
+            .await
+            .expect("response");
+        let status = r.status();
+        let bytes = axum::body::to_bytes(r.into_body(), usize::MAX).await.expect("body");
+        (status, serde_json::from_slice(&bytes).expect("json"))
+    }
+
+    /// Сквозная проба с верным секретом = путь реального транзита: живой
+    /// воркер возвращает IP выхода — статус «проходит».
+    #[tokio::test]
+    async fn relay_slot_test_worker_passes_end_to_end_with_secret() {
+        let base = probe_worker_serve(ProbeWorkerMode::Ok).await;
+        let app = slot_test_app("slottest_ok", base, Some("right"));
+        let (status, v) = slot_test_json(app, "vercel").await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(v["ok"], serde_json::Value::Bool(true), "{v}");
+        assert_eq!(v["ip"], "203.0.113.7", "сквозная проба возвращает IP выхода: {v}");
+        assert!(v["latency_ms"].as_u64().is_some(), "{v}");
+        assert!(v["via"].as_str().is_some(), "{v}");
+    }
+
+    /// Воркер жив, но секрет слота не совпал с RELAY_TOKEN деплоя — 400 с
+    /// причиной, а не «успех» (молчаливый ложный «проходит» невозможен).
+    #[tokio::test]
+    async fn relay_slot_test_worker_reports_secret_mismatch() {
+        let base = probe_worker_serve(ProbeWorkerMode::Ok).await;
+        let app = slot_test_app("slottest_mismatch", base, Some("wrong"));
+        let (status, v) = slot_test_json(app, "vercel").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+        assert!(
+            v["error"].as_str().is_some_and(|m| m.contains("секрет слота не совпадает")),
+            "{v}"
+        );
+    }
+
+    /// Секрета в слоте нет: доступна только availability-проба. Наш воркер
+    /// отвечает 401 (тело содержит «x-relay-token») — ok=true с note, а не
+    /// молчаливый успех.
+    #[tokio::test]
+    async fn relay_slot_test_worker_without_secret_reports_availability() {
+        let base = probe_worker_serve(ProbeWorkerMode::Ok).await;
+        let app = slot_test_app("slottest_nosecret", base, None);
+        let (status, v) = slot_test_json(app, "vercel").await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(v["ok"], serde_json::Value::Bool(true), "{v}");
+        assert!(v["ip"].is_null(), "сквозной IP без секрета невозможен: {v}");
+        assert!(
+            v["note"].as_str().is_some_and(|m| m.contains("секрет слота не задан")),
+            "{v}"
+        );
+    }
+
+    /// Наш воркер без RELAY_TOKEN на деплое (503 fail-closed) — тот же
+    /// «доступен, но сквозной невозможен», с причиной про env деплоя.
+    #[tokio::test]
+    async fn relay_slot_test_worker_without_env_reports_fail_closed() {
+        let base = probe_worker_serve(ProbeWorkerMode::NoEnv).await;
+        let app = slot_test_app("slottest_noenv", base, None);
+        let (status, v) = slot_test_json(app, "vercel").await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(v["ok"], serde_json::Value::Bool(true), "{v}");
+        assert!(
+            v["note"].as_str().is_some_and(|m| m.contains("RELAY_TOKEN на деплое не задан")),
+            "{v}"
+        );
+    }
+
+    /// 200 с HTML без отпечатков воркера — НЕ «проходит»: чужой сервис или
+    /// перехват домена. С секретом — тело не похоже на IP; без секрета —
+    /// «не наш воркер».
+    #[tokio::test]
+    async fn relay_slot_test_foreign_service_is_not_pass() {
+        let base = probe_worker_serve(ProbeWorkerMode::Foreign).await;
+        let app = slot_test_app("slottest_foreign_nosec", base.clone(), None);
+        let (status, v) = slot_test_json(app, "vercel").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+        assert!(
+            v["error"].as_str().is_some_and(|m| m.contains("не наш воркер")),
+            "{v}"
+        );
+
+        let app2 = slot_test_app("slottest_foreign_sec", base, Some("right"));
+        let (status2, v2) = slot_test_json(app2, "vercel").await;
+        assert_eq!(status2, StatusCode::BAD_REQUEST, "{v2}");
+        assert!(
+            v2["error"].as_str().is_some_and(|m| m.contains("не похоже на IP")),
+            "{v2}"
+        );
+    }
+
+    /// Соединение не установилось (закрытый порт) — честная ошибка
+    /// «Релей недоступен», картина блокировки/мёртвого деплоя.
+    #[tokio::test]
+    async fn relay_slot_test_unreachable_is_honest_error() {
+        // Порт, который гарантированно никто не слушает: bind → узнать номер →
+        // дропнуть listener.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        drop(listener);
+        let app = slot_test_app("slottest_dead", format!("http://127.0.0.1:{port}"), Some("right"));
+        let (status, v) = slot_test_json(app, "vercel").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+        assert!(
+            v["error"].as_str().is_some_and(|m| m.contains("Релей недоступен")),
+            "{v}"
+        );
+    }
+
+    /// Регресс 20.11.2026 (починка probe_relay): проба активного релея шла
+    /// БЕЗ секрета, а воркер проверяет секрет ПЕРВЫМ — живой воркер отвечал
+    /// 401, тело без «x-target-url», и `reachable=false` на исправном релеи.
+    /// Теперь probe_relay шлёт `config.relay_token()`, и 400-отпечаток
+    /// «missing x-target-url» достижим: наш воркер опознан.
+    #[tokio::test]
+    async fn probe_relay_recognizes_our_worker_with_secret() {
+        let dir = tmp("probe_ok");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let base = probe_worker_serve(ProbeWorkerMode::Ok).await;
+        let mut cfg = GatewayConfig::default();
+        cfg.relays.push(cloud_routers_core::config::RelaySlot {
+            id: "vercel".into(),
+            kind: RELAY_KIND_VERCEL.into(),
+            url: Some(base),
+            relay_secret: Some("right".into()),
+            ..Default::default()
+        });
+        cfg.active_relay = Some("vercel".into());
+        core_store::save(&dir, &cfg).expect("save");
+        let state = AppState::new(&dir).expect("state");
+
+        let probe = crate::relay::probe_relay(&state).await.expect("probe");
+        assert!(
+            probe.reachable,
+            "наш воркер с верным секретом обязан опознаться: {probe:?}"
+        );
+        assert_eq!(probe.status, 400, "проба без цели → 400 missing x-target-url: {probe:?}");
+        assert!(probe.detail.contains("x-target-url"), "{probe:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Чужой сервис (200 с HTML без отпечатков воркера) — reachable=false:
+    /// «это не наш воркер» вместо молчаливого ложного «наш».
+    #[tokio::test]
+    async fn probe_relay_marks_foreign_service_unreachable() {
+        let dir = tmp("probe_foreign");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let base = probe_worker_serve(ProbeWorkerMode::Foreign).await;
+        let mut cfg = GatewayConfig::default();
+        cfg.relays.push(cloud_routers_core::config::RelaySlot {
+            id: "vercel".into(),
+            kind: RELAY_KIND_VERCEL.into(),
+            url: Some(base),
+            relay_secret: Some("right".into()),
+            ..Default::default()
+        });
+        cfg.active_relay = Some("vercel".into());
+        core_store::save(&dir, &cfg).expect("save");
+        let state = AppState::new(&dir).expect("state");
+
+        let probe = crate::relay::probe_relay(&state).await.expect("probe");
+        assert!(!probe.reachable, "HTML без отпечатков — не наш воркер: {probe:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

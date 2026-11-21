@@ -208,13 +208,24 @@ function renderRelaySlots(r) {
       proxyRows + urlRow + cfRows +
       (isProxy ? '' : `<div class="gw-kv"><span>Секрет RELAY_TOKEN</span><b>${secret}</b></div>`) +
       `<div class="gw-row">` +
-      (isProxy ? `<button class="gw-ghost" data-slot-test="${esc(s.id)}">Проверить</button>` : '') +
+      `<button class="gw-ghost" data-slot-test="${esc(s.id)}">Проверить</button>` +
       `${s.active ? '' : `<button class="gw-ghost" data-slot-activate="${esc(s.id)}">Назначить по умолчанию</button>`}` +
       `<button class="gw-ghost" data-slot-delete="${esc(s.id)}">Удалить</button>` +
-      `</div></div>`;
+      `</div>` +
+      // Результат последней проверки (зонд в памяти вкладки) — класс и текст
+      // восстанавливаются после innerHTML, см. ниже: namespace-страж
+      // (server.rs) запрещает интерполяцию классов в шаблоне class="...".
+      `<div class="gw-test-result" data-test-result="${esc(s.id)}"></div></div>`;
   }).join('');
+  $$('#relay-slots [data-test-result]').forEach((el) => {
+    const last = state.relayTestResults.get(el.dataset.testResult);
+    if (last) {
+      el.textContent = last.text;
+      el.className = `gw-test-result ${last.cls}`;
+    }
+  });
   $$('#relay-slots [data-slot-test]').forEach(btn =>
-    btn.addEventListener('click', () => void testProxySlot(btn.dataset.slotTest, btn)));
+    btn.addEventListener('click', () => void testRelaySlot(btn.dataset.slotTest, btn)));
   $$('#relay-slots [data-slot-activate]').forEach(btn =>
     btn.addEventListener('click', () => void activateRelaySlot(btn.dataset.slotActivate, btn)));
   $$('#relay-slots [data-slot-delete]').forEach(btn =>
@@ -273,15 +284,34 @@ async function addProxySlot(btn) {
   } finally { busy(btn, false); }
 }
 
-/** Проверка прокси-слота: проба через него на ipify — пользователь видит IP
- *  выхода и латентность. Ошибка показывается целиком (fail). */
-async function testProxySlot(id, btn) {
+/** Проверка слота «Релей» (POST /api/relay/slots/test): сервер сам различает
+ *  вид слота — прокси (проба через прокси на ipify) или воркер Vercel/CF
+ *  (сквозная проба с секретом слота — IP выхода воркера; без секрета —
+ *  availability-проба). Результат пишется строкой в карточку слота и живёт
+ *  до следующей проверки/перезагрузки страницы: статус «проходит/заблокирован»
+ *  не должен исчезать с тостом. Ошибка = «НЕ ПРОХОДИТ» с полной причиной. */
+async function testRelaySlot(id, btn) {
+  const out = document.querySelector(`[data-test-result="${CSS.escape(id)}"]`);
+  const show = (text, cls) => {
+    state.relayTestResults.set(id, { text, cls });
+    if (out) {
+      out.textContent = text;
+      out.className = `gw-test-result ${cls}`;
+    }
+  };
   busy(btn, true);
   try {
     const r = await api('/api/relay/slots/test', { method: 'POST', body: JSON.stringify({ id }) });
-    toast(`Прокси «${id}»: IP выхода ${r.ip}, ${r.latency_ms} мс`);
-  } catch (e) { fail('Проверка прокси не удалась', e); }
-  finally { busy(btn, false); }
+    if (r.ip) {
+      show(`Проходит: IP выхода ${r.ip}, ${r.latency_ms} мс`, 'gw-test-result-ok');
+      toast(`Релей «${id}»: проходит`);
+    } else {
+      show(`${r.note || 'Отвечает'}`, 'gw-test-result-warn');
+    }
+  } catch (e) {
+    show(`НЕ ПРОХОДИТ: ${e.message || e}`, 'gw-test-result-err');
+    toast(`Релей «${id}»: не проходит`, 'err');
+  } finally { busy(btn, false); }
 }
 
 async function deleteRelaySlot(id, btn) {

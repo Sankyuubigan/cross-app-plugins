@@ -43,7 +43,7 @@ pub mod router;
 pub mod spec;
 
 pub use commands::RouterId;
-pub use router::config::set_app_data_dir_name;
+pub use router::config::{set_app_data_dir_name, set_default_install_root};
 pub use spec::{RouterKind, RouterSpec, ROUTERS};
 
 use serde::Deserialize;
