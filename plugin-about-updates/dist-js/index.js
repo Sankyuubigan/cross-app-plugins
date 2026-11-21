@@ -30,9 +30,13 @@ export async function getSupportUrl() {
 export async function checkForUpdate() {
     return check();
 }
-/** Скачивание и установка обновления (тихо, без подтверждения). */
-export async function downloadAndInstallUpdate(update) {
-    await update.downloadAndInstall();
+/**
+ * Скачивание и установка обновления (установка — только по явному клику юзера).
+ * `onEvent` — прогресс скачивания (Started/Progress/Finished из plugin-updater);
+ * фаза установки NSIS-инсталлера плагином не отчитывается.
+ */
+export async function downloadAndInstallUpdate(update, onEvent) {
+    await update.downloadAndInstall(onEvent);
 }
 // Регистрируем Web Component при импорте пакета.
 import './web-components';

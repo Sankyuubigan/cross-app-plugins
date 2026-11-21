@@ -16,6 +16,7 @@
     "build:global": "node scripts/build-global.cjs"
   },
   "dependencies": {
+    "@my-tauri-plugins/plugin-logs": "file:../plugin-log-collector",
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-shell": "^2",
     "@tauri-apps/plugin-updater": "^2"

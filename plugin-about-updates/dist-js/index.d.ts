@@ -1,4 +1,4 @@
-import { type Update } from '@tauri-apps/plugin-updater';
+import { type Update, type DownloadEvent } from '@tauri-apps/plugin-updater';
 export interface ReleaseInfo {
     version: string;
     pubDate?: string | null;
@@ -42,6 +42,10 @@ export declare function getAppVersion(): Promise<string>;
 export declare function getSupportUrl(): Promise<string | null>;
 /** Проверка обновления через официальный tauri-plugin-updater (читает latest.json хоста). */
 export declare function checkForUpdate(): Promise<Update | null>;
-/** Скачивание и установка обновления (тихо, без подтверждения). */
-export declare function downloadAndInstallUpdate(update: Update): Promise<void>;
+/**
+ * Скачивание и установка обновления (установка — только по явному клику юзера).
+ * `onEvent` — прогресс скачивания (Started/Progress/Finished из plugin-updater);
+ * фаза установки NSIS-инсталлера плагином не отчитывается.
+ */
+export declare function downloadAndInstallUpdate(update: Update, onEvent?: (progress: DownloadEvent) => void): Promise<void>;
 import './web-components';

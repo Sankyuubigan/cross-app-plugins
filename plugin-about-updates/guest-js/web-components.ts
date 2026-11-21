@@ -7,7 +7,9 @@ import {
   getSupportUrl,
   type ReleaseInfo,
 } from './index'
+import type { Update, DownloadEvent } from '@tauri-apps/plugin-updater'
 import { open } from '@tauri-apps/plugin-shell'
+import { logFront, logFrontendEvent } from '@my-tauri-plugins/plugin-logs'
 
 /**
  * Текст ошибки из reject-значения `invoke`.
@@ -27,6 +29,16 @@ function errorText(e: unknown): string {
   return String(e)
 }
 
+/** Лог стадии обновления в файл лога хоста (plugin-logs). Префикс SSOT с Rust-стороной плагина. */
+function logStage(msg: string) {
+  logFront(`[about-updates] ${msg}`)
+}
+
+/** Ошибка стадии обновления — уровень ERROR в файл лога хоста. */
+function logStageError(msg: string) {
+  void logFrontendEvent('ERROR', `[about-updates] ${msg}`)
+}
+
 /**
  * <about-updates-panel repo="owner/repo"></about-updates-panel>
  *
@@ -44,6 +56,8 @@ class AboutUpdatesPanel extends HTMLElement {
   private repo = ''
   private root!: ShadowRoot
   private busy = false
+  /** Обновление, найденное проверкой, но ещё не подтверждённое кликом «Обновить». */
+  private pendingUpdate: Update | null = null
   private historyLoaded = false
   private historyOpen = false
 
@@ -78,14 +92,17 @@ class AboutUpdatesPanel extends HTMLElement {
         pre { white-space: pre-wrap; max-height: 160px; overflow: auto; background: var(--bg-color, #f6f6f6);
               padding: 8px; border: 1px solid var(--border, #ccc); border-radius: 6px; margin: 6px 0 0;
               color: var(--text, #333); }
+        progress { width: 100%; height: 8px; margin-top: 8px; accent-color: var(--primary, #4a90d9); }
       </style>
       <div>
         <div><strong>Версия:</strong> <span id="ver">…</span></div>
         <div class="row">
-          <button id="check" class="primary">Проверить обновления</button>
+          <button id="check">Проверить обновления</button>
+          <button id="install" class="primary" hidden>Обновить</button>
           <button id="rollback">История / откат</button>
         </div>
         <div id="status" class="muted" style="margin-top:8px"></div>
+        <progress id="install-progress" max="100" hidden></progress>
         <div id="history" style="margin-top:8px" hidden></div>
       </div>`
 
@@ -103,25 +120,90 @@ class AboutUpdatesPanel extends HTMLElement {
     }
 
     this.root.getElementById('check')!.addEventListener('click', () => this.onCheck())
+    this.root.getElementById('install')!.addEventListener('click', () => this.onInstall())
     this.root.getElementById('rollback')!.addEventListener('click', () => this.onRollback())
   }
 
+  private setInstallVisible(visible: boolean) {
+    const el = this.root.getElementById('install')
+    if (el) el.hidden = !visible
+  }
+
+  /**
+   * Проверка ТОЛЬКО ищет обновление. Установка стартует исключительно из
+   * onInstall() по явному клику «Обновить» — правило хостов: auto-install запрещён.
+   */
   private async onCheck() {
     if (this.busy) return
     this.busy = true
     this.setStatus('Проверка…')
+    logStage('проверка обновлений начата')
     try {
       const update = await checkForUpdate()
       if (update) {
-        this.setStatus(`Доступно обновление ${update.version}. Установка…`)
-        await downloadAndInstallUpdate(update)
-        this.setStatus('Обновление установлено, перезапуск…')
+        this.pendingUpdate = update
+        this.setInstallVisible(true)
+        this.setStatus(`Доступно обновление ${update.version}.`)
+        logStage(`найдено обновление ${update.version}`)
       } else {
+        this.pendingUpdate = null
+        this.setInstallVisible(false)
         this.setStatus('У вас последняя версия.')
+        logStage('обновлений нет')
       }
     } catch (e) {
       this.setStatus('Ошибка: ' + errorText(e))
+      logStageError(`ошибка проверки: ${errorText(e)}`)
     } finally {
+      this.busy = false
+    }
+  }
+
+  private async onInstall() {
+    if (this.busy || !this.pendingUpdate) return
+    this.busy = true
+    const bar = this.root.getElementById('install-progress') as HTMLProgressElement | null
+    logStage(`установка обновления ${this.pendingUpdate.version} начата`)
+    try {
+      // Прогресс есть только у скачивания (Started/Progress/Finished из plugin-updater);
+      // фаза установки NSIS-инсталлера плагином не отчитывается — там статус «Установка…».
+      let contentLength: number | null = null
+      let downloaded = 0
+      this.setStatus('Скачивание…')
+      if (bar) {
+        bar.hidden = false
+        bar.value = 0
+      }
+      await downloadAndInstallUpdate(this.pendingUpdate, (e: DownloadEvent) => {
+        if (e.event === 'Started') {
+          contentLength = e.data.contentLength ?? null
+          if (bar && contentLength) bar.max = contentLength
+          logStage(contentLength
+            ? `скачивание начато (${(contentLength / (1024 * 1024)).toFixed(1)} МБ)`
+            : 'скачивание начато')
+        } else if (e.event === 'Progress') {
+          downloaded += e.data.chunkLength
+          if (!bar) return
+          if (contentLength) {
+            bar.value = downloaded
+            this.setStatus(`Скачивание… ${Math.min(100, Math.round((downloaded / contentLength) * 100))}%`)
+          } else {
+            // Сервер не отдал размер — честные килобайты вместо выдуманного процента.
+            this.setStatus(`Скачивание… ${Math.round(downloaded / 1024)} КБ`)
+          }
+        } else if (e.event === 'Finished') {
+          if (bar) bar.value = bar.max
+          this.setStatus('Установка…')
+          logStage('скачивание завершено, запуск установки (NSIS)')
+        }
+      })
+      this.setStatus('Обновление установлено, перезапуск…')
+      logStage('установка завершена, перезапуск…')
+    } catch (e) {
+      this.setStatus('Ошибка: ' + errorText(e))
+      logStageError(`ошибка установки: ${errorText(e)}`)
+    } finally {
+      if (bar) bar.hidden = true
       this.busy = false
     }
   }
