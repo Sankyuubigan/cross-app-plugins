@@ -26,7 +26,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::engine::lora::{lora_spawn_args_for_base, LoraSpec, LORA_MULTIPLIER_MAX};
 use crate::engine::models_catalog::ImageBundleEntry;
-use crate::engine::preflight::{preflight_check, PreflightVerdict};
+use crate::engine::preflight::{
+    gpu_compute_capability, preflight_check_for, ImageRequestProfile, PreflightVerdict,
+};
 use crate::engine::process_util::{
     assign_child_to_kill_job, kill_process_tree, register_engine_pid, unregister_engine_pid,
 };
@@ -35,6 +37,8 @@ use crate::engine::{ref_size, sdcpp_installer};
 /// Диапазон портов image-движка (не пересекается с llama 17800..19300).
 const PORT_MIN: u16 = 19400;
 const PORT_RANGE: u16 = 1500;
+/// Ёмкость кольца хвоста лога sd-server (Баг C: причина смерти в Err).
+const TAIL_LINES: usize = 40;
 /// Ожидание готовности сервера (загрузка 8B-энкодера + diffusion в память).
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(300);
 /// Общий таймаут одной генерации (долгая операция, минуты).
@@ -126,9 +130,15 @@ fn pick_free_port() -> Option<u16> {
 }
 
 pub struct ImageEngine {
-    child: std::process::Child,
+    /// Процесс sd-server под Mutex (Баг C): poll-смерть читает exit-код через
+    /// try_wait, не ломая &self-цепочку generate/poll_job.
+    child: std::sync::Mutex<std::process::Child>,
     base_url: String,
     client: reqwest::blocking::Client,
+    /// Кольцо последних строк stdout/stderr sd-server (Баг C): при смерти
+    /// сервера во время job poll HTTP падает, и хвост лога — единственная
+    /// причина. Честный Err вкладывает его после ENGINE_LOG_REASON.
+    tail: Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
 }
 
 /// Политика preflight при spawn sd-server.
@@ -147,11 +157,14 @@ pub enum PreflightPolicy {
 impl ImageEngine {
     /// Spawn sd-server с файлами бандла. Preflight — до spawn (понятная ошибка
     /// вместо падения сервера); вердикт Offload → стейджинг-флаги уже в cmd.
+    /// `req` — профиль запроса для честного preflight (Баг C: буферы зависят
+    /// от резолюции и режима, константный 2048 МБ пропускал непроходимые).
     pub fn new<L>(
         engine_dir: &Path,
         bundle_dir: &Path,
         entry: &ImageBundleEntry,
         variant_pref: Option<&str>,
+        req: ImageRequestProfile,
         log_cb: L,
     ) -> Result<Self, String>
     where
@@ -163,6 +176,7 @@ impl ImageEngine {
             entry,
             variant_pref,
             PreflightPolicy::Enforce,
+            req,
             log_cb,
         )
     }
@@ -174,6 +188,7 @@ impl ImageEngine {
         entry: &ImageBundleEntry,
         variant_pref: Option<&str>,
         policy: PreflightPolicy,
+        req: ImageRequestProfile,
         log_cb: L,
     ) -> Result<Self, String>
     where
@@ -197,7 +212,7 @@ impl ImageEngine {
         }
 
         // ── Preflight ДО spawn ──
-        let (verdict, est, msg) = preflight_check(entry);
+        let (verdict, est, msg) = preflight_check_for(entry, &req);
         log_cb(format!(
             "💾 Бандл: ~{:.1} ГБ на диске; VRAM full ~{:.1} ГБ / минимум ~{:.1} ГБ; RAM нужно ~{:.1} ГБ.",
             est.disk_mb / 1024.0,
@@ -259,9 +274,23 @@ impl ImageEngine {
         // С auto-fit планировщик сам кладёт diffusion в VRAM (приоритет 1),
         // а TE/VAE уводит в RAM и освобождает их GPU-копии после своей фазы,
         // так что diffusion остаётся резидентным на всех шагах.
+        // ── Flash-attention гард (Баг C/D, 21.11.2026) ──
+        // На Pascal/Volta (compute capability < 8) FA в CUDA-стеке даёт NaN
+        // (доказанный паттерн этого же окружения на llama-движке: дист-сэмплер
+        // падает в последний токен vocab). Флаги включаем только на Turing+
+        // (major ≥ 8); unknown GPU (NVML нет) — прежнее поведение (on).
+        let fa_ok = gpu_compute_capability()
+            .map(|(major, _)| major >= 8)
+            .unwrap_or(true);
+        if fa_ok {
+            cmd.args(["--fa", "--diffusion-fa"]);
+        } else {
+            log_cb(
+                "⚠️ Flash-attention отключена (GPU до Turing): NaN-паттерн CUDA на Pascal/Volta."
+                    .to_string(),
+            );
+        }
         cmd.args([
-            "--fa",
-            "--diffusion-fa",
             "--auto-fit",
             "on",
             // Зарезервировать ~1 ГБ от стартового свободного VRAM (документированная
@@ -332,12 +361,15 @@ impl ImageEngine {
         register_engine_pid(child.id());
         assign_child_to_kill_job(&child);
 
+        // Кольцо хвоста лога (Баг C) — заполняется pipe_log'ом обоих потоков.
+        let tail: Arc<std::sync::Mutex<std::collections::VecDeque<String>>> = Arc::default();
+
         // ОБА потока сервера — в лог хоста. sd.cpp пишет в stdout ВСЮ диагностику
         // (auto-fit plan, compute buffer / число сегментов, префикс-кэш, время
         // сэмплирования); stderr содержит только ggml/CUDA. Если слушать лишь
         // stderr, в логе остаются 4 строки и диагностировать пайплайн нечем.
-        pipe_log(child.stdout.take(), "sd-server", true);
-        pipe_log(child.stderr.take(), "sd-server", false);
+        pipe_log(child.stdout.take(), "sd-server", true, Some(Arc::clone(&tail)));
+        pipe_log(child.stderr.take(), "sd-server", false, Some(Arc::clone(&tail)));
 
         let client = reqwest::blocking::Client::builder()
             .connect_timeout(Duration::from_secs(5))
@@ -345,9 +377,10 @@ impl ImageEngine {
             .build()
             .map_err(|e| format!("Ошибка HTTP-клиента: {}", e))?;
         let engine = Self {
-            child,
+            child: std::sync::Mutex::new(child),
             base_url: format!("http://127.0.0.1:{}", port),
             client,
+            tail,
         };
         engine.wait_ready(&log_cb)?;
         Ok(engine)
@@ -562,13 +595,27 @@ impl ImageEngine {
                     return Err("CANCELLED".to_string());
                 }
             }
-            let st: JobStatus = self
+            let poll = self
                 .client
                 .get(format!("{}/sdcpp/v1/jobs/{}", self.base_url, job_id))
-                .send()
-                .map_err(|e| format!("Ошибка poll job: {}", e))?
-                .json()
-                .map_err(|e| format!("Ошибка парсинга job: {}", e))?;
+                .send();
+            let st: JobStatus = match poll {
+                Ok(resp) => resp
+                    .json()
+                    .map_err(|e| format!("Ошибка парсинга job: {}", e))?,
+                Err(e) => {
+                    // Тихая смерть (Баг C, 21.11.2026): сервер умер во время
+                    // job — poll падает с сетевой ошибкой, и раньше это
+                    // уходило глухим Io без причины → санитайзинг хоста +
+                    // слепые ретраи модели. Факт смерти → честный Err с
+                    // exit-кодом и хвостом лога (ENGINE_LOG_REASON — маркер
+                    // существующего хост-детекта is_honest_tool_error, §0.7).
+                    if let Some(dead) = self.dead_server_error() {
+                        return Err(dead);
+                    }
+                    return Err(format!("Ошибка poll job: {}", e));
+                }
+            };
             match st.status.as_str() {
                 "completed" => {
                     let b64 = st
@@ -594,6 +641,57 @@ impl ImageEngine {
             std::thread::sleep(POLL_INTERVAL);
         }
     }
+
+    /// Ошибка «сервер мёртв» с exit-кодом и хвостом лога, если процесс вышел
+    /// (Баг C). None — процесс жив: сетевая проблема, не смерть сервера.
+    fn dead_server_error(&self) -> Option<String> {
+        let mut child = self.child.lock().ok()?;
+        let status = child.try_wait().ok().flatten()?;
+        let tail_text = self.tail_snapshot();
+        Some(server_crash_message(status.code(), &tail_text))
+    }
+
+    /// Хвост лога сервера (кольцо pipe_log) одной строкой.
+    fn tail_snapshot(&self) -> String {
+        match self.tail.lock() {
+            Ok(t) => {
+                let lines: Vec<String> = t.iter().cloned().collect();
+                if lines.is_empty() {
+                    "(хвост лога пуст)".to_string()
+                } else {
+                    lines.join("\n")
+                }
+            }
+            Err(_) => "(хвост лога недоступен)".to_string(),
+        }
+    }
+}
+
+/// Честный текст краша sd-server (SSOT формата для теста): exit-код + хвост
+/// лога после маркера ENGINE_LOG_REASON — хост-детект is_honest_tool_error
+/// пропускает Io с этим маркером как честный текст (маскировать = ложь).
+fn server_crash_message(exit_code: Option<i32>, tail: &str) -> String {
+    format!(
+        "sd-server завершился во время генерации (код {:?}). {} {}",
+        exit_code,
+        crate::engine::ENGINE_LOG_REASON,
+        truncate_tail(tail, 1200)
+    )
+}
+
+/// Хвост строки с конца по границе строк (без разрыва посреди UTF-8 символа).
+fn truncate_tail(text: &str, max_chars: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= max_chars {
+        return text.to_string();
+    }
+    let cut = chars.len() - max_chars;
+    let start = chars[cut..]
+        .iter()
+        .position(|c| *c == '\n')
+        .map(|p| cut + p + 1)
+        .unwrap_or(cut);
+    chars[start..].iter().collect()
 }
 
 /// Дефолтный denoise-strength апскейла продукта. Выбран юзером 19.10.2026
@@ -613,10 +711,12 @@ pub fn upscale_target_dims(width: u32, height: u32) -> (u32, u32) {
 
 impl Drop for ImageEngine {
     fn drop(&mut self) {
-        let pid = self.child.id();
-        kill_process_tree(&mut self.child);
-        let _ = self.child.wait();
-        unregister_engine_pid(pid);
+        if let Ok(mut child) = self.child.lock() {
+            let pid = child.id();
+            kill_process_tree(&mut child);
+            let _ = child.wait();
+            unregister_engine_pid(pid);
+        }
     }
 }
 
@@ -630,7 +730,14 @@ fn round32(v: u32) -> u32 {
 /// LoRA («X / N … tensors … applied»); X < N → предупреждение (симптом
 /// несовместимости варианта модели, leejet issue #2083). Lora-скан включён
 /// только для image-движка; video_engine имел свою копию pipe_log.
-fn pipe_log<R>(stream: Option<R>, tag: &str, scan_lora: bool)
+/// `tail` (Баг C): арка кольца последних строк ОБОИХ потоков — при смерти
+/// сервера хвост попадает в честный Err (ENGINE_LOG_REASON), а не в никуда.
+fn pipe_log<R>(
+    stream: Option<R>,
+    tag: &str,
+    scan_lora: bool,
+    tail: Option<Arc<std::sync::Mutex<std::collections::VecDeque<String>>>>,
+)
 where
     R: std::io::Read + Send + 'static,
 {
@@ -650,6 +757,14 @@ where
             let text = line.trim_end();
             if text.is_empty() {
                 continue;
+            }
+            if let Some(t) = &tail {
+                if let Ok(mut ring) = t.lock() {
+                    ring.push_back(format!("[{}] {}", tag, text));
+                    while ring.len() > TAIL_LINES {
+                        ring.pop_front();
+                    }
+                }
             }
             if scan_lora {
                 if let Some((applied, total)) = crate::engine::lora::scan_lora_applied_line(text) {
@@ -708,7 +823,14 @@ where
     // пики RAM/VRAM (gen_guard.rs). Хостовые тула и GUI-команды проходят
     // через эту точку — оба канала защищены одним guard'ом.
     let _guard = crate::engine::gen_guard::MediaGenGuard::acquire()?;
-    let engine = ImageEngine::new(engine_dir, bundle_dir, entry, variant_pref, log_cb.clone())?;
+    let engine = ImageEngine::new(
+        engine_dir,
+        bundle_dir,
+        entry,
+        variant_pref,
+        crate::engine::preflight::ImageRequestProfile { width, height, edit_mode: false },
+        log_cb.clone(),
+    )?;
     engine.generate(
         prompt,
         width,
@@ -847,7 +969,20 @@ where
             width, height, canvas_w, canvas_h
         ));
     }
-    let engine = ImageEngine::new(engine_dir, bundle_dir, entry, variant_pref, log_cb.clone())?;
+    let engine = ImageEngine::new(
+        engine_dir,
+        bundle_dir,
+        entry,
+        variant_pref,
+        // Edit-профиль: canvas по референсу уже вычислен выше (Баг C —
+        // буферы preflight от фактического canvas, не константа).
+        crate::engine::preflight::ImageRequestProfile {
+            width: canvas_w,
+            height: canvas_h,
+            edit_mode: true,
+        },
+        log_cb.clone(),
+    )?;
     engine.generate(
         prompt,
         canvas_w,
@@ -909,7 +1044,16 @@ where
             dims.0, dims.1, w, h
         ));
     }
-    let engine = ImageEngine::new(engine_dir, bundle_dir, entry, variant_pref, log_cb.clone())?;
+    let engine = ImageEngine::new(
+        engine_dir,
+        bundle_dir,
+        entry,
+        variant_pref,
+        // img2img-профиль апскейла: цель ×2 (потолок 2048) — workspace больше
+        // базового замера (Баг C).
+        crate::engine::preflight::ImageRequestProfile { width: w, height: h, edit_mode: true },
+        log_cb.clone(),
+    )?;
     engine.generate(
         prompt,
         w,
@@ -933,6 +1077,31 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Баг C (21.11.2026): честный текст краша sd-server несёт exit-код и
+    /// хвост лога ПОСЛЕ маркера ENGINE_LOG_REASON — хост-детект
+    /// is_honest_tool_error пропускает Io с этим маркером (маскировать = ложь).
+    #[test]
+    fn server_crash_message_carries_exit_code_and_tail() {
+        let tail = "[sd-server] [E] CUDA error: out of memory in allocate_tensor\n[sd-server] ggml-backend: last line";
+        // 0xC0000409 как i32 (форма status.code() на Windows) — фактическая
+        // форма fast-fail краша ggml (инцидент E5 0xC0000409).
+        let msg = server_crash_message(Some(-1073741510), tail);
+        assert!(msg.contains("-1073741510"), "exit-код обязателен: {}", msg);
+        assert!(msg.contains(crate::engine::ENGINE_LOG_REASON), "маркер причины обязателен: {}", msg);
+        assert!(msg.contains("CUDA error: out of memory"), "хвост лога обязателен: {}", msg);
+    }
+
+    /// truncate_tail не рвёт посреди UTF-8 и ограничивает длину.
+    #[test]
+    fn truncate_tail_bounds_and_keeps_utf8() {
+        let long = "а".repeat(2000);
+        let cut = truncate_tail(&long, 100);
+        assert!(cut.chars().count() <= 100, "ограничение длины: {}", cut.chars().count());
+        assert!(cut.chars().all(|c| c == 'а'), "валидный UTF-8 без мусора");
+        // Короткий текст проходит без изменений.
+        assert_eq!(truncate_tail("ok", 100), "ok");
+    }
 
     #[test]
     fn round32_snaps_to_multiples() {

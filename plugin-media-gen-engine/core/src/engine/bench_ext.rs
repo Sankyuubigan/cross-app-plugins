@@ -242,6 +242,7 @@ where
         entry,
         variant_pref,
         crate::engine::image_engine::PreflightPolicy::Measure,
+        crate::engine::preflight::ImageRequestProfile::default(),
         log_cb.clone(),
     )?;
     let load_time_s = load_start.elapsed().as_secs_f64();

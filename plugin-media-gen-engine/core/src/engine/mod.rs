@@ -65,7 +65,9 @@ pub use models_catalog::{
     VideoPreset,
 };
 pub use preflight::{
-    estimate_image_memory_mb, preflight_check, MemoryEstimate, PreflightVerdict,
+    compute_buffers_for_request_mb, estimate_image_memory_mb, estimate_image_memory_mb_for,
+    gpu_compute_capability, preflight_check, preflight_check_for, ImageRequestProfile,
+    MemoryEstimate, PreflightVerdict,
 };
 pub use process_util::kill_active_engines;
 pub use refmod::{

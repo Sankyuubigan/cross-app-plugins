@@ -103,6 +103,7 @@ where
         entry,
         None,
         crate::engine::image_engine::PreflightPolicy::Measure,
+        crate::engine::preflight::ImageRequestProfile::default(),
         log_cb.clone(),
     )?;
     log_cb(format!("⏱ Загрузка бандла: {:.1} сек.", load_start.elapsed().as_secs_f64()));

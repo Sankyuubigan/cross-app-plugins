@@ -353,6 +353,7 @@ where
             &entry,
             None,
             crate::engine::image_engine::PreflightPolicy::Measure,
+            crate::engine::preflight::ImageRequestProfile::default(),
             log_cb.clone(),
         )?;
         log_cb(format!(
