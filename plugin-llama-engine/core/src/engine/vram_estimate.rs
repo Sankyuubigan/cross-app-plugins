@@ -809,6 +809,39 @@ mod tests {
     }
 
     #[test]
+    fn hardware_ceiling_from_window_is_not_capped_by_initial_slot() {
+        // Баг A (21.11.2026, инцидент: промпт валидатора 20725 ток > слот 16384
+        // при 14.4 ГБ свободной VRAM): потолок железа обязан считаться от ОКНА
+        // GGUF (base_ctx), а не от стартового слота. Иначе step-up структурно
+        // мёртв (слот никогда < потолка), а бюджет компакции хоста зажат
+        // слотом — ровно это сломал «Вариант B» (6f2bf21), передавая слот как
+        // global_ctx_limit.
+        // Синтетика из лога dev-машины: окно 262144, модель ~6653 МБ, KV ~736
+        // МБ на слоте 16384 (масштабируется по токам), свободно 14451 МБ.
+        let window = 262_144u32;
+        let slot = 16_384u32;
+        let kv_per_token_mb = 736.0 / 16_384.0;
+        let mut e = est(6653.0, kv_per_token_mb * 2048.0, 48);
+        e.kv_per_token_mb = kv_per_token_mb;
+        e.kv_mb = kv_per_token_mb * window as f64;
+        // VRAM: свободно 14451 МБ (лог 07:34 21.11.2026); RAM-бюджет велик,
+        // чтобы стороной ограничения была только VRAM (как на dev-машине).
+        let ceiling = compute_hardware_ctx_ceiling(&e, window, 48, 14451.0, 1024.0, 65_536.0);
+        assert!(
+            ceiling > slot,
+            "потолок железа ({}) обязан быть больше стартового слота ({}) — иначе step-up мёртв",
+            ceiling,
+            slot
+        );
+        assert!(ceiling <= window, "потолок ({}) не может превышать окно {}", ceiling, window);
+        // Сам шаг step-up для инцидента: потребность 20725+2048=22773 ток
+        // должна подниматься тиром, влезающим в потолок.
+        let step_target = next_tier(20_725 + 2_048, ceiling);
+        assert!(step_target >= 32_768, "тир step-up ({}) обязан покрыть промпт инцидента", step_target);
+        assert!(step_target <= ceiling);
+    }
+
+    #[test]
     fn hardware_ceiling_is_min_of_vram_and_ram_sides() {
         // est: веса 5000, KV 1000 (dense-only), 10 слоёв, буферы min(600,640)=600.
         let e = est(5_000.0, 1_000.0, 10);

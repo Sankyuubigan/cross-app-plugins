@@ -267,6 +267,9 @@ struct RespawnCtx {
     /// Финальные флаги запуска ПОСЛЕ фолбэков цикла запуска (реально применились).
     reasoning_enabled: bool,
     is_pre_hopper: bool,
+    /// Фактический флаг FA этого прогона (Баг D: на Pascal/Volta FA off —
+    /// NaN-логиты → dist-сэмплер падает в последний токен vocab).
+    flash_attn: bool,
     /// PATH с общей папкой CUDA-рантайма (`backends/_cudart/<семейство>/`).
     /// None для CPU/Vulkan/HIP и старых установок, где DLL лежат рядом с exe.
     cudart_path: Option<String>,
@@ -297,14 +300,14 @@ impl Prng {
 }
 
 impl LlamaEngine {
-    pub fn new<L, S>(engine_dir: &Path, model_path: &str, global_ctx_limit: u32, kv_quant_keys: bool, kv_quant_values: bool, reasoning_budget: u32, log_cb: L, stream_cb: S) -> Result<Self, String>
+    pub fn new<L, S>(engine_dir: &Path, model_path: &str, initial_slot_ctx: u32, kv_quant_keys: bool, kv_quant_values: bool, reasoning_budget: u32, log_cb: L, stream_cb: S) -> Result<Self, String>
     where L: Fn(String) + Send + Sync + 'static, S: Fn(String) + Send + Sync + 'static
     {
-        Self::new_with_mmproj(engine_dir, model_path, None, global_ctx_limit, kv_quant_keys, kv_quant_values, reasoning_budget, log_cb, stream_cb)
+        Self::new_with_mmproj(engine_dir, model_path, None, initial_slot_ctx, kv_quant_keys, kv_quant_values, reasoning_budget, log_cb, stream_cb)
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn new_with_mmproj<L, S>(engine_dir: &Path, model_path: &str, mmproj_path: Option<&str>, global_ctx_limit: u32, kv_quant_keys: bool, kv_quant_values: bool, reasoning_budget: u32, log_cb: L, stream_cb: S) -> Result<Self, String>
+    pub fn new_with_mmproj<L, S>(engine_dir: &Path, model_path: &str, mmproj_path: Option<&str>, initial_slot_ctx: u32, kv_quant_keys: bool, kv_quant_values: bool, reasoning_budget: u32, log_cb: L, stream_cb: S) -> Result<Self, String>
     where L: Fn(String) + Send + Sync + 'static, S: Fn(String) + Send + Sync + 'static
     {
         let log_cb: std::sync::Arc<dyn Fn(String) + Send + Sync> = std::sync::Arc::new(log_cb);
@@ -530,14 +533,25 @@ impl LlamaEngine {
         let use_gpu = installed_family.is_gpu();
         let mut gpu_layers: u32 = if use_gpu { 999 } else { 0 };
 
-        // Окно GGUF до мутаций гейтами — база hardware-потолка (PRP C1):
-        // хост-слот приходит сюда равным окну из GGUF (SSOT «Слот движка»).
-        let gguf_window = global_ctx_limit;
-        // Мутабельная тень объявлена ДО префлайта: VRAM-гейт контекста (ниже)
-        // режет ctx до ngl-резки, и урезанное значение обязаны увидеть все
-        // потребители — `--ctx-size` в build_cmd (захват замыкания) и
-        // `Self { global_ctx_limit }` (бюджет компакции хоста читает его).
-        let mut global_ctx_limit = global_ctx_limit;
+        // ── SSOT окна GGUF (Баг A, 21.11.2026) ──
+        // Хост после тир-слотов («Вариант B», 6f2bf21) передаёт СЛОТ — тир от
+        // потребности истории (интра-ходовой рост промпта: INCLUDE-база в
+        // системных промптах, инжект отчётов коллег — слоту невидимы). Слот
+        // может быть на порядки меньше окна GGUF; считать слот окном нельзя:
+        // hardware_ctx_limit капался бы слотом → step-up структурно мёртв
+        // (слот никогда < потолка), бюджет компакции хоста зажат слотом
+        // (инцидент: промпт 20725 ток > слот 16384 при 14.4 ГБ свободной VRAM —
+        // честный отказ вместо step-up до ~70k). SSOT окна — сам GGUF
+        // (`<arch>.context_length`, llm_gguf::extract_context_length); нет
+        // ключа — фолбэк на слот (окно модели неизвестно).
+        let gguf_window = crate::engine::llm_gguf::extract_context_length(&model_path)
+            .unwrap_or(initial_slot_ctx);
+        // Слот хоста = стартовый --ctx-size. Мутабельная тень объявлена ДО
+        // префлайта: VRAM-гейт контекста (ниже) режет ctx до ngl-резки, и
+        // урезанное значение обязаны увидеть все потребители — `--ctx-size` в
+        // build_cmd (захват замыкания) и `Self { global_ctx_limit }`
+        // (бюджет компакции хоста читает его).
+        let mut global_ctx_limit = initial_slot_ctx;
 
         // ── Pre-flight VRAM: модель не влезает в GPU? ──
         // Ступенчатый авто-offload («сколько влезет»), БЕЗ блокирующего диалога:
@@ -864,6 +878,14 @@ impl LlamaEngine {
         // "invalid device function" из-за бага в llama.cpp (проверяет ptxVersion,
         // но не compute capability). Отключаем через env-var.
         let is_pre_hopper = gpu_info.compute_major > 0 && gpu_info.compute_major < 9;
+        // Flash-attn гард (Баг D, 21.11.2026): на Pascal (sm_60) и Volta (sm_70)
+        // FA в связке с NaN-логитами прогонял дист-сэмплер в последний токен vocab
+        // (<unused6226> = n_vocab−1 → крэш «empty grammar stack» / «0 дельт»).
+        // Флаг включаем только на sm_75+ (Turing и новее); unknown GPU
+        // (compute_major == 0, CPU/Vulkan/старый NVML) — прежнее поведение (on).
+        let flash_attn_ok = gpu_info.compute_major == 0
+            || gpu_info.compute_major > 7
+            || (gpu_info.compute_major == 7 && gpu_info.compute_minor >= 5);
 
         // CUDA-DLL лежат ОДИН раз в `backends/_cudart/<семейство>/`, а не рядом
         // с exe каждого варианта. Windows ищет библиотеки: папка exe → System32 →
@@ -900,7 +922,7 @@ impl LlamaEngine {
                 .arg("--parallel").arg(crate::engine::vram_estimate::SERVER_N_PARALLEL.to_string())
                 .arg("-t").arg(threads.to_string())
                 .arg("-ngl").arg(gpu_layers.to_string())
-                .arg("--flash-attn").arg("on")
+                .arg("--flash-attn").arg(if flash_attn_ok { "on" } else { "off" })
                 .arg("--no-webui")
                 .arg("--jinja")
                 .arg("--log-file").arg(&server_log);
@@ -1285,6 +1307,7 @@ impl LlamaEngine {
                 kv_spec,
                 reasoning_enabled: attempt_reasoning,
                 is_pre_hopper,
+                flash_attn: flash_attn_ok,
                 cudart_path: cudart_path.clone(),
             })),
             engine_mode: std::cell::RefCell::new(engine_mode.clone()),
@@ -1648,8 +1671,32 @@ impl LlamaEngine {
             output_tokens,
             reasoning_tokens,
             finish_reason,
-            stderr_lines: self.server_trace.diagnostic_lines(),
+            stderr_lines: self.drain_stderr_for_diagnostics(),
         }
+    }
+
+    /// Гонка доставки (Баг D, 21.11.2026): stderr-насос качает строки в
+    /// ServerTrace из отдельного потока — строка исключения могла быть
+    /// напечатана ДО момента обнаружения отказа, но ещё не доехать (инцидент
+    /// юзера: stderr_tail обрезан ДО строки «Unexpected empty grammar stack»).
+    /// Bounded poll: ждём появления НОВОЙ диагностической строки до 150 мс
+    /// (шаг 20 мс); как только доехала — даём 20 мс на догрузку хвоста.
+    /// Если за 150 мс ничего не приехало — читаем что есть: латентность растёт
+    /// максимум на 150 мс, а путь выполняется только при отказе.
+    fn drain_stderr_for_diagnostics(&self) -> Vec<String> {
+        let initial = self.server_trace.diagnostic_lines().len();
+        let mut waited_ms = 0u32;
+        while waited_ms < 150 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            waited_ms += 20;
+            let latest = self.server_trace.diagnostic_lines().len();
+            if latest > initial {
+                // Строка доехала — даём 20 мс на догрузку хвоста и выходим.
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                break;
+            }
+        }
+        self.server_trace.diagnostic_lines()
     }
 
     /// Ошибка генерации гарантированно уходит в единый лог (log::Log) и телеметрию.
@@ -1707,7 +1754,13 @@ impl LlamaEngine {
         }
         let actual_min_p = params.min_p.max(0.0);
         let actual_rep_pen = params.repetition_penalty.max(1.0);
-        let actual_temp = params.temperature.max(0.01);
+        // Баг D (21.11.2026): кламп 0.0→0.01 снят. strict-режим обязан быть
+        // ЧИСТЫМ greedy: llama-server при temp=0 использует greedy-сэмплер, а
+        // dist-сэмплер с temp 0.01 при NaN-логитах (Pascal+flash-attn) падал в
+        // ПОСЛЕДНИЙ токен vocab (<unused6226> = n_vocab−1 → крэш «empty grammar
+        // stack» у грамматик / «0 дельт» у Ornith-класса с 2047 unused-токенами).
+        // Корневая причина NaN-логитов гасится гардом flash-attn (flash_attn_ok).
+        let actual_temp = params.temperature;
 
         log_cb(format!(
             "🎛 Фактические параметры сэмплинга: Temp={:.2}, Top_K={}, Top_P={:.2}, Min_P={:.2}, Rep_Pen={:.2}, Pres_Pen={:.2}, DRY={:.2}/{:.2}/{}, XTC={:.2}/{:.2}",
@@ -2108,9 +2161,26 @@ impl LlamaEngine {
                 first_event_at = Some(Instant::now());
             }
             stream_events += 1;
+            // ── SSE error-фрейм (Баг D, 21.11.2026) ──
+            // llama-server в стрим-режиме шлёт ошибку как `data: {"error": …}`.
+            // Такой фрейм ПАРСИТСЯ в ChatCompletionEvent успешно (все поля
+            // дефолтные) и молча терялся → EOF трактовался как «Сервер закрыл
+            // поток до первого токена» (инцидент юзера 00:21: крэш грамматики
+            // выглядел «тихой смертью» стрима). Честная ошибка вместо молчания.
+            if is_sse_error_frame(data) {
+                let report = mem_guard.finish();
+                let message = self.err_details(
+                    &report,
+                    &format!("llama-server: ошибка генерации: {}", truncate_str(data, 500)),
+                );
+                self.report_generation_error(ctx_label, &report, &message);
+                return Err(message);
+            }
             let event: ChatCompletionEvent = match serde_json::from_str(data) {
                 Ok(e) => e,
                 Err(_) => {
+                    // НЕпарсируемый фрейм с «error» — прежний честный путь
+                    // (parseable error-фрейм уже пойман is_sse_error_frame выше).
                     if data.contains("\"error\"") {
                         let report = mem_guard.finish();
                         let message = self.err_details(
@@ -2560,7 +2630,7 @@ impl LlamaEngine {
             .arg("--parallel").arg(crate::engine::vram_estimate::SERVER_N_PARALLEL.to_string())
             .arg("-t").arg(ctx.threads.to_string())
             .arg("-ngl").arg(new_ngl.to_string())
-            .arg("--flash-attn").arg("on")
+            .arg("--flash-attn").arg(if ctx.flash_attn { "on" } else { "off" })
             .arg("--no-webui")
             .arg("--jinja")
             .arg("--log-file").arg(&self.server_log);
@@ -2717,6 +2787,10 @@ impl LlamaEngine {
         let mut stream_retry_used = false;
         // PRP C6: mid-turn step-up слота — один за вызов.
         let mut step_up_used = false;
+        // Крэш грамматики (Баг D, 21.11.2026): ретрай ВООБЩЕ БЕЗ грамматики
+        // (детерминированный крэш gbnf-стека; JSON-only тоже падал). Один за вызов.
+        let mut effective_grammar = grammar.clone();
+        let mut grammar_fallback_used = false;
         loop {
             let result = self.run_chat_completions(
                 messages,
@@ -2724,7 +2798,7 @@ impl LlamaEngine {
                 max_tokens,
                 params,
                 stop_words,
-                grammar.clone(),
+                effective_grammar.clone(),
                 disable_reasoning,
                 cancel_flag.clone(),
                 ctx_label,
@@ -2752,6 +2826,25 @@ impl LlamaEngine {
                 log::error!("LLM генерация [{}]: {}", ctx_label, strip_stream_retry_marker(&err));
             }
             let err = strip_stream_retry_marker(&err);
+            // ── Крэш грамматики gbnf-сэмплера (Баг D, 21.11.2026) ──
+            // «Unexpected empty grammar stack after accepting piece: …» —
+            // llama-server падает на токенах вне грамматики (битая таблица
+            // токенов модели, инцидент юзера: <unused6226>). Ретрай С
+            // грамматикой бесполезен (детерминированный крэш), JSON-only
+            // грамматика тоже. Структурный выход — ОДИН ретрай ВООБЩЕ БЕЗ
+            // грамматики: конверт разберёт tolerant-парсер хоста (parsers.rs),
+            // «думатель без ответа» гасится существующей ретрай-механикой
+            // оркестратора (§0.7 — нового контура не создаём).
+            if !grammar_fallback_used && is_grammar_crash_text(&err) {
+                grammar_fallback_used = true;
+                effective_grammar = None;
+                (self.log_cb.borrow())(
+                    "⚠️ Сэмплер грамматики движка упал — повторяю запрос без грамматики (один ретрай)…"
+                        .to_string(),
+                );
+                log::warn!("grammar crash → единственный ретрай без грамматики");
+                continue;
+            }
             // OOM-детект: (1) явные маркеры в тексте ошибки и/или в хвосте лога движка;
             // (2) «молчаливая смерть» стрима — сервер убит БЕЗ печати OOM (драйвер
             // сбросил GPU по TDR раньше, чем ggml написал диагноз), при этом пиковый
@@ -2785,26 +2878,62 @@ impl LlamaEngine {
             }
             // ── C6: переполнение слота — step-up, не усечение (§00.2) ──
             // Рост от выходов тулов, который стартовая оценка не видит
-            // структурно: поднимаем слот на тир выше (в пределах hardware-
-            // потолка), один ретрай. Усечение истории — не здесь: его держит
-            // бюджет компакции хоста у потолка железа (PRP C5).
-            if !step_up_used && is_ctx_overflow_text(&err) && self.slot.get() < self.hardware_ctx_limit {
-                let new_ctx = crate::engine::vram_estimate::next_tier(
-                    self.slot.get().saturating_add(1),
-                    self.hardware_ctx_limit,
-                );
-                step_up_used = true;
-                if new_ctx > self.slot.get() {
-                    (self.log_cb.borrow())(format!(
-                        "🔄 Промпт не влез в слот {} токенов — поднимаю слот движка до {} (step-up, один ретрай)...",
+            // структурно: поднимаем слот в пределах hardware-потолка, один
+            // ретрай. Усечение истории — не здесь: его держит бюджет компакции
+            // хоста у потолка железа (PRP C5).
+            // Баг A (21.11.2026): целевой тир — от ФАКТИЧЕСКОЙ потребности
+            // (промпт из тела HTTP 400 + бюджет генерации), не слепой «тир
+            // выше»: промпт 50k+ одним слепым шагом 16384→32768 не покрыть,
+            // и каждый лишний 400-цикл — лишний респавн движка.
+            if !step_up_used && is_ctx_overflow_text(&err) {
+                let prompt_tokens = parse_overflow_prompt_tokens(&err);
+                if self.slot.get() >= self.hardware_ctx_limit {
+                    // Пропуск step-up: потолок железа достигнут — дальше только
+                    // усечение/компакция хоста. Причина пропуска — в лог (раньше
+                    // мёртвый gate молчал, инцидент 07:37 21.11.2026).
+                    log::warn!(
+                        "ctx overflow → step-up недоступен: слот {} >= потолка железа {} (prompt={:?})",
                         self.slot.get(),
-                        new_ctx
-                    ));
-                    log::warn!("ctx overflow → step-up слота {} → {}", self.slot.get(), new_ctx);
-                    if let Err(resp_err) = self.respawn_with(self.current_ngl.get(), new_ctx) {
-                        return Err(format!("{}\n\nНе удалось поднять слот движка: {}", err, resp_err));
+                        self.hardware_ctx_limit,
+                        prompt_tokens
+                    );
+                } else {
+                    let need = prompt_tokens
+                        .map(|p| p.saturating_add(max_tokens as u32))
+                        .unwrap_or_else(|| self.slot.get().saturating_add(1));
+                    let new_ctx = crate::engine::vram_estimate::next_tier(
+                        need,
+                        self.hardware_ctx_limit,
+                    );
+                    if new_ctx > self.slot.get() {
+                        step_up_used = true;
+                        (self.log_cb.borrow())(format!(
+                            "🔄 Промпт {} не влез в слот {} токенов — поднимаю слот движка до {} (потолок железа {}; step-up, один ретрай)...",
+                            prompt_tokens
+                                .map(|p| p.to_string())
+                                .unwrap_or_else(|| "?".into()),
+                            self.slot.get(),
+                            new_ctx,
+                            self.hardware_ctx_limit
+                        ));
+                        log::warn!(
+                            "ctx overflow → step-up слота {} → {} (prompt={:?}, ceiling={})",
+                            self.slot.get(),
+                            new_ctx,
+                            prompt_tokens,
+                            self.hardware_ctx_limit
+                        );
+                        if let Err(resp_err) = self.respawn_with(self.current_ngl.get(), new_ctx) {
+                            return Err(format!("{}\n\nНе удалось поднять слот движка: {}", err, resp_err));
+                        }
+                        continue;
                     }
-                    continue;
+                    log::warn!(
+                        "ctx overflow → next_tier({}) не вырос выше слота {} (потолок {}) — ретрай бессмыслен",
+                        need,
+                        self.slot.get(),
+                        self.hardware_ctx_limit
+                    );
                 }
             }
             let err_is_oom = is_cuda_oom_text(&err) || log_tail_oom || vram_pressure;
@@ -3228,6 +3357,51 @@ fn mmproj_error_detail(log: &str) -> String {
 fn is_ctx_overflow_text(text: &str) -> bool {
     let h = text.to_lowercase();
     h.contains("exceed_context_size_error") || h.contains("exceeds the available context size")
+}
+
+/// Число промпт-токенов из тела HTTP 400 `exceed_context_size_error`
+/// (сообщение llama-server содержит `... n_prompt_tokens=20725, n_ctx=16384 ...`,
+/// верифицировано логом 21.11.2026). Целевой тир step-up считается от
+/// ФАКТИЧЕСКОЙ потребности, а не слепым «тиром выше» (Баг A, 21.11.2026).
+/// Без regex-зависимости ради одного числа.
+fn parse_overflow_prompt_tokens(text: &str) -> Option<u32> {
+    let idx = text.find("n_prompt_tokens")?;
+    let rest = &text[idx + "n_prompt_tokens".len()..];
+    let rest = rest.trim_start_matches(|c: char| c.is_whitespace() || c == '=');
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    let digits = &rest[..end];
+    if digits.is_empty() {
+        None
+    } else {
+        digits.parse::<u32>().ok()
+    }
+}
+
+/// SSE-фрейм с ошибкой от llama-server: `data: {"error": {"message": …}}`
+/// (стрим-режим: llama.cpp шлёт исключения генерации — включая крэш грамматики
+/// «Unexpected empty grammar stack» — именно так, проверено логом юзера
+/// 21.11.2026 00:21). Раньше такой фрейм ПАРСИЛСЯ в ChatCompletionEvent
+/// успешно (все поля дефолтные) и молча терялся → EOF трактовался как
+/// «Сервер закрыл поток до первого токена» → бесполезный ретрай. `error: null`
+/// внутри существующего события ошибкой НЕ является.
+fn is_sse_error_frame(data: &str) -> bool {
+    if !data.contains("\"error\"") {
+        return false;
+    }
+    match serde_json::from_str::<serde_json::Value>(data) {
+        Ok(v) => v.get("error").map(|e| !e.is_null()).unwrap_or(false),
+        Err(_) => false,
+    }
+}
+
+/// Крэш gbnf-сэмплера llama-server: «Unexpected empty grammar stack after
+/// accepting piece: <unused6226> (262143)» (дословно из лога юзера 21.11.2026
+/// 00:21; детерминированный крэш — задача 0 и ретрай задачи 3 упали одинаково
+/// за 0.2 с, ретрай С грамматикой бесполезен, JSON-only грамматика тоже).
+fn is_grammar_crash_text(text: &str) -> bool {
+    text.to_lowercase().contains("empty grammar stack")
 }
 
 fn is_cuda_oom_text(text: &str) -> bool {
@@ -3732,6 +3906,49 @@ mod tests {
         assert!(!should_retry_stream(false, false, &after_first_token));
     }
 
+    /// Баг D (21.11.2026): крэш gbnf-сэмплера — дословная строка из лога юзера
+    /// 00:21. Детектор обязан ловить её в HTTP-тексте ошибки («llama-server:
+    /// ошибка генерации: {json}» после фикса SSE error-фрейма).
+    #[test]
+    fn grammar_crash_detected_from_real_message() {
+        let real = "llama-server: ошибка генерации: {\"error\":{\"message\":\"Unexpected empty grammar stack after accepting piece: <unused6226> (262143)\",\"type\":\"runtime_error\",\"code\":0}}";
+        assert!(is_grammar_crash_text(real), "дословная строка лога юзера обязана детектиться");
+        // И голое сообщение без обёртки тоже.
+        assert!(is_grammar_crash_text(
+            "Unexpected empty grammar stack after accepting piece: <unused6226> (262143)"
+        ));
+        // Обычные ошибки не матчятся.
+        assert!(!is_grammar_crash_text("exceed_context_size_error"));
+        assert!(!is_grammar_crash_text("CUDA error: out of memory"));
+    }
+
+    /// Баг D (21.11.2026): SSE error-фрейм раньше ПАРСИЛСЯ в ChatCompletionEvent
+    /// (serde игнорирует неизвестные поля) и молча терялся → ложный «Сервер
+    /// закрыл поток до первого токена». Детектор ловит parseable `{"error":…}`,
+    /// `error: null` ошибкой НЕ считается, обычные чанки не задевает.
+    #[test]
+    fn sse_error_frame_detector_catches_real_payload_shapes() {
+        // Реальная форма из лога юзера 00:21 (крэш грамматики).
+        assert!(is_sse_error_frame(
+            "{\"error\":{\"message\":\"Unexpected empty grammar stack after accepting piece: <unused6226> (262143)\",\"type\":\"runtime_error\",\"code\":0}}"
+        ));
+        // Прочие формы ошибок llama-server.
+        assert!(is_sse_error_frame(
+            "{\"error\":{\"message\":\"invalid model file\",\"type\":\"runtime_error\"}}"
+        ));
+        // error: null внутри события — НЕ ошибка.
+        assert!(!is_sse_error_frame("{\"error\":null}"));
+        // Обычный чанк без error — не задевается.
+        assert!(!is_sse_error_frame(
+            "{\"content\":\"фрагмент\",\"stop\":false}"
+        ));
+        // НО: обычный чанк, содержащий слово "error" в ЗНАЧЕНИИ строки-контента,
+        // обязан парситься и НЕ быть ошибкой (error-ключ отсутствует).
+        assert!(!is_sse_error_frame(
+            "{\"content\":\"произошла error-ситуация\",\"stop\":false}"
+        ));
+    }
+
     #[test]
     fn log_tail_prioritizes_errors_and_keeps_recent_lines() {
         let mut content = String::new();
@@ -3771,6 +3988,16 @@ mod tests {
         assert_eq!(vram_peak_mb_from_error(""), None);
         // VRAM=0 (в начале строки без данных) → None.
         assert_eq!(vram_peak_mb_from_error("VRAM=0 МБ"), None);
+    }
+
+    #[test]
+    fn overflow_prompt_tokens_parsed_from_real_400_body() {
+        // Дословный фрагмент тела HTTP 400 из лога 21.11.2026 (Баг A):
+        // по нему целевой тир step-up считается от фактической потребности.
+        let body = "{\"error\":{\"message\":\"the request exceeds the available context size. (n_prompt_tokens=20725, n_ctx=16384, n_batch=2048)\"}}";
+        assert_eq!(parse_overflow_prompt_tokens(body), Some(20725));
+        assert_eq!(parse_overflow_prompt_tokens("n_prompt_tokens="), None);
+        assert_eq!(parse_overflow_prompt_tokens("никакого overflow тут нет"), None);
     }
 
     #[test]
