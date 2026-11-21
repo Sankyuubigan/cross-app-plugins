@@ -21,10 +21,11 @@ use std::path::PathBuf;
 
 use gpui_kit::base::StyledExt as _;
 use gpui_kit::component::button::Button;
+use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{ActiveTheme, h_flex};
 use gpui_kit::{
     App, InteractiveElement as _, IntoElement, ParentElement as _, RenderOnce, SharedString,
-    StatefulInteractiveElement as _, Styled, StyleRefinement, Window, div, px,
+    Styled, StyleRefinement, Window, div, px,
 };
 use log_collector_core::logger;
 
@@ -105,7 +106,7 @@ impl RenderOnce for LogsPanel {
         // Fn(&ClickEvent, &mut Window, &mut App) — listener не нужен).
         let copy_tail = tail.clone();
         let copy = Button::new("logs_copy").label("Копировать").on_click(move |_, _, _| {
-            copy_to_clipboard(&copy_tail);
+            copy_to_clipboard(&copy_tail, "логи");
         });
 
         let save_tail = tail.clone();
@@ -125,6 +126,13 @@ impl RenderOnce for LogsPanel {
                 Some(f) => f(window, cx),
                 None => window.refresh(),
             }
+        });
+
+        // Копирование ПУТИ лог-файла (PRP 19.11.26 шаг 2): в gpui-pre текст
+        // не выделяется мышью — кнопка вместо селекции.
+        let copy_path_text = path_text.clone();
+        let copy_path = Button::new("logs_copy_path").label("Копировать путь").on_click(move |_, _, _| {
+            copy_to_clipboard(&copy_path_text, "путь лог-файла");
         });
 
         div()
@@ -155,10 +163,22 @@ impl RenderOnce for LogsPanel {
                             .child(SharedString::from(path_text)),
                     ),
             )
-            // Кнопки: плагинный набор (Копировать/Сохранить/Очистить) + Обновить.
-            .child(h_flex().gap_2().child(copy).child(save).child(clear).child(refresh))
+            // Кнопки: плагинный набор (Копировать/Сохранить/Очистить) +
+            // «Копировать путь» (текст в gpui-pre не выделяется мышью) + Обновить.
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(copy)
+                    .child(copy_path)
+                    .child(save)
+                    .child(clear)
+                    .child(refresh),
+            )
             .child(div().h(px(1.0)).w_full().bg(cx.theme().border))
-            // Текст лога: Consolas 12px, приглушённый, утопленный фон поля, скролл.
+            // Текст лога: Consolas 12px, приглушённый, утопленный фон поля.
+            // Scrollable-обёртка кита (PRP 19.11.26 шаг 3): голый
+            // overflow_y_scroll в бою не давал ни полосы, ни уверенного колеса —
+            // обёртка даёт track_scroll + видимую вертикальную полосу.
             .child(
                 div()
                     .id("logs_text")
@@ -170,17 +190,18 @@ impl RenderOnce for LogsPanel {
                     .font_family("Consolas")
                     .text_size(px(12.0))
                     .text_color(cx.theme().muted_foreground)
-                    .overflow_y_scroll()
+                    .overflow_y_scrollbar()
                     .child(tail),
             )
     }
 }
 
 /// Копирование в буфер обмена через arboard (краткоживущий клипборд-объект).
-fn copy_to_clipboard(text: &str) {
+/// `what` — что копируется, для честного лога (хвост лога / путь файла).
+fn copy_to_clipboard(text: &str, what: &str) {
     match arboard::Clipboard::new() {
         Ok(mut clipboard) => match clipboard.set_text(text.to_string()) {
-            Ok(()) => log::info!("логи скопированы в буфер обмена ({} строк)", text.lines().count()),
+            Ok(()) => log::info!("{what} скопированы в буфер обмена ({} симв.)", text.chars().count()),
             Err(e) => log::error!("буфер обмена недоступен: {e}"),
         },
         Err(e) => log::error!("буфер обмена недоступен: {e}"),

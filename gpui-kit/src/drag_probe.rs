@@ -13,6 +13,13 @@
 //! - длительность драга, тип (перемещение/ресайз);
 //! - счётчики и частота (шт/с) целевых сообщений;
 //! - avg/max время обработки каждого (мс) и суммарная занятость главного потока.
+//!
+//! v2 (19.11.26, диагноз PAINT-шторма: тысячи WM_PAINT/с при драге):
+//! - регион обновления на входе WM_PAINT (GetUpdateRect до обработки):
+//!   пустой / ≤25% / >25% клиентской площади — отличает мусорные PAINT
+//!   от полноценных кадров;
+//! - интервалы между PAINT (avg/min/max) — vsync-ритм vs спам;
+//! - распределение времени обработки (<1мс / 1-5мс / >5мс).
 
 #[cfg(windows)]
 use std::cell::RefCell;
@@ -22,13 +29,15 @@ use std::time::{Duration, Instant};
 #[cfg(windows)]
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 #[cfg(windows)]
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{BOOL, HWND, LPARAM, LRESULT, RECT, WPARAM};
+#[cfg(windows)]
+use windows::Win32::Graphics::Gdi::GetUpdateRect;
 #[cfg(windows)]
 use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 #[cfg(windows)]
 use windows::Win32::UI::WindowsAndMessaging::{
-    WM_EXITSIZEMOVE, WM_MOVE, WM_MOVING, WM_NCDESTROY, WM_PAINT, WM_SIZING, WM_SYSCOMMAND,
-    WM_TIMER,
+    GetClientRect, WM_EXITSIZEMOVE, WM_MOVE, WM_MOVING, WM_NCDESTROY, WM_PAINT, WM_SIZING,
+    WM_SYSCOMMAND, WM_TIMER,
 };
 
 /// SC_MOVE = 0xF010. Старшие 4 бита WPARAM Windows использует внутренне,
@@ -77,7 +86,7 @@ fn install_windows(window: &crate::Window) {
     // окна на главном потоке — там же обрабатываются все сообщения окна.
     let ok = unsafe { SetWindowSubclass(hwnd, Some(probe_proc), SUBCLASS_ID, 0) };
     if ok.as_bool() {
-        log::info!("drag-probe: замер установлен (VIBEBRIDGE_DRAG_PROBE=1)");
+        log::info!("drag-probe: замер установлен v2 (VIBEBRIDGE_DRAG_PROBE=1)");
     } else {
         log::error!(
             "drag-probe: SetWindowSubclass не удался: {}",
@@ -106,6 +115,59 @@ struct ProbeState {
     timer_max: Duration,
     paint_total: Duration,
     paint_max: Duration,
+    // v2: диагностика PAINT-шторма.
+    paint_empty: u64,
+    paint_small: u64,
+    paint_large: u64,
+    paint_large_area_total: u64,
+    paint_lt1ms: u64,
+    paint_1to5ms: u64,
+    paint_gt5ms: u64,
+    last_paint: Option<Instant>,
+    paint_interval_count: u64,
+    paint_interval_total: Duration,
+    paint_interval_max: Duration,
+    paint_interval_min: Option<Duration>,
+}
+
+/// Классификация региона обновления на входе WM_PAINT (v2): пустой — PAINT
+/// без реальной работы; Small — ≤25% клиентской площади (кусочная
+/// инвалидация); Large — больше (полноценный кадр), с площадью в px².
+#[cfg(windows)]
+enum PaintRegion {
+    Empty,
+    Small,
+    Large(u64),
+}
+
+/// Регион обновления окна ДО обработки WM_PAINT (пока не валидирован
+/// BeginPaint внутри gpui-pre). Ошибка чтения — Empty + запись в лог
+/// (ошибки не глотаются), клиентская площадь — для порога 25%.
+#[cfg(windows)]
+fn paint_region_info(hwnd: HWND) -> PaintRegion {
+    let mut rect = RECT::default();
+    let has_region = unsafe { GetUpdateRect(hwnd, Some(&mut rect), BOOL(0)) }.as_bool();
+    if !has_region {
+        return PaintRegion::Empty;
+    }
+    let area =
+        (rect.right - rect.left).max(0) as u64 * (rect.bottom - rect.top).max(0) as u64;
+    let mut client = RECT::default();
+    let client_ok = unsafe { GetClientRect(hwnd, &mut client) }.is_ok();
+    if !client_ok {
+        log::error!(
+            "drag-probe: GetClientRect не удался: {}",
+            std::io::Error::last_os_error()
+        );
+        return PaintRegion::Large(area);
+    }
+    let client_area =
+        (client.right - client.left).max(0) as u64 * (client.bottom - client.top).max(0) as u64;
+    if client_area > 0 && area * 4 <= client_area {
+        PaintRegion::Small
+    } else {
+        PaintRegion::Large(area)
+    }
 }
 
 #[cfg(windows)]
@@ -123,13 +185,38 @@ impl ProbeState {
                 self.timer_total += spent;
                 self.timer_max = self.timer_max.max(spent);
             }
-            WM_PAINT => {
-                self.paint_count += 1;
-                self.paint_total += spent;
-                self.paint_max = self.paint_max.max(spent);
-            }
             _ => {}
         }
+    }
+
+    /// Учёт одного WM_PAINT с v2-диагностикой шторма: регион обновления,
+    /// бакет времени обработки и интервал от предыдущего PAINT.
+    fn record_paint(&mut self, spent: Duration, region: PaintRegion) {
+        self.paint_count += 1;
+        self.paint_total += spent;
+        self.paint_max = self.paint_max.max(spent);
+        match spent {
+            s if s < Duration::from_millis(1) => self.paint_lt1ms += 1,
+            s if s < Duration::from_millis(5) => self.paint_1to5ms += 1,
+            _ => self.paint_gt5ms += 1,
+        }
+        match region {
+            PaintRegion::Empty => self.paint_empty += 1,
+            PaintRegion::Small => self.paint_small += 1,
+            PaintRegion::Large(area) => {
+                self.paint_large += 1;
+                self.paint_large_area_total += area;
+            }
+        }
+        if let Some(last) = self.last_paint {
+            let interval = last.elapsed();
+            self.paint_interval_count += 1;
+            self.paint_interval_total += interval;
+            self.paint_interval_max = self.paint_interval_max.max(interval);
+            self.paint_interval_min =
+                Some(self.paint_interval_min.map_or(interval, |m: Duration| m.min(interval)));
+        }
+        self.last_paint = Some(Instant::now());
     }
 
     /// Сводка в лог (ровно один блок строк на драг) и сброс счётчиков.
@@ -177,6 +264,35 @@ impl ProbeState {
             "drag-probe: WM_PAINT    — {}",
             stat(self.paint_count, self.paint_total, self.paint_max)
         );
+        // v2: диагноз PAINT-шторма — регионы, бакеты времени, интервалы.
+        log::info!(
+            "drag-probe: WM_PAINT регионы — пустых {}, крошечных {} (≤25%), полных {} (avg {:.0}px²)",
+            self.paint_empty,
+            self.paint_small,
+            self.paint_large,
+            if self.paint_large > 0 {
+                self.paint_large_area_total as f64 / self.paint_large as f64
+            } else {
+                0.0
+            }
+        );
+        log::info!(
+            "drag-probe: WM_PAINT время  — <1мс: {}, 1-5мс: {}, >5мс: {}",
+            self.paint_lt1ms,
+            self.paint_1to5ms,
+            self.paint_gt5ms
+        );
+        if self.paint_interval_count > 0 {
+            let n = self.paint_interval_count as f64;
+            let avg = self.paint_interval_total.as_secs_f64() * 1000.0 / n;
+            let max = self.paint_interval_max.as_secs_f64() * 1000.0;
+            let min = self
+                .paint_interval_min
+                .map_or(0.0, |m| m.as_secs_f64() * 1000.0);
+            log::info!(
+                "drag-probe: WM_PAINT интервал — avg {avg:.2}мс, min {min:.2}мс, max {max:.2}мс"
+            );
+        }
         *self = ProbeState::default();
     }
 }
@@ -216,11 +332,21 @@ unsafe extern "system" fn probe_proc(
             | (WM_PAINT, _)
     );
     let start = measure.then(Instant::now);
+    // v2: регион обновления читаем ДО DefSubclassProc — BeginPaint gpui-pre
+    // валидирует его, после обработки пустой регион ничего не расскажет.
+    let paint_region = (msg == WM_PAINT).then(|| paint_region_info(hwnd));
     let result = DefSubclassProc(hwnd, msg, wparam, lparam);
     if let Some(start) = start {
-        STATE.with(|cell| {
-            cell.borrow_mut().account(msg, wparam, start.elapsed());
-        });
+        if let Some(region) = paint_region {
+            let spent = start.elapsed();
+            STATE.with(|cell| {
+                cell.borrow_mut().record_paint(spent, region);
+            });
+        } else {
+            STATE.with(|cell| {
+                cell.borrow_mut().account(msg, wparam, start.elapsed());
+            });
+        }
     }
 
     // Сводка — после учёта: WM_EXITSIZEMOVE завершает драг.
