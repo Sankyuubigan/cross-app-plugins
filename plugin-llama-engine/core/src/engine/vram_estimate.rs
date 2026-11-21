@@ -49,6 +49,24 @@ pub const SERVER_N_PARALLEL: u32 = 1;
 /// `n_ubatch` — дефолт llama.cpp (аргумент движку не передаётся).
 pub const N_UBATCH: u32 = 512;
 
+/// Резерв свободной VRAM, не отдаваемый движку (PRP B2, 20.11.2026).
+/// WDDM на Windows выполняет spillover GPU-аллокаций в системный Commit
+/// (ОЗУ+pagefile): инцидент E5 — запрос ≈7270 МБ при свободных 7255 прошёл
+/// проверку «влезает», WDDM вынес излишек в commit, Commit Limit кончился,
+/// `_aligned_malloc` вернул NULL → GGML_ASSERT → 0xC0000409. Оценка спеца
+/// для Windows — 768–1024 МБ; берём 1024 (консервативно, до лога -lv 4).
+/// Не-Windows (Linux/Vulkan без WDDM-переаллокации) — прежние 512.
+pub fn vram_reserve_mb() -> f64 {
+    #[cfg(windows)]
+    {
+        1024.0
+    }
+    #[cfg(not(windows))]
+    {
+        512.0
+    }
+}
+
 /// Оценка VRAM-потребления для контекста `ctx_size`.
 #[derive(Debug, Clone, Copy)]
 pub struct VramEstimate {
@@ -406,8 +424,11 @@ pub fn estimate_vram_with_spec(
     let kv_per_token_mb = layout.global_bytes_per_token / MIB;
     let kv_swa_mb = kv_swa_bytes / MIB;
     let kv_mb = kv_dense_bytes / MIB + kv_swa_mb;
-    // Workspace CUDA-буферов (промежуточные тензоры) ~10%, не более 256 МБ.
-    let buffers_mb = ((model_mb + kv_mb) * 0.10).min(256.0);
+    // Workspace CUDA-буферов (промежуточные тензоры) ~10%, cap 640 МБ.
+    // Прежний cap 256 — ложь (PRP B2): факт CPU-прогона -lv 4 — compute 153 МБ
+    // уже при ubatch 512, а на CUDA у 9B-модели ~500-650 МБ (спец); формула
+    // (model+kv)*0.10 для 9B даёт ~538 — в этом диапазоне.
+    let buffers_mb = ((model_mb + kv_mb) * 0.10).min(640.0);
     VramEstimate {
         model_mb,
         kv_per_token_mb,
@@ -441,10 +462,22 @@ pub fn vram_for_ngl_with_spec(model_path: &str, ngl: u32, ctx_size: u32, spec: &
 }
 
 /// Численное ядро `vram_for_ngl` (отдельно — для тестов).
+///
+/// ФИЗИКА llama.cpp (инцидент 19.11.2026, 8 ГБ карта): KV-кэш ЕДИНЫЙ — при
+/// ЛЮБОМ ngl>0 он лежит на GPU ЦЕЛИКОМ и пре-аллоцируется под ВЕСЬ
+/// `--ctx-size` при создании контекста, ДО любого промпта (лог инцидента:
+/// аллокация 8192 МБ на 0.09 с при промпте 852 токена; размер аллокации равен
+/// ПОЛНОМУ KV при frac 16/36 — пропорциональная модель `kv*frac` обещала вдвое
+/// меньше и пропускала заведомо смертельные запуски до cudaMalloc failed).
+/// При ngl==0 весь кэш живёт в ОЗУ — в VRAM остаются только compute-буферы.
 pub fn vram_for_ngl_estimate(est: &VramEstimate, ngl: u32) -> f64 {
-    let layers = est.num_layers.max(1) as f64;
-    let frac = (ngl.min(est.num_layers) as f64) / layers;
-    est.model_mb * frac + est.kv_mb * frac + est.buffers_mb
+    if ngl == 0 {
+        // Всё на CPU: веса и KV в ОЗУ, в VRAM — только буферы (консервативно).
+        est.buffers_mb
+    } else {
+        let frac = (ngl.min(est.num_layers) as f64) / est.num_layers.max(1) as f64;
+        est.model_mb * frac + est.kv_mb + est.buffers_mb
+    }
 }
 
 /// Максимальное число слоёв, помещающихся в бюджет VRAM.
@@ -472,27 +505,27 @@ pub fn max_fitting_ngl_estimate(est: &VramEstimate, budget_mb: f64, reserve_mb: 
 
 /// Максимальное число слоёв с запасом безопасности `safety_factor` (>1).
 ///
-/// Это ТОЧНАЯ ОБРАТНАЯ к [`vram_for_ngl_safe`] — то есть к тому же критерию,
-/// по которому решается «влезает ли модель целиком». Раньше здесь была
-/// отдельная формула «(веса+KV) × фактор / слоёв», которая:
-///   - не учитывала `buffers_mb` вообще (а буферы в VRAM при любом `-ngl`);
-///   - применяла фактор к весам, а резерв вычитала целиком сверху.
-///
-/// Из-за расхождения pre-flight выбирал `-ngl`, для которого СОБСТВЕННЫЙ
-/// прогноз памяти всё равно превышал бюджет, то есть недозащищал ровно от
-/// CUDA OOM / TDR, ради которых запас и введён. Теперь критерий один:
-/// `vram_for_ngl_safe(est, ngl) ≤ budget`.
+/// Это ТОЧНАЯ ОБРАТНАЯ к [`vram_for_ngl_safe`] при том же критерии
+/// «влезает ли модель целиком». Критерий при ngl>0:
+/// `(веса·frac + KV_ПОЛНЫЙ + буферы)·safety + reserve ≤ budget` — KV не
+/// масштабируется по слоям (единый кэш на GPU при любом ngl>0, см.
+/// [`vram_for_ngl_estimate`]), поэтому frac отсчитывается от весов ЗА вычетом
+/// полного KV. Возвращает 0 = «оффлоад невозможен, всё на CPU» — это НЕ отказ
+/// запуска, а последний рычаг ступенчатого оффлоада (медленнее, но работает).
 pub fn max_fitting_ngl_safe_estimate(est: &VramEstimate, budget_mb: f64, reserve_mb: f64, safety_factor: f64) -> u32 {
     if est.num_layers == 0 {
         return 0;
     }
     let safety = safety_factor.max(1.0);
-    let budget_for_payload = ((budget_mb - reserve_mb) / safety - est.buffers_mb).max(0.0);
-    let scalable = est.model_mb + est.kv_mb;
-    if scalable <= 0.0 {
+    let budget_for_weights = (budget_mb - reserve_mb) / safety - est.buffers_mb - est.kv_mb;
+    if budget_for_weights >= est.model_mb {
         return est.num_layers;
     }
-    let frac = budget_for_payload / scalable;
+    if budget_for_weights <= 0.0 {
+        // Даже один слой + полный KV не проходят критерий → оффлоад невозможен.
+        return 0;
+    }
+    let frac = budget_for_weights / est.model_mb;
     ((frac * est.num_layers as f64).floor() as i64)
         .clamp(0, est.num_layers as i64) as u32
 }
@@ -612,6 +645,128 @@ pub fn max_fitting_ctx_estimate(est: &VramEstimate, ngl: u32, base_ctx: u32, ram
     ctx.max(0.0) as u32
 }
 
+// ------------------------------------------------- VRAM-гейт контекста ---
+
+/// VRAM-след ПОЛНОГО оффлоада (ngl = num_layers) при контексте `ctx`, где
+/// `est` считалась на `base_ctx` (`ctx ≤ base_ctx` — гейт только режет).
+///
+/// Разложение: веса (константа) + dense-часть KV (масштабируется линейно по
+/// pad256-ячейкам — точная модель SSOT для dense-only моделей) + SWA-часть
+/// (удерживается на уровне base_ctx: при урезании контекста ниже окна SWA-
+/// ячейки не растут, поэтому удержание — консервативная переоценка) +
+/// compute-буферы (константа). Резерв НЕ входит — его добавляет критерий в
+/// [`max_fitting_ctx_vram_estimate`]. Для dense-only моделей (без SWA) —
+/// точная линейная инверсия; для SWA/tail-моделей — консервативная.
+pub fn vram_for_ctx_mb(est: &VramEstimate, ctx: u32, base_ctx: u32) -> f64 {
+    let swa = est.kv_swa_mb.min(est.kv_mb); // защита от кривых входов
+    let dense_full = est.kv_mb - swa;
+    if base_ctx == 0 || ctx >= base_ctx || dense_full <= 0.0 {
+        // Кроить нечем (SWA-only / вырожденные входы): честный след на base.
+        return est.model_mb + est.kv_mb + est.buffers_mb;
+    }
+    let dense_ctx = dense_full * (pad256(ctx) as f64) / (pad256(base_ctx) as f64);
+    est.model_mb + dense_ctx + swa + est.buffers_mb
+}
+
+/// Максимальный контекст, чей VRAM-след ПОЛНОГО оффлоада влезает в
+/// `budget_mb` при резерве `reserve_mb` — VRAM-собрат ОЗУ-версии
+/// [`max_fitting_ctx_estimate`]. Аналитическая ОБРАТНАЯ к критерию
+/// `vram_for_ctx_mb(est, ctx, base_ctx) + reserve_mb ≤ budget_mb`.
+///
+/// Возвращает:
+/// - `base_ctx`, если влезает как есть (гейт не срабатывает);
+/// - 0, если не влезает ни при каком контексте (веса + SWA + буферы + резерв
+///   сами по себе больше бюджета) — контекстом карту не спасти, вызывающий
+///   обязан уйти к урезанию слоёв (ngl);
+/// - иначе — наибольший кратный 256 контекст, проходящий критерий.
+///
+/// Инварианты (закреплены property-тестами P1/P2/P4): результат ≤ base_ctx;
+/// результат > 0 проходит критерий; шаг +256 (при кратном pad256) — уже нет;
+/// результат 0 — сентинел «даже минимальный реальный контекст (256) критерий
+/// не проходит» (включая случай cells < 256, когда ctx=0 критерий формально
+/// проходит, но реального контекста нет — не отказ, а честный «нечего запускать»).
+pub fn max_fitting_ctx_vram_estimate(est: &VramEstimate, base_ctx: u32, budget_mb: f64, reserve_mb: f64) -> u32 {
+    if base_ctx == 0 {
+        return 0;
+    }
+    if vram_for_ctx_mb(est, base_ctx, base_ctx) + reserve_mb <= budget_mb {
+        return base_ctx;
+    }
+    let swa = est.kv_swa_mb.min(est.kv_mb);
+    let dense_full = est.kv_mb - swa;
+    let headroom = budget_mb - reserve_mb - est.model_mb - swa - est.buffers_mb;
+    if dense_full <= 0.0 || headroom <= 0.0 {
+        // Веса+SWA+буферы+резерв сами по себе не влезают, либо KV целиком
+        // SWA-часть (урезанием ctx не масштабируется) — контекстом не помочь.
+        return 0;
+    }
+    // Критерий: model + dense·pad256(ctx)/pad256(base) + swa + buffers + reserve ≤ budget
+    // ⟺ pad256(ctx) ≤ pad256(base)·headroom/dense_full. Округление ВНИЗ до
+    // кратного 256 даёт одновременно выполнение критерия и максимальность
+    // (шаг +256 кратен 256 → pad256 не меняет → критерий ломается).
+    let cells = (pad256(base_ctx) as f64) * headroom / dense_full;
+    let ctx = (cells / 256.0).floor() * 256.0;
+    (ctx.max(0.0) as u32).min(base_ctx)
+}
+
+// ───────────────────── Тир-слот и hardware-потолок (PRP C) ─────────────────────
+
+/// Нижний тир слота (PRP C, инвариант спеца): `slot = clamp(next_tier(need), 16384, hardware_max)`.
+pub const TIERS_MIN: u32 = 16384;
+
+/// Наименьший тир (16384 × 2^n) ≥ `need`, зажатый сверху `window`.
+///
+/// SSOT для плагина (mid-turn step-up, PRP C6) и хоста (choose_slot кэша
+/// движка, PRP C4) — тир один, расхождений не бывает. Окно меньше нижнего
+/// тира → само окно (кап сильнее пола); need > окна → окно (step-up за окно
+/// бессмыслен — слот не может превышать окно модели).
+pub fn next_tier(need: u32, window: u32) -> u32 {
+    if window == 0 {
+        return 0;
+    }
+    let mut tier = TIERS_MIN;
+    while tier < need && tier < window {
+        tier = tier.saturating_mul(2);
+    }
+    tier.min(window)
+}
+
+/// Hardware-потолок слота (PRP C1): максимальный контекст, который ЭТО железо
+/// способно держать для модели, — min(VRAM-инверсия при полном оффлоаде,
+/// RAM-инверсия при финальном ngl), обе на est окна GGUF.
+///
+/// Хост привязывает бюджет компакции и step-up кэша движка к потолку железа,
+/// а не к активному слоту: переполнение слота лечится step-up (respawn на тир
+/// выше), усечение истории — только у потолка железа, где step-up невозможен
+/// (§00.2: отказ «данных нет» делается невозможным, а не реже).
+///
+/// Сентинелы инверсий:
+/// - VRAM-инверсия вернула 0 («веса + SWA + буферы + резерв не влезают при
+///   любом контексте») → полный оффлоад невозможен, ngl уйдёт в резку/CPU и
+///   VRAM перестаёт биндить контекст — сторона не ограничивает (base_ctx).
+///   Тот же смысл у `vram_budget_mb <= 0` (GPU нет / память не читается).
+/// - RAM-инверсия вернула 0 (CPU-веса сами по себе больше ОЗУ-бюджета) —
+///   запуск обречён на RAM-гейте; честный 0 в потолке (не маскируем).
+pub fn compute_hardware_ctx_ceiling(
+    est: &VramEstimate,
+    base_ctx: u32,
+    ngl: u32,
+    vram_budget_mb: f64,
+    reserve_mb: f64,
+    ram_budget_mb: f64,
+) -> u32 {
+    let vram_ceiling = if vram_budget_mb <= 0.0 {
+        base_ctx
+    } else {
+        match max_fitting_ctx_vram_estimate(est, base_ctx, vram_budget_mb, reserve_mb) {
+            0 => base_ctx,
+            c => c,
+        }
+    };
+    let ram_ceiling = max_fitting_ctx_estimate(est, ngl, base_ctx, ram_budget_mb);
+    vram_ceiling.min(ram_ceiling)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -622,7 +777,7 @@ mod tests {
             kv_per_token_mb: kv_mb / 2048.0,
             kv_mb,
             kv_swa_mb: 0.0,
-            buffers_mb: ((model_mb + kv_mb) * 0.10).min(256.0),
+            buffers_mb: ((model_mb + kv_mb) * 0.10).min(640.0),
             total_mb: model_mb + kv_mb,
             num_layers: layers,
             num_attn_layers: layers,
@@ -630,33 +785,80 @@ mod tests {
     }
 
     #[test]
-    fn vram_for_ngl_scales_linearly_by_layers() {
-        // 20 слоёв, веса 10000 МБ, KV 2000 МБ, буферы = min(0.1*12000, 256)=256.
+    fn next_tier_is_monotone_capped_and_exact() {
+        // Точное попадание: need внутри тира → верх тира.
+        assert_eq!(next_tier(1, 262_144), 16_384);
+        assert_eq!(next_tier(16_384, 262_144), 16_384);
+        assert_eq!(next_tier(16_385, 262_144), 32_768);
+        assert_eq!(next_tier(100_000, 262_144), 131_072);
+        // need > окна → окно (step-up за окно бессмыслен).
+        assert_eq!(next_tier(1_000_000, 262_144), 262_144);
+        // Окно меньше нижнего тира → само окно (кап сильнее пола).
+        assert_eq!(next_tier(1, 8_192), 8_192);
+        assert_eq!(next_tier(0, 0), 0);
+        // Монотонность по need + всегда тир (грид).
+        let mut prev = 0;
+        let mut need = 0u32;
+        while need <= 300_000 {
+            let t = next_tier(need, 262_144);
+            assert!(t >= prev, "не монотонно на need {}", need);
+            assert!(t % 16_384 == 0, "вне тиров: {}", t);
+            prev = t;
+            need += 4_097;
+        }
+    }
+
+    #[test]
+    fn hardware_ceiling_is_min_of_vram_and_ram_sides() {
+        // est: веса 5000, KV 1000 (dense-only), 10 слоёв, буферы min(600,640)=600.
+        let e = est(5_000.0, 1_000.0, 10);
+        // (1) Всё влезает → потолок = окно.
+        assert_eq!(compute_hardware_ctx_ceiling(&e, 32_768, 10, 8_000.0, 512.0, 4_000.0), 32_768);
+        // (2) VRAM-сторона биндит: headroom = 7000−512−5000−0−600 = 888;
+        // cells = 32768·888/1000 = 29094.4 → ctx 28928 (критерий 5000+883.1+600+512
+        // = 6995.1 ≤ 7000; +256 → 7002.75 > 7000). RAM при полном оффлоаде не биндит.
+        assert_eq!(compute_hardware_ctx_ceiling(&e, 32_768, 10, 7_000.0, 512.0, 4_000.0), 28_928);
+        // (3) RAM-сторона биндит (ngl=0, всё в ОЗУ): headroom = 6000−512−5000 = 488;
+        // frac 0.488 → ctx = 15872 (5000+484.4+512 = 5996.4 ≤ 6000; +256 → 6004.2 > 6000).
+        // VRAM-бюджет 0 (GPU нет) → VRAM-сторона не ограничивает.
+        assert_eq!(compute_hardware_ctx_ceiling(&e, 32_768, 0, 0.0, 512.0, 6_000.0), 15_872);
+        // (4) 0-сентинел VRAM (веса+SWA+буферы+резерв не влезают ни при каком
+        // ctx) → сторона не ограничивает; RAM при полном оффлоаде — только слак.
+        assert_eq!(compute_hardware_ctx_ceiling(&e, 32_768, 10, 4_000.0, 512.0, 4_000.0), 32_768);
+        // (5) min обеих сторон: VRAM даёт 28928, RAM 15872 → 15872.
+        assert_eq!(compute_hardware_ctx_ceiling(&e, 32_768, 0, 7_000.0, 512.0, 6_000.0), 15_872);
+    }
+
+    #[test]
+    fn vram_for_ngl_full_kv_on_gpu_at_any_offload() {
+        // 20 слоёв, веса 10000 МБ, KV 2000 МБ, буферы = min(0.1*12000, 640)=640.
         let e = est(10_000.0, 2_000.0, 20);
         // Полный оффлоад: веса+KV+буферы.
         let full = vram_for_ngl_estimate(&e, 20);
-        assert!((full - 12_256.0).abs() < 0.01, "full: {}", full);
-        // Половина слоёв: (веса+KV)/2 + буферы.
+        assert!((full - 12_640.0).abs() < 0.01, "full: {}", full);
+        // Половина слоёв: веса/2 + ПОЛНЫЙ KV + буферы (единый KV на GPU при
+        // любом ngl>0 — физика llama.cpp, инцидент 19.11.2026).
         let half = vram_for_ngl_estimate(&e, 10);
-        assert!((half - (6000.0 + 256.0)).abs() < 0.01, "half: {}", half);
+        assert!((half - (5_000.0 + 2_000.0 + 640.0)).abs() < 0.01, "half: {}", half);
+        // Один слой: веса/20 + полный KV + буферы.
+        let one = vram_for_ngl_estimate(&e, 1);
+        assert!((one - (500.0 + 2_000.0 + 640.0)).abs() < 0.01, "one: {}", one);
         // Больше слоёв, чем есть — кап на num_layers (полный оффлоад).
         assert_eq!(vram_for_ngl_estimate(&e, 999), full);
-        // Ноль слоёв — только буферы.
-        assert!((vram_for_ngl_estimate(&e, 0) - 256.0).abs() < 0.01, "zero: {}", vram_for_ngl_estimate(&e, 0));
+        // Ноль слоёв: KV и веса в ОЗУ — в VRAM только буферы.
+        assert!((vram_for_ngl_estimate(&e, 0) - 640.0).abs() < 0.01, "zero: {}", vram_for_ngl_estimate(&e, 0));
     }
 
     #[test]
     fn max_fitting_ngl_computes_floor_of_budget() {
-        // Модель 10000+2000 МБ, 20 слоёв, буферы = min(12000·0.1, 256) = 256.
+        // Модель 10000+2000 МБ, 20 слоёв, буферы = min(12000·0.1, 640) = 640.
         let e = est(10_000.0, 2_000.0, 20);
-        // Безопасно: (12000·n/20 + 256) ≤ 10 000 → 600n ≤ 9744 → 16 слоёв.
-        assert_eq!(max_fitting_ngl_estimate(&e, 10_500.0, 500.0), 16);
-        // С фактором 1.25 пик считается как (веса+KV+буферы)·1.25 + резерв:
-        // (600n + 256)·1.25 ≤ 10 000 → 600n ≤ 7744 → 12 слоёв.
-        // (Раньше здесь было 13: фактор применялся к весам, а буферы не
-        // учитывались — из-за этого кламп возвращал число слоёв, которое не
-        // проходило собственный критерий. См. max_fitting_ngl_safe_estimate.)
-        assert_eq!(max_fitting_ngl_safe_estimate(&e, 10_500.0, 500.0, 1.25), 12);
+        // Без фактора: KV на GPU ПОЛНЫЙ (ngl>0) → бюджета на веса остаётся
+        // 10 500 − 500 − 640 − 2000 = 7360 → frac 0.736 → floor(14.72) = 14.
+        assert_eq!(max_fitting_ngl_estimate(&e, 10_500.0, 500.0), 14);
+        // С фактором 1.25: (веса·frac + KV_ПОЛНЫЙ + буферы)·1.25 + резерв ≤ бюджет
+        // → веса·frac ≤ (10 500 − 500)/1.25 − 2000 − 640 = 5360 → floor(10.72) = 10.
+        assert_eq!(max_fitting_ngl_safe_estimate(&e, 10_500.0, 500.0, 1.25), 10);
         // Фактор никогда не расширяет бюджет.
         assert!(max_fitting_ngl_safe_estimate(&e, 10_500.0, 500.0, 1.25) <= max_fitting_ngl_estimate(&e, 10_500.0, 500.0));
         // Резерв больше бюджета → 0 (не влезает даже минимальный оффлоад).
@@ -915,14 +1117,15 @@ mod tests {
         );
     }
 
-    /// Регрессия на числа юзера ПОСЛЕ снятия двойного стека (G3, tasks/31.10.26).
+    /// Регрессия на числа юзера (GTX 1070 Ti 8 ГБ, лог 30.10.26) + честные
+    /// константы B2 (буферы = min(10%·(model+kv), 640) — спец: compute у 9B
+    /// реально ~500-650 МБ; CPU-прогон -lv 4 дал нижнюю границу 153 МБ).
     ///
-    /// Факт лога 30.10.26: свободно 7700 из 8192; прежняя формула
-    /// `(5167+640+256)×1.25+1024 = 8603` урезала оффлоад до 26-28/32 → 5 t/s,
-    /// хотя полный оффлоад влезал (замер: использовано 4899 МБ, остаток ~2800).
-    /// После снижения резерва до 512: при реальной гибридной оценке KV
-    /// полный оффлоад обязан помещаться целиком; при консервативной f16-оценке
-    /// (без гибрид-метаданных, как в логе юзера: KV 640) — не урезаться ниже 30.
+    /// Факт лога 30.10.26: свободно 7700 из 8192, использовано 4899 МБ — полный
+    /// оффлоад влезал. Решение резки смотрит на ФАКТ (×1.0): при честных буферах
+    /// фактическая потребность (≈6429) влезает → резки нет. Padded-оценка (×1.25)
+    /// честно показывает ≈7908 > 7700, но её инверсия не уходит глубже 30/32
+    /// (исторический баг «26-28 слоёв → 5 t/s» из-за ложных буферов 256 не вернулся).
     #[test]
     fn pre_flight_full_offload_fits_users_8gb_card() {
         let reserve = 512.0; // как в llm.rs pre-flight после 31.10.26
@@ -931,20 +1134,42 @@ mod tests {
 
         // Гибридные метаданные KV (реальный боевой кейс BeLlama/KVarN): ~212 МБ.
         let e_hybrid = est(5_167.0, 212.0, 32);
-        let ngl = max_fitting_ngl_safe_estimate(&e_hybrid, free, reserve, safety);
-        assert_eq!(
-            ngl, e_hybrid.num_layers,
-            "полный оффлоад обязан влезать (need={:.0}, свободно {:.0})",
-            vram_for_ngl_safe(&e_hybrid, e_hybrid.num_layers, reserve, safety),
+        // Фактическая потребность (по ней решает pre-flight): влезает → резки нет.
+        let need_factual = vram_for_ngl_safe(&e_hybrid, e_hybrid.num_layers, reserve, 1.0);
+        assert!(
+            need_factual <= free,
+            "факт ({:.0} МБ) обязан влезать в {:.0} — полный оффлоад без резки",
+            need_factual,
             free
+        );
+        // Padded-оценка на честных буферах честно превышает свободные…
+        let need_padded = vram_for_ngl_safe(&e_hybrid, e_hybrid.num_layers, reserve, safety);
+        assert!(
+            need_padded > free,
+            "padded {:.0} обязан превышать {:.0} — иначе тест не различает факт/×1.25",
+            need_padded,
+            free
+        );
+        // …но её инверсия не уходит глубже 30/32 (против старых 26-28).
+        let ngl_padded = max_fitting_ngl_safe_estimate(&e_hybrid, free, reserve, safety);
+        assert!(
+            ngl_padded >= 30,
+            "padded-инверсия ушла глубже 30/32 (старый баг 26-28), got {}",
+            ngl_padded
         );
 
         // Консервативная f16-оценка KV без метаданных (как в логе юзера: KV 640).
         let e_plain = est(5_167.0, 640.0, 32);
+        let need_factual_plain = vram_for_ngl_safe(&e_plain, e_plain.num_layers, reserve, 1.0);
+        assert!(
+            need_factual_plain <= free,
+            "консервативный факт ({:.0}) тоже влезает — резки нет",
+            need_factual_plain
+        );
         let ngl_plain = max_fitting_ngl_safe_estimate(&e_plain, free, reserve, safety);
         assert!(
-            ngl_plain >= 30,
-            "консервативная оценка не должна урезать ниже 30/32 (было 26-28), got {}",
+            ngl_plain >= 28,
+            "консервативная padded-инверсия ушла глубже 28/32, got {}",
             ngl_plain
         );
     }
@@ -956,8 +1181,9 @@ mod tests {
     /// `(5167+768+256)×1.25+512 = 8251 > 7697` → урезание до 29/32 слоёв →
     /// 5 t/s → два сгоревших факт-экстрактора («14 минут юзера»), хотя
     /// реальный пик VRAM по тому же логу — 5822 МБ. Решение резки обязано
-    /// считаться по факту (файл+KV+буферы+резерв, §00.2): 6703 ≤ 7697 →
-    /// полный оффлоад без урезания.
+    /// считаться по факту (файл+KV+буферы+резерв, §00.2): 7041 ≤ 7697 →
+    /// полный оффлоад без урезания. Буферы честные (B2): 593.5 МБ, поэтому
+    /// потребность ~7041 (при ложных 256 была 6703).
     #[test]
     fn pre_flight_cut_decision_is_factual_users_nov1_log() {
         let reserve = 512.0;
@@ -968,8 +1194,8 @@ mod tests {
         // Фактическая потребность влезает — резать нельзя.
         let need_factual = vram_for_ngl_safe(&e, e.num_layers, reserve, 1.0);
         assert!(
-            (need_factual - 6_703.0).abs() < 1.0,
-            "фактическая формула: ожидалось ~6703 МБ (как в логе без ×1.25), got {:.0}",
+            (need_factual - 7_040.5).abs() < 1.0,
+            "фактическая формула: ожидалось ~7041 МБ (5167+768+593.5+512), got {:.0}",
             need_factual
         );
         assert!(
@@ -989,10 +1215,11 @@ mod tests {
             free
         );
 
-        // Старое решение резки на этих числах давало ровно 29 слоёв (лог:
-        // «урезан с 999 до 29»); фактическая формула даёт полный оффлоад.
+        // Старое решение резки дало в логе ровно 29 слоёв («урезан с 999 до 29»);
+        // на честных буферах B2 ×1.25 даёт 27: bfw = 5748 − 593.5 − 768 = 4386.5
+        // → frac 0.849 → floor(27.17) = 27. Фактическая формула — полный оффлоад.
         let ngl_old = max_fitting_ngl_safe_estimate(&e, free, reserve, safety);
-        assert_eq!(ngl_old, 29, "×1.25 воспроизводит урезание из лога");
+        assert_eq!(ngl_old, 27, "×1.25-инверсия на честных буферах B2");
         let ngl_factual = max_fitting_ngl_safe_estimate(&e, free, reserve, 1.0);
         assert_eq!(
             ngl_factual, e.num_layers,
@@ -1036,6 +1263,262 @@ mod tests {
                     budget,
                     ngl
                 );
+            }
+        }
+    }
+
+    // ------------------------------------------------ VRAM-гейт контекста ---
+
+    /// U2, инцидент 19.11.2026 (GTX 1070 Ti, 8 ГБ): файл 5167 МБ, окно GGUF
+    /// 262144 (KV 8192 МБ), свободно 7614 МБ. Старая пропорциональная формула
+    /// на этом кейсе давала ложное «влезает» (vram(ngl=16) = 5167·0.5 +
+    /// 8192·0.5 + 256 = 6935.5 + 512 ≤ 7614 — а реальный след при ngl=16:
+    /// 5167·0.5 + 8192 + 256 = 10991.5 > 7614) и посылала llama-server с
+    /// ctx 262144 → cudaMalloc failed. VRAM-гейт обязан вернуть максимальный
+    /// кратный 256 контекст, проходящий критерий.
+    #[test]
+    fn vram_ctx_gate_survives_users_8gb_incident() {
+        let e = est(5_167.0, 8_192.0, 32); // kv_swa_mb = 0 (dense-only), буферы 640 (B2)
+        let base = 262_144u32;
+        let free = 7_614.0;
+        let reserve = 1024.0; // B2: Windows WDDM-запас (vram_reserve_mb)
+
+        // Полный слот не влезает — иначе тест не проверяет гейт.
+        assert!(
+            vram_for_ctx_mb(&e, base, base) + reserve > free,
+            "полный KV 8192 + файл + буферы обязан превышать свободные {:.0}",
+            free
+        );
+
+        let ctx = max_fitting_ctx_vram_estimate(&e, base, free, reserve);
+        // B2-числа: headroom = 7614−1024−5167−640 = 783 → cells 25056 → floor 97×256.
+        assert_eq!(ctx, 24_832, "инцидентные числа (честные константы): максимальный кратный 256 ctx");
+        assert_eq!(ctx % 256, 0);
+        // Критерий выполняется; шаг +256 (pad256 не меняет) — уже нет.
+        assert!(
+            vram_for_ctx_mb(&e, ctx, base) + reserve <= free,
+            "ctx {} обязан влезать: {:.0} МБ",
+            ctx,
+            vram_for_ctx_mb(&e, ctx, base) + reserve
+        );
+        assert!(
+            vram_for_ctx_mb(&e, ctx + 256, base) + reserve > free,
+            "ctx+256 обязан не влезать (максимальность)"
+        );
+    }
+
+    /// U3, большая карта: свободной VRAM хватает на полный след при окне —
+    /// гейт НЕ трогает слот (возвращает base_ctx как есть).
+    #[test]
+    fn vram_ctx_gate_keeps_window_on_big_card() {
+        let e = est(5_167.0, 8_192.0, 32);
+        let base = 262_144u32;
+        // Полный след 13999 (5167+8192+640, буферы честные B2) + 512 < 15000.
+        assert_eq!(max_fitting_ctx_vram_estimate(&e, base, 15_000.0, 512.0), base);
+        // Запас ровно на границе критерия — тоже окно.
+        let need = vram_for_ctx_mb(&e, base, base) + 512.0;
+        assert_eq!(max_fitting_ctx_vram_estimate(&e, base, need, 512.0), base);
+    }
+
+    /// Веса + буферы + резерв сами по себе не влезают ни при каком контексте →
+    /// 0 = «контекстом карту не спасти», вызывающий уходит к урезанию ngl.
+    #[test]
+    fn vram_ctx_gate_returns_zero_when_weights_do_not_fit() {
+        let e = est(5_167.0, 8_192.0, 32);
+        let base = 262_144u32;
+        // 5167 + 640 + 512 = 6319 > 5900 → headroom < 0 → 0.
+        assert_eq!(max_fitting_ctx_vram_estimate(&e, base, 5_900.0, 512.0), 0);
+        // base_ctx == 0 — вырожденный вход, без деления на ноль.
+        assert_eq!(max_fitting_ctx_vram_estimate(&e, 0, 15_000.0, 512.0), 0);
+    }
+
+    /// Инверсия VRAM-ctx-гейта: результат проходит критерий, максимален и
+    /// кратен 256. SWA-часть удерживается на base_ctx — максимальность при
+    /// этом сохраняется (dense-часть всё равно растёт от +256).
+    #[test]
+    fn vram_ctx_gate_is_inverse_of_vram_for_ctx_mb() {
+        let base = 16_384u32;
+        let reserve = 512.0;
+        // Две модели: dense-only и со SWA-частью.
+        let mut e = est(4_000.0, 3_000.0, 30);
+        let e_swa = VramEstimate { kv_swa_mb: 800.0, ..e.clone() };
+        for (name, est) in [("dense", e.clone()), ("swa", e_swa)] {
+            for budget in [5_000.0, 6_000.0, 7_000.0, 9_000.0, 12_000.0, 20_000.0] {
+                let ctx = max_fitting_ctx_vram_estimate(&est, base, budget, reserve);
+                assert!(ctx <= base, "{}: ctx {} > base", name, ctx);
+                assert_eq!(ctx % 256, 0, "{}: ctx {} не кратен 256", name, ctx);
+                if ctx == 0 {
+                    // Сентинел «ничего не влезает»: даже минимальный реальный
+                    // контекст (256) не проходит критерий — честный отказ, а не
+                    // контекст-ноль, обязанный влезать.
+                    assert!(
+                        vram_for_ctx_mb(&est, 256, base) + reserve > budget,
+                        "{}: бюджет {:.0}: вернулся 0, но 256 токенов влезает ({:.0})",
+                        name,
+                        budget,
+                        vram_for_ctx_mb(&est, 256, base) + reserve
+                    );
+                    continue;
+                }
+                assert!(
+                    vram_for_ctx_mb(&est, ctx, base) + reserve <= budget,
+                    "{}: бюджет {:.0}: ctx {} не влезает ({:.0})",
+                    name,
+                    budget,
+                    ctx,
+                    vram_for_ctx_mb(&est, ctx, base) + reserve
+                );
+                if ctx < base {
+                    assert!(
+                        vram_for_ctx_mb(&est, (ctx + 256).min(base), base) + reserve > budget,
+                        "{}: бюджет {:.0}: ctx {} не максимален",
+                        name,
+                        budget,
+                        ctx
+                    );
+                }
+            }
+        }
+    }
+
+    /// Урезание ctx НЕ ужимает SWA-часть (окно ограничено) — след на ctx ниже
+    /// окна держит SWA на уровне base_ctx (консервативная переоценка).
+    #[test]
+    fn vram_for_ctx_holds_swa_at_base_level() {
+        let mut e = est(4_000.0, 3_000.0, 30);
+        e.kv_swa_mb = 800.0; // dense = 2200
+        let base = 16_384u32;
+        // На base: полный след (dense + swa целиком).
+        let full = vram_for_ctx_mb(&e, base, base);
+        assert!((full - (4_000.0 + 3_000.0 + 640.0)).abs() < 0.01, "full: {}", full);
+        // На base/2: dense вдвое меньше, SWA целиком.
+        let half = vram_for_ctx_mb(&e, 8_192, base);
+        let dense_half = 2_200.0 * 8_192.0 / 16_384.0;
+        assert!((half - (4_000.0 + dense_half + 800.0 + 640.0)).abs() < 0.01, "half: {}", half);
+    }
+
+    // ----------------------------------------------- property P1-P4 (proptest) ---
+
+    use proptest::prelude::*;
+
+    /// Общая стратегия est для property-тестов: свайп realistic-диапазонов
+    /// (модель до 50 ГБ, KV до 20 ГБ, SWA — доля KV, буферы, слои, окно —
+    /// кратное 256 до 262144, бюджет, резерв).
+    fn est_strategy() -> impl Strategy<Value = (VramEstimate, f64, f64, u32)> {
+        (
+            100.0..50_000.0,      // model_mb
+            10.0..20_000.0,       // kv_mb
+            0.0..1.0,             // swa_frac
+            0.0..1_000.0,         // buffers_mb
+            1u32..200,            // layers
+            1u32..1024,           // window_cells (×256)
+            500u32..100_000,      // budget_raw
+            0u32..=2_048,         // reserve_raw
+        )
+            .prop_map(|(model, kv, swa_frac, buffers, layers, cells, budget, reserve)| {
+                let base = cells * 256;
+                let e = VramEstimate {
+                    model_mb: model,
+                    kv_per_token_mb: kv / base as f64,
+                    kv_mb: kv,
+                    kv_swa_mb: kv * swa_frac,
+                    buffers_mb: buffers,
+                    total_mb: model + kv + buffers,
+                    num_layers: layers,
+                    num_attn_layers: layers,
+                };
+                (e, budget as f64, reserve as f64, base)
+            })
+    }
+
+    proptest! {
+        // P1 + P4: инвариант невозможности отказа — для ЛЮБЫХ входов гейт
+        // возвращает контекст, проходящий VRAM-критерий, либо 0 (явная ветка
+        // «контекстом не помочь» → урезание ngl). Тихого «влезает, но не
+        // влезло» не существует. Попутно: результат ≤ окна и кратен 256.
+        #[test]
+        fn prop_ctx_gate_never_overfits_silently(
+            (e, budget, reserve, base) in est_strategy(),
+        ) {
+            let ctx = max_fitting_ctx_vram_estimate(&e, base, budget, reserve);
+            prop_assert!(ctx <= base, "P4: ctx {} > окна {}", ctx, base);
+            prop_assert_eq!(ctx % 256, 0, "кратность 256");
+            prop_assert!(
+                ctx == 0 || vram_for_ctx_mb(&e, ctx, base) + reserve <= budget,
+                "P1: ctx {} не проходит критерий при бюджете {:.0}",
+                ctx,
+                budget
+            );
+        }
+
+        // P2: монотонность — больше свободной VRAM → выбранный ctx не меньше.
+        #[test]
+        fn prop_ctx_gate_monotone_in_budget(
+            (e, budget, reserve, base) in est_strategy(),
+            extra in 1u32..=50_000,
+        ) {
+            let b2 = budget + extra as f64;
+            let ctx1 = max_fitting_ctx_vram_estimate(&e, base, budget, reserve);
+            let ctx2 = max_fitting_ctx_vram_estimate(&e, base, b2, reserve);
+            prop_assert!(ctx1 <= ctx2, "P2: бюджет {:.0}+{:.0} дал ctx {} < {}",
+                budget, extra, ctx2, ctx1);
+        }
+
+        // P3: полная KV-модель — при ngl>0 в оценке ПОЛНЫЙ kv_mb; при ngl==0
+        // оценки KV нет вовсе (только буферы); полный оффлоад — точная сумма.
+        #[test]
+        fn prop_ngl_estimate_full_kv_model(
+            (e, _budget, _reserve, _base) in est_strategy(),
+            ngl_raw in 0u32..=250,
+        ) {
+            let ngl = ngl_raw;
+            if ngl == 0 {
+                prop_assert!(
+                    (vram_for_ngl_estimate(&e, 0) - e.buffers_mb).abs() < 1e-9,
+                    "ngl=0: ровно буферы, KV не входит"
+                );
+            } else {
+                prop_assert!(
+                    vram_for_ngl_estimate(&e, ngl) >= e.kv_mb + e.buffers_mb - 1e-9,
+                    "ngl>0: полный KV обязан входить"
+                );
+                prop_assert!(
+                    vram_for_ngl_estimate(&e, ngl) <= e.model_mb + e.kv_mb + e.buffers_mb + 1e-9,
+                    "ngl>0: оценка не превышает сумму частей"
+                );
+            }
+            if ngl >= e.num_layers {
+                let full = vram_for_ngl_estimate(&e, e.num_layers);
+                prop_assert!((full - (e.model_mb + e.kv_mb + e.buffers_mb)).abs() < 1e-9,
+                    "полный оффлоад — точная сумма");
+            }
+        }
+
+        // P3+P1 для ngl-инверсии: выбранный safe-кламп проходит собственный
+        // критерий и максимален на сетке любой плотности (то же свойство, что
+        // проверяет max_fitting_ngl_is_inverse_of_vram_for_ngl_safe, но на
+        // произвольных входах).
+        #[test]
+        fn prop_ngl_safe_inverse_passes_and_maximal(
+            (e, budget, reserve, _base) in est_strategy(),
+        ) {
+            let ngl = max_fitting_ngl_safe_estimate(&e, budget, reserve, 1.25);
+            let fits = |n: u32| vram_for_ngl_safe(&e, n, reserve, 1.25) <= budget;
+            if ngl == 0 {
+                // Сентинел «оффлоад невозможен»: оффлоад даже одного слоя не
+                // проходит критерий (в т.ч. резерв > бюджета — case a, и
+                // веса одного слоя не влезают — case b). Контр-example
+                // (budget 500 / reserve 501) из regressions-файла ловит ровно
+                // это: fits(0) там ложен по построению.
+                prop_assert!(
+                    !fits(1),
+                    "ngl=0 вернулся, но оффлоад одного слоя проходит критерий"
+                );
+                return Ok(());
+            }
+            prop_assert!(fits(ngl), "ngl={} не проходит собственный критерий", ngl);
+            if ngl < e.num_layers {
+                prop_assert!(!fits(ngl + 1), "ngl={} не максимален", ngl);
             }
         }
     }

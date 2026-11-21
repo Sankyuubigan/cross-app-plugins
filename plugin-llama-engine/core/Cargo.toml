@@ -28,6 +28,11 @@ json-store = { path = "../../json-store" }
 # один код на все плагины; llama-шейп DownloadProgress уходит (тип из downloader-core).
 downloader-core = { path = "../../plugin-downloader/core" }
 
+[dev-dependencies]
+# Property-тесты VRAM-гейтов (P1-P4 PRP 26.11.20): чистый Rust, C-зависимостей
+# не задевает (D8050-класс машины не трогается).
+proptest = "1"
+
 [lib]
 name = "llama_engine_core"
 path = "src/lib.rs"

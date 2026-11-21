@@ -372,8 +372,15 @@ fn diagnose_host_ram_oom(haystack: &str, ctx: &DiagnosisContext) -> Option<Start
     // haystack из combined_log уже в нижнем регистре.
     let oom = haystack.contains("cuda_host buffer")
         || haystack.contains("graph_reserve")
-        || (haystack.contains("failed to allocate") && haystack.contains("compute"))
-        || (haystack.contains("cpu_buffer_type_alloc_buffer") && haystack.contains("failed to allocate"));
+        || (haystack.contains("failed to allocate") && haystack.contains("host buffer"))
+        || (haystack.contains("cpu_buffer_type_alloc_buffer") && haystack.contains("failed to allocate"))
+        || haystack.contains("vulkan_host")
+        || haystack.contains("rocm_host")
+        // Тихий host-alloc fail: GGML_ASSERT(ctx->mem_buffer != NULL) в ggml_init —
+        // aligned_malloc вернул NULL (исчерпан Commit Limit Windows = RAM + pagefile).
+        // Слов «out of memory» при этом в логе нет (инцидент E5 20.11.26: exit
+        // 0xC0000409 при ctx 41984 на 8 ГБ карте) — обязан матчить сам assert.
+        || (haystack.contains("ggml_assert") && haystack.contains("mem_buffer != null"));
     if !oom {
         return None;
     }
@@ -383,7 +390,7 @@ fn diagnose_host_ram_oom(haystack: &str, ctx: &DiagnosisContext) -> Option<Start
             "Движку не хватило обычной памяти (ОЗУ) при загрузке модели «{}».\n\n\
              Что сделать (по порядку):\n\
              1. Закройте другие программы, использующие память.\n\
-             2. Уменьшите размер контекста в Настройках — от него напрямую зависит потребность в ОЗУ.\n\
+             2. Движок сам ужимает контекст под доступную ОЗУ; если памяти всё равно не хватает — освободите её больше либо возьмите модель поменьше.\n\
              3. Если не поможет — переключитесь на исходный источник движка (Настройки → «Движок запуска нейромоделей»): он держит KV-кэш в видеопамяти.",
             if ctx.model_name.is_empty() { "эта модель".to_string() } else { ctx.model_name.clone() },
         ),
@@ -395,11 +402,22 @@ fn diagnose_host_ram_oom(haystack: &str, ctx: &DiagnosisContext) -> Option<Start
 }
 
 /// Не хватило видеопамяти при создании контекста (в т.ч. на pre-flight).
+///
+/// Текст честен (§2.2): движок УЖЕ ужимает контекст под свободную VRAM и
+/// подбирает число слоёв до спавна (VRAM-гейты llm.rs), поэтому совет
+/// «уменьшите размер контекста в Настройках» лжёт дважды — слайдера контекста
+/// в UI нет (context_size живёт только в app_config.json), а до этой ветки
+/// контекст уже урезан до минимума. Оставшийся рычаг юзера — модель полегче.
 fn diagnose_cuda_oom(haystack: &str, ctx: &DiagnosisContext) -> Option<StartupDiagnosis> {
     let oom = haystack.contains("out of memory")
         || haystack.contains("cuda_malloc failed")
         || haystack.contains("cumemalloc")
-        || (haystack.contains("not enough memory") && haystack.contains("memory"));
+        || (haystack.contains("not enough memory") && haystack.contains("memory"))
+        // Device compute-буфер: «failed to allocate CUDA0 buffer of size …» — device
+        // аллокация БЕЗ слов «out of memory» (спец: реальный compute ~500-650 МБ).
+        // Это VRAM, не host: прежний loose-маршрут («failed to allocate»+«compute»)
+        // уводил GPU-буфер в HostRamOom с вредным советом (PRP B3).
+        || (haystack.contains("failed to allocate") && (haystack.contains("cuda0 buffer") || haystack.contains("vulkan0 buffer")));
     if !oom {
         return None;
     }
@@ -407,12 +425,10 @@ fn diagnose_cuda_oom(haystack: &str, ctx: &DiagnosisContext) -> Option<StartupDi
         kind: StartupFailureKind::CudaOom,
         user_message: format!(
             "Модель «{}» не поместилась в видеопамять.\n\n\
-             Что сделать (по порядку):\n\
-             1. Уменьшите размер контекста в Настройках (например с 24576 до 8192).\n\
-             2. Возьмите модель полегче (меньше квантизация Q4 → Q3, либо меньше параметров).\n\
-             3. Либо переключитесь на вариант «{}» движка: он экономнее расходует видеопамять.",
-            if ctx.model_name.is_empty() { "эта модель".to_string() } else { ctx.model_name.clone() },
-            ctx.recommended_variant
+             Движок сам ужимает контекст под свободную видеопамять и подбирает число слоёв на GPU. \
+             Если модель всё равно не стартует — файл модели слишком велик для этой видеокарты.\n\n\
+             Что сделать: возьмите модель полегче — меньшую квантизацию (Q4 → Q3) либо модель с меньшим числом параметров.",
+            if ctx.model_name.is_empty() { "эта модель".to_string() } else { ctx.model_name.clone() }
         ),
         log_hint: format!("cuda_oom: variant={} model={}", ctx.variant, ctx.model_name),
     })
@@ -456,7 +472,9 @@ fn diagnose_crash(exit_code: i32, haystack: &str, ctx: &DiagnosisContext) -> Opt
         kind: StartupFailureKind::EngineCrash,
         user_message: format!(
             "Движок «{}» аварийно завершился при запуске модели{}{}.\n\n\
-             Подробности — в логах приложения (вкладка «Логи»).\n\
+             Такой fail-fast чаще всего означает тихий отказ выделения ОБЫЧНОЙ памяти (ОЗУ) \
+             под буферы движка (инцидент 20.11.26: GGML_ASSERT на ggml.c:1650 при исчерпанном \
+             Commit Limit Windows). Закройте другие программы (освободите ОЗУ/файл подкачки) и повторите запрос.\n\n\
              Что попробовать: переустановить движок (Настройки → «Движок запуска нейромоделей» → \
              «Переустановить»), затем повторить запрос.",
             ctx.variant_label,

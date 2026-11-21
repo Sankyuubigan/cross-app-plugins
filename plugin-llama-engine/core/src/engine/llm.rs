@@ -182,11 +182,22 @@ pub fn estimate_vram_mb_with_spec(model_path: &str, ctx_size: u32, spec: &crate:
 
 pub struct LlamaEngine {
     pub global_ctx_limit: u32,
+    /// Hardware-потолок слота (PRP C1): см. `compute_hardware_ctx_ceiling` в
+    /// vram_estimate.rs. Хост привязывает бюджет компакции и step-up кэша
+    /// движка к нему, а не к активному слоту.
+    pub hardware_ctx_limit: u32,
+    /// Живой слот (текущий `--ctx-size` движка). Стартует равным
+    /// `global_ctx_limit`, растёт при mid-turn step-up (PRP C6) — respawn
+    /// строит `--ctx-size` из него. Cell: меняется на &self, как current_ngl.
+    slot: std::cell::Cell<u32>,
     pub model_path: String,
     pub mmproj_path: Option<String>,
     /// true = движок запущен с mmproj (может принимать изображения)
     pub is_multimodal_engine: bool,
-    stream_cb: Arc<dyn Fn(String) + Send + Sync>,
+    /// Канал стрима ответа. RefCell (PRP C2): реюз живого движка между ходами
+    /// с новым приёмником — сеттер вызывается хостом между ходами, во время
+    /// генерации канал читает только поток генерации.
+    stream_cb: std::cell::RefCell<Arc<dyn Fn(String) + Send + Sync>>,
     /// Канал размышлений модели (`reasoning_content` в SSE). Отдельный от
     /// `stream_cb` намеренно: у llama.cpp с `--reasoning-format deepseek`
     /// мысли приходят отдельным полем и НЕ являются частью ответа — смешивать
@@ -195,10 +206,16 @@ pub struct LlamaEngine {
     /// Дефолт — no-op, поэтому хост, которому показывать мысли не нужно,
     /// ничего не меняет.
     reasoning_cb: std::cell::RefCell<Arc<dyn Fn(String) + Send + Sync>>,
-    /// Канал логов движка (нужен для stderr-ридера при перезапуске из-за CUDA OOM)
-    log_cb: Arc<dyn Fn(String) + Send + Sync>,
+    /// Канал логов движка (нужен для stderr-ридера при перезапуске из-за CUDA OOM).
+    /// RefCell (PRP C2) — сеттер между ходами; stderr-насос, живущий в отдельном
+    /// потоке, захватывает Arc-клон при спавне и остаётся на старом слоте.
+    log_cb: std::cell::RefCell<Arc<dyn Fn(String) + Send + Sync>>,
     client: Client,
     server_log: PathBuf,
+    /// Полный stderr llama-server (все строки, включая progress) — файл рядом
+    /// с llama_server.log; переживает fast-fail abort, который теряет буферизованный
+    /// --log-file (PRP B5). Truncate на каждом спавне/респавне — всегда «последний прогон».
+    stderr_log: PathBuf,
     server_trace: ServerTrace,
     /// Форматированный счётчик уже обработанных строк llama_server.log
     /// (дигностика: привязка LCP/граф-строк сервера к запросу клиента).
@@ -513,6 +530,15 @@ impl LlamaEngine {
         let use_gpu = installed_family.is_gpu();
         let mut gpu_layers: u32 = if use_gpu { 999 } else { 0 };
 
+        // Окно GGUF до мутаций гейтами — база hardware-потолка (PRP C1):
+        // хост-слот приходит сюда равным окну из GGUF (SSOT «Слот движка»).
+        let gguf_window = global_ctx_limit;
+        // Мутабельная тень объявлена ДО префлайта: VRAM-гейт контекста (ниже)
+        // режет ctx до ngl-резки, и урезанное значение обязаны увидеть все
+        // потребители — `--ctx-size` в build_cmd (захват замыкания) и
+        // `Self { global_ctx_limit }` (бюджет компакции хоста читает его).
+        let mut global_ctx_limit = global_ctx_limit;
+
         // ── Pre-flight VRAM: модель не влезает в GPU? ──
         // Ступенчатый авто-offload («сколько влезет»), БЕЗ блокирующего диалога:
         // считаем честную оценку (единый `infra::vram_estimate` — та же формула,
@@ -555,13 +581,17 @@ impl LlamaEngine {
         }
 
         let mut vram_notice: Option<String> = None;
+        // Свободная VRAM при спавне — VRAM-бюджет hardware-потолка (PRP C1).
+        // 0 = GPU нет / память не читается: VRAM-сторона потолка не ограничивает.
+        let mut preflight_free_vram_mb: f64 = 0.0;
         if use_gpu && vram_before > 0 {
             if let Ok(nvml) = nvml_wrapper::Nvml::init() {
                 if let Ok(device) = nvml.device_by_index(0) {
                     if let Ok(mem) = device.memory_info() {
                         let total_vram_mb = mem.total / 1024 / 1024;
                         let free_vram_mb = mem.free as f64 / (1024.0 * 1024.0);
-                        let est = crate::engine::vram_estimate::estimate_vram_with_spec(
+                        preflight_free_vram_mb = free_vram_mb;
+                        let mut est = crate::engine::vram_estimate::estimate_vram_with_spec(
                             &model_path, global_ctx_limit, &kv_spec,
                         );
                         // Запас сверх оценки на фрагментацию/пиковые compute-тензоры
@@ -581,7 +611,8 @@ impl LlamaEngine {
                         // осталось ~2800 МБ). Страховка от реальной нехватки —
                         // существующий respawn по факту отказа аллокации
                         // (respawn_with_ngl), он честнее прогноза.
-                        const VRAM_RESERVE_MB: f64 = 512.0;
+                        // WDDM-запас Windows (PRP B2): SSOT — vram_reserve_mb() плагина.
+                        let reserve_mb = crate::engine::vram_estimate::vram_reserve_mb();
                         // Решение о резке — ТОЛЬКО по факту (§00.2): измеренные
                         // компоненты (файл + KV + буферы) + резерв, БЕЗ множителя.
                         // Инцидент 01.11.26 (лог юзера, 8 ГБ, сборка уже
@@ -595,10 +626,65 @@ impl LlamaEngine {
                         // ловит respawn_with_ngl по отказу аллокации — это и есть
                         // «страховка по факту», признанная в комментарии выше.
                         const VRAM_SAFETY_FACTOR: f64 = 1.25;
+                        // ── Шаг 1: VRAM-гейт контекста (веса остаются на GPU) ──
+                        // KV-кэш llama.cpp пре-аллоцируется под ВЕСЬ --ctx-size
+                        // при создании контекста, ДО любого промпта (инцидент
+                        // 19.11.2026: окно GGUF 262144 → KV 8192 МБ → cudaMalloc
+                        // failed на 8 ГБ карте при промпте 852 токена). Поэтому
+                        // при нехватке VRAM сначала подбираем максимальный
+                        // кратный 256 контекст, чей след (веса + KV + буферы +
+                        // запас) влезает, и только затем — если даже это не
+                        // спасает — существующая ступенчатая резка -ngl (Шаг 2
+                        // ниже, вплоть до CPU). Обе границы — измеряемые факты
+                        // (окно GGUF, свободная VRAM), не оценки промпта.
+                        const VRAM_MIN_CTX: u32 = 2048;
+                        let fitted_ctx = crate::engine::vram_estimate::max_fitting_ctx_vram_estimate(
+                            &est, global_ctx_limit, free_vram_mb, reserve_mb,
+                        );
+                        if fitted_ctx < global_ctx_limit && fitted_ctx >= VRAM_MIN_CTX {
+                            // Контекстом карта спасается — режем ctx, веса на GPU.
+                            let was_ctx = global_ctx_limit;
+                            global_ctx_limit = fitted_ctx;
+                            est = crate::engine::vram_estimate::estimate_vram_with_spec(
+                                &model_path, global_ctx_limit, &kv_spec,
+                            );
+                            let note = format!(
+                                "VRAM-гейт: контекст урезан {} → {} токенов (файл {:.0} МБ + KV {:.0} МБ + буферы {:.0} МБ + запас {:.0} МБ — свободно {:.0} из {:.0} МБ), веса остаются на GPU",
+                                was_ctx,
+                                global_ctx_limit,
+                                est.model_mb,
+                                est.kv_mb,
+                                est.buffers_mb,
+                                reserve_mb,
+                                free_vram_mb,
+                                total_vram_mb
+                            );
+                            log_cb(format!("📐 {}", note));
+                            log::warn!("{}", note);
+                            vram_notice = Some(crate::engine::vram::vram_forecast_notice(&note));
+                        } else if fitted_ctx < VRAM_MIN_CTX.min(global_ctx_limit) {
+                            // Веса + буферы + запас сами по себе больше свободной
+                            // VRAM — контекстом карту не спасти (совет «уменьшите
+                            // контекст в настройках» лжёт: слайдера там нет).
+                            // Опускаем ctx до минимума и отдаём решение ступенчатой
+                            // резке слоёв ниже — она честно уведомит юзера.
+                            global_ctx_limit = VRAM_MIN_CTX.min(global_ctx_limit);
+                            est = crate::engine::vram_estimate::estimate_vram_with_spec(
+                                &model_path, global_ctx_limit, &kv_spec,
+                            );
+                            log::warn!(
+                                "VRAM-гейт: свободной VRAM не хватает даже на веса+буферы+запас ({:.0} > {:.0} МБ) — контекст опущен до {} токенов, оффлоад уйдёт в ступенчатую резку слоёв (вплоть до CPU)",
+                                est.model_mb + est.buffers_mb + reserve_mb,
+                                free_vram_mb,
+                                global_ctx_limit
+                            );
+                        }
+                        // ── Шаг 2: ступенчатая резка -ngl по факту (существующий
+                        // префлайт) — работает на обновлённых est/global_ctx_limit.
                         let need_factual_mb = crate::engine::vram_estimate::vram_for_ngl_safe(
                             &est,
                             est.num_layers,
-                            VRAM_RESERVE_MB,
+                            reserve_mb,
                             1.0,
                         );
                         if need_factual_mb > free_vram_mb {
@@ -606,13 +692,13 @@ impl LlamaEngine {
                             // (по той же фактической формуле — фактор в резку не входит).
                             let new_ngl = crate::engine::vram_estimate::max_fitting_ngl_safe_with_spec(
                                 &model_path, global_ctx_limit, &kv_spec,
-                                free_vram_mb, VRAM_RESERVE_MB, 1.0,
+                                free_vram_mb, reserve_mb, 1.0,
                             );
                             let was_ngl = gpu_layers;
                             gpu_layers = new_ngl.min(gpu_layers);
                             let components = format!(
                                 "файл {:.0} МБ + KV {:.0} МБ + буферы {:.0} МБ + запас {:.0} МБ",
-                                est.model_mb, est.kv_mb, est.buffers_mb, VRAM_RESERVE_MB
+                                est.model_mb, est.kv_mb, est.buffers_mb, reserve_mb
                             );
                             let note = format!(
                                 "Pre-flight VRAM: модели по оценке нужно ~{:.0} МБ ({}) — свободно {:.0} МБ из {:.0} МБ. \
@@ -640,7 +726,7 @@ impl LlamaEngine {
                             let need_padded_mb = crate::engine::vram_estimate::vram_for_ngl_safe(
                                 &est,
                                 est.num_layers,
-                                VRAM_RESERVE_MB,
+                                reserve_mb,
                                 VRAM_SAFETY_FACTOR,
                             );
                             if need_padded_mb > free_vram_mb {
@@ -675,7 +761,6 @@ impl LlamaEngine {
         const RAM_RESERVE_MB: f64 = 1536.0; // ОС + UI/WebView2 + запас
         const RAM_MIN_CTX: u32 = 4096;
         let ram_base_ctx = global_ctx_limit;
-        let mut global_ctx_limit = global_ctx_limit;
         sys.refresh_memory();
         let avail_ram_mb = sys.available_memory() as f64 / (1024.0 * 1024.0) - RAM_RESERVE_MB;
         let ram_est = crate::engine::vram_estimate::estimate_vram_with_spec(&model_path, ram_base_ctx, &kv_spec);
@@ -687,7 +772,7 @@ impl LlamaEngine {
             if ctx_new < RAM_MIN_CTX {
                 return fail(format!(
                     "❌ Запуск отменён: модели с контекстом {} нужно ~{:.0} МБ ОЗУ, доступно ~{:.0} МБ — не хватает даже при минимальном контексте {} токенов. \
-                     Освободите память (закройте другие программы), уменьшите размер контекста в настройках или выберите модель поменьше.",
+                     Контекст движок уже урезал до минимума — освободите память (закройте другие программы) или выберите модель поменьше.",
                     ram_base_ctx, ram_need_mb, avail_ram_mb, RAM_MIN_CTX
                 ));
             }
@@ -705,6 +790,21 @@ impl LlamaEngine {
         } else {
             ram_need_mb
         };
+
+        // ── Hardware-потолок слота (PRP C1): max-контекст, который это железо
+        // держит для модели — min(VRAM-инверсия при полном оффлоаде, RAM-инверсия
+        // при финальном ngl), обе на est окна GGUF. Бюджет компакции хоста и
+        // step-up кэша привязываются К НЕМУ, а не к активному слоту:
+        // переполнение слота лечится step-up, усечение — только у потолка.
+        let est_window = crate::engine::vram_estimate::estimate_vram_with_spec(&model_path, gguf_window, &kv_spec);
+        let hardware_ctx_limit = crate::engine::vram_estimate::compute_hardware_ctx_ceiling(
+            &est_window,
+            gguf_window,
+            gpu_layers,
+            preflight_free_vram_mb,
+            crate::engine::vram_estimate::vram_reserve_mb(),
+            avail_ram_mb,
+        );
 
         let variant_source = if cfg_early.engine_variant.as_deref().map(|v| v == "auto" || v.is_empty()).unwrap_or(true) {
             format!("авто-подбор по GPU → {}", required_label)
@@ -743,6 +843,12 @@ impl LlamaEngine {
 
         let server_log = engine_dir.join("llama_server.log");
         let _ = std::fs::remove_file(&server_log);
+        // Полный stderr (включая progress-строки) — в отдельный файл: --log-file
+        // буферизуется и теряется при fast-fail abort, а stderr-зеркало в лог
+        // приложения отбрасывает progress-строки. Этот файл — единственное место,
+        // где после 0xC0000409 остаётся полный технический след (PRP B5).
+        let stderr_log = engine_dir.join("llama_server_stderr.log");
+        let _ = std::fs::remove_file(&stderr_log);
 
         let use_reasoning_default = reasoning_budget > 0;
         // mmproj передаётся в llama-server ТОЛЬКО когда он реально нужен
@@ -767,13 +873,16 @@ impl LlamaEngine {
             crate::engine::llamacpp_installer::child_path_with_cudart(engine_dir, installed_family);
         // Клон для замыкания спавна: оригинал ещё нужен для RespawnCtx (перезапуск).
         let cudart_path_env = cudart_path.clone();
+        // Скрытые дефолты llama-server гасим только для официального источника:
+        // поддержка флагов в форках (beellama) не проверена (PRP B1, честность §00.3).
+        let is_ggml_org_source = source_id == "ggml-org";
 
         let build_cmd = {
             let server_exe = server_exe.clone();
             let server_log = server_log.clone();
             let api_key = api_key.clone();
             let model_path = model_path.clone();
-            move |use_reasoning: bool, use_mmproj: bool| {
+            move |use_reasoning: bool, use_mmproj: bool, ctx_size: u32, small_ubatch: bool| {
                 let mut c = Command::new(&server_exe);
                 if let Some(p) = &cudart_path_env {
                     c.env("PATH", p);
@@ -783,7 +892,7 @@ impl LlamaEngine {
                     .arg("--host").arg("127.0.0.1")
                     .arg("--port").arg(port.to_string())
                     .arg("--api-key").arg(&api_key)
-                    .arg("--ctx-size").arg(global_ctx_limit.to_string())
+                    .arg("--ctx-size").arg(ctx_size.to_string())
                 // Один слот: приложение выполняет запросы строго последовательно,
                 // а llama-server умножает -c на число слотов. Без этого флага
                 // движок брал дефолт n_parallel=4 и резервировал вчетверо больший
@@ -795,6 +904,19 @@ impl LlamaEngine {
                 .arg("--no-webui")
                 .arg("--jinja")
                 .arg("--log-file").arg(&server_log);
+                // Скрытые дефолты llama-server b12549 (верифицировано по common.h):
+                // cache_ram_mib = 8192 — prompt-cache до 8 ГБ ОЗУ, n_ctx_checkpoints = 32.
+                // Наш кэш движка делает prompt-cache бесполезным, а на 16 ГБ машинах
+                // это прямое давление на Commit Limit (краш E5 0xC0000409).
+                if is_ggml_org_source {
+                    c.arg("--cache-ram").arg("0");
+                    c.arg("--ctx-checkpoints").arg("0");
+                    // HostRamOom-респавн (PRP B4): меньше физический батч —
+                    // меньше compute-буферы (спец: ~500-650 МБ при ubatch 512).
+                    if small_ubatch {
+                        c.arg("--ubatch-size").arg("256");
+                    }
+                }
                 if is_pre_hopper {
                     c.env("GGML_CUDA_PDL", "0");
                 }
@@ -880,12 +1002,18 @@ impl LlamaEngine {
             let log_cb = log_cb.clone();
             let server_trace = server_trace.clone();
             let engine_last_progress_ms = engine_last_progress_ms.clone();
+            let stderr_log = stderr_log.clone();
             move |stderr: std::process::ChildStderr| {
                 let log_cb = log_cb.clone();
                 let server_trace = server_trace.clone();
                 let engine_last_progress_ms = engine_last_progress_ms.clone();
+                // Полный stderr-след прогона: файл создан (truncate) здесь, чтобы
+                // даже при fast-fail abort всё, что успел напечатать движок,
+                // осталось на диске (PRP B5 — инцидент E5: --log-file потерян).
+                let stderr_file = std::fs::File::create(&stderr_log).ok();
                 std::thread::spawn(move || {
-                    use std::io::BufRead;
+                    use std::io::{BufRead, Write};
+                    let mut err_out = stderr_file.map(std::io::BufWriter::new);
                     let reader = std::io::BufReader::new(stderr);
                     for line in reader.lines() {
                         let line = match line {
@@ -894,6 +1022,13 @@ impl LlamaEngine {
                         };
                         let line = line.trim();
                         if !line.is_empty() {
+                            // Пишем КАЖДУЮ строку (включая progress, который в лог
+                            // приложения не зеркалится) — flush на строке: краш
+                            // не должен забрать буфер с собой.
+                            if let Some(w) = err_out.as_mut() {
+                                let _ = writeln!(w, "{}", line);
+                                let _ = w.flush();
+                            }
                             if stderr_line_shows_progress(line) {
                                 engine_last_progress_ms.store(now_unix_ms(), Ordering::Relaxed);
                             }
@@ -917,9 +1052,15 @@ impl LlamaEngine {
         let mut tried_no_reasoning = false;
         let mut tried_no_mmproj = false;
         let mut tried_with_mmproj = false;
+        // Контекст попытки (PRP B4): стартует от пост-гейтового слота, режется
+        // при HostRamOom-респавне. Финальное значение уходит в Self{} — хост
+        // читает его для бюджета компакции (SSOT «Слот движка» в AGENTS.md).
+        let mut attempt_ctx = global_ctx_limit;
+        let mut attempt_small_ubatch = false;
+        let mut tried_host_ctx_cut = false;
 
         'launch: loop {
-            let mut c = build_cmd(attempt_reasoning, attempt_mmproj);
+            let mut c = build_cmd(attempt_reasoning, attempt_mmproj, attempt_ctx, attempt_small_ubatch);
             let mut child = match c.spawn() {
                 Ok(c) => c,
                 Err(e) => return fail(format!("Ошибка запуска llama-server: {}", e)),
@@ -980,11 +1121,36 @@ impl LlamaEngine {
             // ── Сервер завершился с ошибкой при старте ──
             let code = exit_code.unwrap_or(-1);
             let log = read_log_tail(&server_log);
+            // stderr читается ОДИН раз (PRP B4): нужен reasoning-гейту и
+            // финальному диагнозу; log_full_trace ниже переиспользует список.
+            let stderr_lines = server_trace.diagnostic_lines();
+            let diag = crate::engine::startup_diagnosis::diagnose_startup_failure(
+                &log,
+                &stderr_lines,
+                code,
+                &diag_ctx,
+            );
 
-            // Фолбэк 1: движок не понимает флаги reasoning (старая сборка)
-            if attempt_reasoning && !tried_no_reasoning && !is_mmproj_load_error(&log) {
+            // Фолбэк 1: движок не понимает флаги reasoning (старая сборка).
+            // Гейт (PRP B4): рестарт без флагов — ТОЛЬКО при явном отказе
+            // аргумента («invalid argument» arg.cpp b12549 / «unknown argument»
+            // старых сборок). Иначе краш был по другой причине и рестарт с теми
+            // же параметрами повторил бы её (E5: две одинаковые смерти на OOM).
+            let launch_haystack = {
+                let mut h = log.clone();
+                for l in &stderr_lines {
+                    h.push('\n');
+                    h.push_str(l);
+                }
+                h
+            };
+            if attempt_reasoning
+                && !tried_no_reasoning
+                && !is_mmproj_load_error(&log)
+                && log_shows_unknown_flag_error(&launch_haystack)
+            {
                 log_cb(format!(
-                    "⚠️ llama-server завершился при запуске (код {}) — перезапуск БЕЗ reasoning-флагов (движок их не поддерживает). Думатель будет отключён.",
+                    "⚠️ llama-server отклонил аргументы запуска (код {}) — перезапуск БЕЗ reasoning-флагов. Думатель будет отключён.",
                     code
                 ));
                 attempt_reasoning = false;
@@ -1015,6 +1181,32 @@ impl LlamaEngine {
                 continue 'launch;
             }
 
+            // ── PRP B4: HostRamOom при старте — режем КОНТЕКСТ, НЕ -ngl ──
+            // Веса в ОЗУ host-давление только усилят (спец): урезание слота
+            // уменьшает KV/compute-буферы И host-компоненту (graph/reserve-хвост
+            // скейлится с графом). Максимум 1 срез (2 попытки всего), затем fail.
+            if let Some(d) = &diag {
+                if matches!(
+                    d.kind,
+                    crate::engine::startup_diagnosis::StartupFailureKind::HostRamOom
+                ) && !tried_host_ctx_cut
+                {
+                    // Половина слота, выровненная к 256, минимум 4096.
+                    let cut = (((attempt_ctx / 2) / 256) * 256).max(4096);
+                    if cut < attempt_ctx {
+                        log_cb(format!(
+                            "⚠️ Движку не хватило ОБЫЧНОЙ памяти (ОЗУ) при старте (код {}). Рестарт с урезанным контекстом {} → {} и меньшим батчем (--ubatch-size 256). Слои GPU НЕ трогаем — выгрузка весов в ОЗУ давление на ОЗУ только усилит.",
+                            code, attempt_ctx, cut
+                        ));
+                        attempt_ctx = cut;
+                        attempt_small_ubatch = true;
+                        tried_host_ctx_cut = true;
+                        crate::engine::process_util::unregister_engine_pid(child.id());
+                        continue 'launch;
+                    }
+                }
+            }
+
             // ── Финальная ошибка ──
             let msg = if is_mmproj_load_error(&log) || is_mmproj_required_error(&log) {
                 let path = mmproj_orig.as_deref().unwrap_or("<не указан>");
@@ -1023,23 +1215,11 @@ impl LlamaEngine {
                     path,
                     mmproj_error_detail(&log)
                 )
-            } else if let Some(diag) = {
-                // stderr — второй источник диагностики наряду с log-файлом,
-                // поэтому читаем его один раз и переиспользуем в лог.
-                let stderr_lines = server_trace.diagnostic_lines();
-                crate::engine::startup_diagnosis::diagnose_startup_failure(
-                    &log,
-                    &stderr_lines,
-                    code,
-                    &diag_ctx,
-                )
-                .map(|d| (d, stderr_lines))
-            } {
+            } else if let Some(diag) = diag {
                 // Полный технический след — в лог приложения (вкладка «Логи»),
                 // юзеру — расшифровка с конкретным действием. Раньше здесь
                 // отдавался сырой хвост ggml-лога, и юзер делал вывод,
                 // что «сломалась программа».
-                let (diag, stderr_lines) = diag;
                 crate::engine::startup_diagnosis::log_full_trace(
                     &server_log,
                     &log,
@@ -1077,15 +1257,18 @@ impl LlamaEngine {
         let child = engine_child.expect("engine child after successful launch");
 
         let engine = Self {
-            global_ctx_limit,
+            global_ctx_limit: attempt_ctx,
+            hardware_ctx_limit,
+            slot: std::cell::Cell::new(attempt_ctx),
             model_path: model_path.clone(),
             mmproj_path: if attempt_mmproj { mmproj_orig.clone() } else { None },
             is_multimodal_engine: attempt_mmproj,
-            stream_cb: Arc::new(stream_cb),
+            stream_cb: std::cell::RefCell::new(Arc::new(stream_cb)),
             reasoning_cb: std::cell::RefCell::new(Arc::new(|_chunk: String| {})),
-            log_cb: log_cb.clone(),
+            log_cb: std::cell::RefCell::new(log_cb.clone()),
             client,
             server_log,
+            stderr_log: stderr_log.clone(),
             server_trace,
             server_log_line_count: std::sync::Mutex::new(0),
             port,
@@ -1191,7 +1374,7 @@ impl LlamaEngine {
             let free_now_mb = sys.free_memory() as f64 / (1024.0 * 1024.0);
             if pinned_need_mb > free_now_mb - BEE_LLAMA_RAM_RESERVE_MB {
                 let note = format!(
-                    "BeeLlama держит KV-кэш и вычисления в обычной памяти (pinned ~{:.1} ГБ при контексте {} токенов), свободно {:.1} ГБ (минус {} ГБ резерва для системы). Запуск может упасть с ошибкой аллокации — сократите контекст в настройках или используйте исходный движок llama.cpp.",
+                    "BeeLlama держит KV-кэш и вычисления в обычной памяти (pinned ~{:.1} ГБ при контексте {} токенов), свободно {:.1} ГБ (минус {} ГБ резерва для системы). Запуск может упасть с ошибкой аллокации — освободите память (закройте другие программы) либо выберите исходный движок llama.cpp: Настройки → «Движок запуска нейромоделей».",
                     pinned_need_mb / 1024.0,
                     global_ctx_limit,
                     free_now_mb / 1024.0,
@@ -1973,7 +2156,7 @@ impl LlamaEngine {
                     let current_text = String::from_utf8_lossy(&generated_bytes).into_owned();
                     let diff = compute_stream_diff(&current_text, &result_text).to_string();
                     if !diff.is_empty() {
-                        (self.stream_cb)(diff);
+                        (self.stream_cb.borrow())(diff);
                     }
                     result_text = current_text;
                     generated_tokens += 1;
@@ -2300,7 +2483,7 @@ impl LlamaEngine {
             self.global_ctx_limit,
             &ctx.kv_spec,
             free_mb,
-            256.0,
+            crate::engine::vram_estimate::vram_reserve_mb(), // WDDM-запас (B2)
             1.25,
         ))
     }
@@ -2332,7 +2515,7 @@ impl LlamaEngine {
             return Ok(());
         }
         let ngl = self.current_ngl.get();
-        (self.log_cb)(format!(
+        (self.log_cb.borrow())(format!(
             "▶ Перезапуск llama-server после внешнего вычисления (-ngl {})…",
             ngl
         ));
@@ -2342,6 +2525,12 @@ impl LlamaEngine {
     /// Убивает текущий llama-server и запускает заново с указанным -ngl.
     /// Возвращает Ok, когда сервер здоров. Логи попадают в UI (self.log_cb).
     fn respawn_with_ngl(&self, new_ngl: u32) -> Result<(), String> {
+        self.respawn_with(new_ngl, self.slot.get())
+    }
+
+    /// Респавн с ЯВНЫМ слотом (PRP C6 step-up): тот же конфиг, другие ngl/ctx.
+    /// При успехе обновляет живой слот (current_slot) — хост-кэш видит рост.
+    fn respawn_with(&self, new_ngl: u32, new_ctx: u32) -> Result<(), String> {
         let ctx = match self.respawn_ctx.as_deref() {
             Some(c) => c,
             None => return Err("Нет контекста для перезапуска движка".to_string()),
@@ -2367,7 +2556,7 @@ impl LlamaEngine {
             .arg("--host").arg("127.0.0.1")
             .arg("--port").arg(self.port.to_string())
             .arg("--api-key").arg(&self.api_key)
-            .arg("--ctx-size").arg(self.global_ctx_limit.to_string())
+            .arg("--ctx-size").arg(new_ctx.to_string())
             .arg("--parallel").arg(crate::engine::vram_estimate::SERVER_N_PARALLEL.to_string())
             .arg("-t").arg(ctx.threads.to_string())
             .arg("-ngl").arg(new_ngl.to_string())
@@ -2386,6 +2575,12 @@ impl LlamaEngine {
         {
             let cfg_r = crate::engine::config::load_config_early();
             let sid = crate::engine::sources::resolve_source(cfg_r.engine_source.as_deref());
+            // Те же скрытые дефолты, что в build_cmd (только ggml-org — PRP B1):
+            // respawn обязан спавнить сервер с тем же набором флагов.
+            if sid == "ggml-org" {
+                c.arg("--cache-ram").arg("0");
+                c.arg("--ctx-checkpoints").arg("0");
+            }
             let spec = crate::engine::sources::source_spec(&sid);
             let rk = spec.as_ref().and_then(|s| s.runtime.cache_type_k.clone());
             let rv = spec.as_ref().and_then(|s| s.runtime.cache_type_v.clone());
@@ -2419,10 +2614,15 @@ impl LlamaEngine {
         #[cfg(windows)]
         crate::engine::process_util::assign_child_to_kill_job(&child);
         if let Some(stderr) = child.stderr.take() {
-            let log_cb = self.log_cb.clone();
+            let log_cb = self.log_cb.borrow().clone();
             let server_trace = self.server_trace.clone();
             let engine_last_progress_ms = self.engine_last_progress_ms.clone();
+            // Truncate-файл под stderr этого прогона (та же семантика «последний
+            // прогон», что и у llama_server.log при respawn — PRP B5).
+            let stderr_file = std::fs::File::create(&self.stderr_log).ok();
             std::thread::spawn(move || {
+                use std::io::{BufRead, Write};
+                let mut err_out = stderr_file.map(std::io::BufWriter::new);
                 let reader = std::io::BufReader::new(stderr);
                 for line in reader.lines() {
                     let line = match line {
@@ -2431,6 +2631,11 @@ impl LlamaEngine {
                     };
                     let line = line.trim().to_string();
                     if !line.is_empty() {
+                        // Flush на строке: fast-fail не должен забрать буфер (PRP B5).
+                        if let Some(w) = err_out.as_mut() {
+                            let _ = writeln!(w, "{}", line);
+                            let _ = w.flush();
+                        }
                         if stderr_line_shows_progress(&line) {
                             engine_last_progress_ms.store(now_unix_ms(), Ordering::Relaxed);
                         }
@@ -2476,13 +2681,14 @@ impl LlamaEngine {
 
         *self.child.lock().unwrap() = Some(child);
         self.current_ngl.set(new_ngl);
+        self.slot.set(new_ctx);
         if new_ngl == 0 {
             self.engine_mode.replace("cpu".to_string());
             self.engine_mode_detail.replace(
                 "После CUDA OOM движок перезапущен с полной выгрузкой оффлоада в ОЗУ.".to_string(),
             );
         }
-        (self.log_cb)(format!("✅ Перезапуск движка с -ngl {} завершён, сервер здоров.", new_ngl));
+        (self.log_cb.borrow())(format!("✅ Перезапуск движка с -ngl {} завершён, сервер здоров.", new_ngl));
         Ok(())
     }
 
@@ -2509,6 +2715,8 @@ impl LlamaEngine {
     where F: FnMut(f32, &str), L: Fn(String)     {
         let mut step: u8 = 0;
         let mut stream_retry_used = false;
+        // PRP C6: mid-turn step-up слота — один за вызов.
+        let mut step_up_used = false;
         loop {
             let result = self.run_chat_completions(
                 messages,
@@ -2536,7 +2744,7 @@ impl LlamaEngine {
             }
             if should_retry_stream(false, stream_retry_used, &err) {
                 stream_retry_used = true;
-                (self.log_cb)("🔄 Стрим оборвался до первого токена — повторяю запрос 1/1.".to_string());
+                (self.log_cb.borrow())("🔄 Стрим оборвался до первого токена — повторяю запрос 1/1.".to_string());
                 log::warn!("Стрим оборвался до первого токена: {}", strip_stream_retry_marker(&err));
                 continue;
             }
@@ -2564,7 +2772,7 @@ impl LlamaEngine {
             // CUDA-веткой: там ответ «урезать -ngl», что при host-отказе делает
             // причину ХУЖЕ (больше слоёв уйдёт в ОЗУ). Честный отказ + факт в чат.
             if is_host_memory_oom_text(&err) || is_host_memory_oom_text(&log_tail) {
-                (self.log_cb)("❌ Движку не хватило обычной памяти (ОЗУ) под pinned-буферы. Повтор не поможет: памяти не прибавится.".to_string());
+                (self.log_cb.borrow())("❌ Движку не хватило обычной памяти (ОЗУ) под pinned-буферы. Повтор не поможет: памяти не прибавится.".to_string());
                 crate::engine::notify_vram(crate::engine::vram::vram_oom_fact_notice(
                     "оперативная память (ОЗУ) под pinned-буферы движка",
                     "Уменьшите размер контекста в настройках или закройте другие приложения; при оффлоаде части слоёв в ОЗУ — увеличьте число GPU-слоёв.",
@@ -2574,6 +2782,30 @@ impl LlamaEngine {
                      Уменьшите контекст в настройках или закройте другие приложения.",
                     err
                 ));
+            }
+            // ── C6: переполнение слота — step-up, не усечение (§00.2) ──
+            // Рост от выходов тулов, который стартовая оценка не видит
+            // структурно: поднимаем слот на тир выше (в пределах hardware-
+            // потолка), один ретрай. Усечение истории — не здесь: его держит
+            // бюджет компакции хоста у потолка железа (PRP C5).
+            if !step_up_used && is_ctx_overflow_text(&err) && self.slot.get() < self.hardware_ctx_limit {
+                let new_ctx = crate::engine::vram_estimate::next_tier(
+                    self.slot.get().saturating_add(1),
+                    self.hardware_ctx_limit,
+                );
+                step_up_used = true;
+                if new_ctx > self.slot.get() {
+                    (self.log_cb.borrow())(format!(
+                        "🔄 Промпт не влез в слот {} токенов — поднимаю слот движка до {} (step-up, один ретрай)...",
+                        self.slot.get(),
+                        new_ctx
+                    ));
+                    log::warn!("ctx overflow → step-up слота {} → {}", self.slot.get(), new_ctx);
+                    if let Err(resp_err) = self.respawn_with(self.current_ngl.get(), new_ctx) {
+                        return Err(format!("{}\n\nНе удалось поднять слот движка: {}", err, resp_err));
+                    }
+                    continue;
+                }
             }
             let err_is_oom = is_cuda_oom_text(&err) || log_tail_oom || vram_pressure;
             if step >= 2 || !self.can_oom_retry() || !err_is_oom {
@@ -2585,7 +2817,7 @@ impl LlamaEngine {
                 // урезать нечего — повтор не поможет
                 return Err(err);
             }
-            (self.log_cb)(format!(
+            (self.log_cb.borrow())(format!(
                 "🔄 CUDA OOM при генерации — автоматический перезапуск движка с меньшим оффлоадом (-ngl {} → {}), шаг {}/2...",
                 self.current_ngl.get(),
                 next_ngl,
@@ -2624,6 +2856,28 @@ impl LlamaEngine {
     /// JSON-envelope у агентов Method 3.
     pub fn set_reasoning_sink(&self, sink: Arc<dyn Fn(String) + Send + Sync>) {
         *self.reasoning_cb.borrow_mut() = sink;
+    }
+
+    /// Сеттер канала стрима (PRP C2): реюз живого движка между ходами с новым
+    /// приёмником токенов. RefCell-паттерн `set_reasoning_sink`: вызывается
+    /// хостом МЕЖДУ ходами (движок эксклюзивно взят из кэша), не во время
+    /// генерации — во время неё канал читает только поток генерации.
+    pub fn set_stream_sink(&self, sink: Arc<dyn Fn(String) + Send + Sync>) {
+        *self.stream_cb.borrow_mut() = sink;
+    }
+
+    /// Сеттер канала логов (PRP C2). Живущий в отдельном потоке stderr-насос
+    /// захватывает Arc-клон при спавне — смена слота логов не влияет на
+    /// работающий насос (его строки продолжают идти в шину приложения).
+    pub fn set_log_sink(&self, sink: Arc<dyn Fn(String) + Send + Sync>) {
+        *self.log_cb.borrow_mut() = sink;
+    }
+
+    /// Текущий живой слот (`--ctx-size` работающего движка). Растёт при
+    /// mid-turn step-up (PRP C6) — хост-кэш обновляет активный слот после
+    /// каждого хода из этого геттера (PRP C4).
+    pub fn current_slot(&self) -> u32 {
+        self.slot.get()
     }
 
     /// Забирает заданную грамматику для текущего вызова (consume-and-clear).
@@ -2911,6 +3165,21 @@ fn format_log_tail(content: &str) -> String {
     format!("\n--- хвост лога llama-server ---\n{}\n{}", status, body)
 }
 
+/// Распознаёт отказ запуска из-за неподдерживаемого аргумента командной строки.
+/// b12549 arg.cpp печатает `error: invalid argument: <флаг>` (верифицировано по
+/// исходнику); старые сборки — `unknown argument` / `unrecognized argument` /
+/// `unknown option`. Только явный отказ аргумента даёт право на рестарт без
+/// reasoning-флагов (PRP B4): на OOM/assert-краше рестарт с теми же параметрами —
+/// лишняя одинаковая смерть (инцидент E5 20.11.26: фолбэк перезапускал движок
+/// дважды на OOM и маскировал причину).
+fn log_shows_unknown_flag_error(haystack: &str) -> bool {
+    let h = haystack.to_lowercase();
+    h.contains("invalid argument")
+        || h.contains("unknown argument")
+        || h.contains("unrecognized argument")
+        || h.contains("unknown option")
+}
+
 /// Проверка: упал ли llama-server из-за ОШИБКИ ЗАГРУЗКИ проектора mmproj
 /// (битый/несовместимый файл, нечитаемый тензор и т.п.).
 fn is_mmproj_load_error(log: &str) -> bool {
@@ -2950,6 +3219,17 @@ fn mmproj_error_detail(log: &str) -> String {
 }
 
 /// Детектор CUDA OOM по тексту (ошибка/хвост лога llama-server).
+/// Переполнение контекста при генерации (PRP C6): llama-server отвечает
+/// HTTP 400 с типом ошибки `exceed_context_size_error` (верифицировано по
+/// b12549, tools/server/server-common.cpp: `case ERROR_TYPE_EXCEED_CONTEXT_SIZE`
+/// → `type_str = "exceed_context_size_error"`); тело ответа попадает в текст
+/// ошибки целиком (llm.rs, ветка `!status.is_success()`). Классический
+/// фрагмент сообщения — запасной матч на случай старых рефакторингов.
+fn is_ctx_overflow_text(text: &str) -> bool {
+    let h = text.to_lowercase();
+    h.contains("exceed_context_size_error") || h.contains("exceeds the available context size")
+}
+
 fn is_cuda_oom_text(text: &str) -> bool {
     let lower = text.to_lowercase();
     lower.contains("out of memory")
@@ -3125,6 +3405,45 @@ pub fn merge_consecutive_assistant(messages: Vec<serde_json::Value>) -> Vec<serd
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── PRP B4: reasoning-фолбэк только при flag-error ───
+
+    /// Явный отказ аргументов — единственное основание для перезапуска без
+    /// reasoning-флагов (U-B4).
+    #[test]
+    fn unknown_flag_error_is_detected_by_all_wordings() {
+        assert!(log_shows_unknown_flag_error("error: invalid argument: --reasoning-budget"));
+        assert!(log_shows_unknown_flag_error("llama_server: unknown argument --no-reasoning-preserve"));
+        assert!(log_shows_unknown_flag_error("Unrecognized argument: --jinja"));
+        assert!(log_shows_unknown_flag_error("error: unknown option: --cache-ram"));
+    }
+
+    /// OOM/assert-краш НЕ является flag-error: reasoning-фолбэк на нём запрещён
+    /// (инцидент E5: две одинаковые смерти от одного и того же OOM).
+    #[test]
+    fn oom_and_assert_crash_are_not_flag_errors() {
+        assert!(!log_shows_unknown_flag_error(
+            "GGML_ASSERT(ctx->mem_buffer != NULL) failed; ggml.c:1650"
+        ));
+        assert!(!log_shows_unknown_flag_error(
+            "llama_kv_cache_unified: failed to allocate CUDA0 buffer of size 4096.00 MiB"
+        ));
+        assert!(!log_shows_unknown_flag_error(""));
+    }
+
+    // ─── C6: матчер переполнения контекста ───
+
+    #[test]
+    fn ctx_overflow_matches_verified_type_and_message_fragment() {
+        // Тип из b12549 server-common.cpp (верифицировано) внутри тела HTTP 400.
+        assert!(is_ctx_overflow_text(
+            r#"llama-server: HTTP 400 при генерации: {"error":{"code":400,"message":"the request exceeds the available context size...","type":"exceed_context_size_error"}}"#
+        ));
+        // Запасной фрагмент классического сообщения.
+        assert!(is_ctx_overflow_text("the request exceeds the available context size"));
+        assert!(!is_ctx_overflow_text("CUDA out of memory"));
+        assert!(!is_ctx_overflow_text(""));
+    }
 
     // ─── Таймауты фаз обмена с llama-server ───
 

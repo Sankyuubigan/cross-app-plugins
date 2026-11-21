@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 25ce692dd6fcba752d9ddea8c7f9e9a8ba56753a3f5eec67f230898a91e361b2 # shrinks to (e, budget, reserve, _base) = (VramEstimate { model_mb: 100.0, kv_per_token_mb: 0.0390625, kv_mb: 10.0, kv_swa_mb: 0.0, buffers_mb: 0.0, total_mb: 110.0, num_layers: 1, num_attn_layers: 1 }, 500.0, 501.0, 256)

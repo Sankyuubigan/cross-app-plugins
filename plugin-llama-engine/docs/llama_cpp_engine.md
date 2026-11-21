@@ -514,30 +514,79 @@ diagnose_shared_kv_before_spawn(&model_path, &diag_ctx) -> Option<StartupDiagnos
 
 ---
 
-## 5. Контекст: оценка ДО старта и точная обрезка ПОСЛЕ
+## 5. Контекст: физика `--ctx-size` и точная обрезка ПОСЛЕ старта
 
 `--ctx-size` **фиксируется при старте процесса** и не меняется (runtime-resize через `/props`
-недоступен в llama.cpp). Поэтому:
+недоступен в llama.cpp). Физика аллокатора (доказана логом инцидента 19.11.2026, 8 ГБ VRAM):
 
-### 5.1 Эвристика worst-case ДО старта (`orchestrator/mod.rs:287`, `estimate_chars_per_token:237`)
-```rust
-let (worst_system_prompt, worst_has_tools) = build_worst_agent_prompt(...); // самый тяжёлый агент графа
-let total_chars = worst_system_prompt.len() + history_chars + user_text.len();
-let image_tokens = attachments.len() as u32 * 2048;
-let chars_per_token = if cyrillic_heavy { 2 } else { 3 };   // ~2 симв/токен кириллица, ~3 латиница
-let tool_budget = if worst_has_tools { TOOL_WORKING_BUDGET(1024) } else { 0 };
-let estimated_tokens = (total_chars / chars_per_token)
-                       + image_tokens + TOKEN_ESTIMATE_RESERVE(512) + tool_budget;
-let engine_ctx_limit = (estimated_tokens + max_gen_tokens + 128).min(context_size).max(2048);
-```
-- `TOKEN_ESTIMATE_RESERVE = 512`, `TOOL_WORKING_BUDGET = 1024` (`orchestrator/consts.rs:9-10`).
-- `+128` — запас; clamp к `[2048, context_size]` (где `context_size` из конфига, default 24576).
-- `worst_system_prompt`: системный промпт самого «тяжёлого» `llm_worker`-агента графа (включая
-  схемы инструментов и блок `[КРИТИЧЕСКОЕ ОГРАНИЧЕНИЕ]`) — SSOT с `run_agent_node`.
-- Токенизатор недоступен до старта сервера → грубая эвристика; точная подгонка — после.
+- **KV-кэш пре-аллоцируется под ВЕСЬ `--ctx-size` при создании контекста — ДО любого промпта**
+  (лог: аллок 8192 МБ на 0.09 сек после старта при промпте 852 токенов, отказ
+  `failed to allocate buffer for kv cache`). «Сколько промпт — столько памяти» — НЕВЕРНО.
+- При `-ngl > 0` ЕДИНЫЙ KV-кэш лежит на GPU **целиком** — не пропорционально оффлоадженным
+  слоям (оценки вида `kv * (ngl/layers)` врут; инцидент: оценка обещала «влезет» при
+  frac=16/36, фактический аллок был K-половиной ПОЛНОГО KV).
+- Встроенный авто-фит llama.cpp (`common_fit_params`, сам урезал бы ctx под свободную VRAM)
+  **отключается явным `-ngl`** (`n_gpu_layers already set by user ... abort`).
+
+**Какой ctx подать на спавн — решение хоста.** Считать его от оценки промпта запрещено
+(астро-баг king_orch_3, коммит 3dea2ed: задание агента материализуется ПОЗЖЕ из выходов
+тулов — оценка несуществующего контента врёт и провоцирует свёртку данных компакцией).
+База для слота — измеряемые факты: окно модели из GGUF-метаданных (`extract_context_length`),
+свободная ОЗУ (RAM-гейт плагина, `max_fitting_ctx_estimate`) и свободная VRAM. Эталонная
+цепочка хоста (King Orch, SSOT в его AGENTS.md): `слот = min(окно GGUF, ОЗУ-потолок, VRAM-потолок)`.
+
+### 5.1 VRAM-потолок слота (реализовано, PRP 26.11.20 king_orch_3)
+
+Хост подаёт в префлайт слот = окно GGUF; префлайт плагина (`llm.rs` + `vram_estimate.rs`)
+ужимает запрос под свободную VRAM. Порядок гейтов:
+
+1. **VRAM-ctx-гейт** — `max_fitting_ctx_vram_estimate(est, base_ctx, free_vram, reserve)`:
+   аналитическая обратная к критерию `vram_for_ctx_mb(ctx) + reserve ≤ free`. Возвращает
+   наибольший кратный 256 ctx, при котором веса остаются на GPU (SWA-часть KV от ctx не
+   зависит и удерживается на уровне base); `0` — сентинел «веса+SWA+буферы+резерв сами по
+   себе не влезают». Срезанный ctx идёт в `--ctx-size` и в `Self.global_ctx_limit` → через
+   `engine.global_ctx_limit()` доходит до бюджета компакции хоста.
+2. **Ступенчатая резка `-ngl`** (шаг 2, до PRP существовал): если с минимальным ctx не
+   влезает — резка слоёв через `max_fitting_ngl_estimate`/`max_fitting_ngl_safe_estimate`
+   (KV при любом `ngl>0` считается ЦЕЛИКОМ на GPU — физика инцидента 19.11.2026).
+3. **RAM-гейт** (`max_fitting_ctx_estimate`) — под свободную ОЗУ, без изменений.
+
+Формулы следов: `vram_for_ngl_estimate` (ngl>0 → веса·frac + ПОЛНЫЙ KV + буферы; ngl=0 →
+буферы) и `vram_for_ctx_mb` (модель + dense·pad256(ctx)/pad256(base) + SWA на уровне base +
+буферы). Свойства закреплены property-тестами proptest (инверсия проходит собственный
+критерий, максимальна, кратна 256, монотонна по бюджету; `0` — честный сентинел «даже
+минимальный контекст не влезает», не валидное значение).
+
+### 5.1.1 Тир-слот, step-up и железный потолок (реализовано, PRP «Вариант B+C» 20.11.2026)
+
+Хост подаёт в префлайт слот = **тир** от потребности: `engine_cache::choose_slot(need, окно
+GGUF)` → `next_tier` (SSOT в `vram_estimate.rs`: удвоение от `TIERS_MIN = 16384`, clamp к
+окну; окно 0 → 0). Потребность `need` — по ФАКТИЧЕСКОЙ истории (non-thought chars/2 по SSOT
+2 симв/ток + 2×max_gen margin); это НЕ воскрешение удалённой 3dea2ed worst-оценки будущего
+задания (оценка несуществующего контента структурно врёт) — задание, материализующееся позже
+из выходов тулов, защищено двумя механизмами ниже.
+
+1. **Железный потолок компакции** — `compute_hardware_ctx_ceiling(est_окна, base_ctx, ngl,
+   free_vram, reserve, ram_budget)` = min(VRAM-инверсии с сентинел-фолбэком, RAM-инверсии)
+   считается префлайтом и живёт в `LlamaEngine.hardware_ctx_limit` (+ хост-прокси
+   `llm_backend.rs::hardware_ctx_limit()`). Бюджет компакции хоста считается ОТ НЕГО, а не
+   от активного слота: слот может быть ниже потолка (тир-экономия VRAM) — усечение истории
+   из-за слота воспроизводило бы астро-баг «данных нет».
+2. **Step-up переполнения** — HTTP 400 `exceed_context_size_error` (верифицировано по
+   server-common.cpp b12549) ловит `is_ctx_overflow_text` в oom-retry: ОДИН раз
+   `respawn_with(ngl, next_tier(slot+1, hardware_ctx_limit))` и повтор запроса. Ограничение:
+   рост >2× ВНУТРИ одного хода одним шагом не покрывается → честный Err, следующий ход
+   свежий спавн по реальному размеру.
+3. **Движок живёт между ходами** — кэш хоста (`infra/engine_cache.rs`): реюз при полном
+   совпадении model/mmproj/KV-флагов/reasoning-budget и `active_slot ≥ need`; колбэки хода
+   перецепляются сеттерами `set_stream_sink`/`set_log_sink` (`RefCell<Arc<…>>`, безопасно
+   между ходами — stderr-насос держит Arc-клон, снятый при спавне); слот перечитывается
+   `current_slot()` (Cell, мутация `global_ctx_limit` невозможна на `&self`). Idle-выгрузка
+   5 мин у хоста; `respawn_with_ngl` делегирует в `respawn_with(ngl, ctx)`.
 
 ### 5.2 Точная обрезка ПОСЛЕ старта (`/tokenize`)
-В `run_agent_node` (`orchestrator/mod.rs:759`) на каждой итерации цикл:
+Токенизатор движка доступен после старта — точная подгонка истории делается им, а не оценкой.
+В `run_agent_node` (king_orch_3, `orchestrator/mod.rs`) на каждой итерации цикл:
 ```rust
 loop {
     let current_tokens = engine.get_tokens_count(&ctx.llm_messages, format_type)?;
@@ -770,9 +819,10 @@ infra/  (обёртка над LLM — ТОЛЬКО через дверь infra/
    32-hex), `--ctx-size`, `-t`, `-ngl 999|0`, `--flash-attn on`, `--no-webui`, `--log-file`.
 4. **Жди `/health`** (≤120s). Имей fallback на случай неподдерживаемых флагов.
 5. **Чисть через Drop + Job Object + kill_active_engines** — иначе серверы-зомби висят в VRAM.
-6. **Контекст:** оцени worst-case `--ctx-size` эвристикой ДО старта (~3 симв/токен, +резервы);
-   точно подгоняй историю ПОСЛЕ старта через `/tokenize` (не рви пары tool/assistant, не трогай
-   сжатую историю).
+6. **Контекст:** помни — `--ctx-size` фиксируется при спавне и KV пре-аллоцируется под ВЕСЬ
+   размер до первого промпта (§5). Слот считай от физики (окно GGUF, свободная VRAM/ОЗУ),
+   НЕ от оценки промпта; точную подгонку истории делай ПОСЛЕ старта через `/tokenize`
+   (не рви пары tool/assistant, не трогай сжатую историю).
 7. **Сэмплинг** — per-request в `/v1/chat/completions`; бери дефолты из GGUF-метаданных, клампь.
 8. **Промпт рендерит сервер** (jinja `chat_template` из GGUF) — шли только `messages[]`.
 9. **GPU:** детект через NVML/nvidia-smi; `-ngl 999` для GPU-бекенда; проверяй дельту VRAM после
@@ -785,7 +835,7 @@ infra/  (обёртка над LLM — ТОЛЬКО через дверь infra/
 
 - **Тихий CPU-фолбэк** без CUDA-рантайма (`cublas64_*.dll`). Решение: preflight-проверка DLL +
   диагностика из лога сервера.
-- **Переполнение контекста** (runtime-resize недоступен). Решение: эвристика ДО + `/tokenize`-триминг ПОСЛЕ.
+- **Переполнение контекста** (runtime-resize недоступен). Решение: слот от физики железа (§5) + `/tokenize`-триминг ПОСЛЕ.
 - **Висящие процессы** при насильственном закрытии. Решение: Windows Job Object `KILL_ON_JOB_CLOSE`.
 - **Конфликт портов** при параллельных запусках. Решение: рандом + bind-проверка.
 - **Уязвимость localhost** без api-key. Решение: рандомный 32-hex ключ в `Bearer`.
