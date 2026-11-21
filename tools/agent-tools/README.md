@@ -22,6 +22,8 @@ https://github.com/punkpeye/awesome-mcp-servers
 https://github.com/modelcontextprotocol/servers
 https://github.com/punkpeye/awesome-mcp-devtools
 https://github.com/unpluggedcoder/awesome-rust-tools
+https://github.com/ultraworkers/claw-code
+https://github.com/xai-org/grok-build
 
 ## Сборка и запуск
 
