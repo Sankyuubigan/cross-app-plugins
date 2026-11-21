@@ -57,4 +57,28 @@ function syncConfiguredResources(cfg) {
     }
 }
 
-module.exports = { syncConfiguredResources, syncDir };
+// Скопировать syncDirs (basename каждой папки) в произвольную папку рядом с
+// exe — для kind=cargo, где Tauri-ресурсов нет: destDir = папка exe при build
+// и NSIS-стейдж при упаковке. Зеркалирование то же (syncDir). Ошибка источника
+// — warn (как в syncConfiguredResources); ошибка копирования — throw:
+// сборка/упаковка падают, молчаливой потери файлов нет.
+function copySyncDirsTo(cfg, destDir) {
+    const entries = cfg.syncDirs;
+    if (!entries || entries.length === 0) return 0;
+    fs.mkdirSync(destDir, { recursive: true });
+    let count = 0;
+    for (const rel of entries) {
+        const src = path.join(cfg.projectRoot, rel);
+        if (!fs.existsSync(src)) {
+            console.warn(`syncDirs: source not found, skipped: ${rel}`);
+            continue;
+        }
+        const dest = path.join(destDir, path.basename(rel));
+        syncDir(src, dest);
+        console.log(`[sync-resources] ${path.basename(rel)}/ -> ${dest}`);
+        count++;
+    }
+    return count;
+}
+
+module.exports = { syncConfiguredResources, syncDir, copySyncDirsTo };

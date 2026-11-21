@@ -8,13 +8,15 @@
 // точное совпадение `_X.Y.Z_x64-setup.exe`, никакого префиксного матчинга).
 //
 // Стейджинг: общий target-dir означает, что рядом с exe лежат чужие артефакты,
-// поэтому в пакет собираем ТОЛЬКО exe приложения + vcRedist-DLL из конфига.
+// поэтому в пакет собираем exe приложения + vcRedist-DLL из конфига + syncDirs
+// (зеркальная копия, copySyncDirsTo — те же папки, что кладутся рядом с exe).
 
 const fs = require('fs');
 const path = require('path');
 const { run: sh } = require('./run.cjs');
 const { resolveTargetDir } = require('./config.cjs');
 const { readVersion } = require('./version.cjs');
+const { copySyncDirsTo } = require('./sync-resources.cjs');
 
 const APP_NSI = path.join(__dirname, '..', 'templates', 'app.nsi');
 
@@ -59,6 +61,12 @@ function stageCargoFiles(cfg, exePath) {
             dllCount++;
         }
     }
+
+    // syncDirs (напр. doc/ с инструкциями промпта) — в стейдж установщика
+    // и portable-zip: без этого deployed-копия остаётся без файлов «рядом
+    // с exe» (баг VibeBridge 19.11.26: doc/markdown_plan.md не находился).
+    copySyncDirsTo(cfg, stageDir);
+
     return { stageDir, exeName, dllCount };
 }
 

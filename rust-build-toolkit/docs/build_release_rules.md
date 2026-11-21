@@ -125,7 +125,7 @@ MSVC-окружение (vswhere → `vcvarsall.bat x64`). В шаблонах �
   до `--`, если в аргументах нет явного `--profile`/`--release`).
 - Причины:
   1. debug-харнесс на части машин не стартует (0xc0000139
-     STATUS_ENTRYPOINT_NOT_FOUND, desktop-доки §6.2) — debug-тесты собирались, но
+     STATUS_ENTRYPOINT_NOT_FOUND, test_rules.md §7) — debug-тесты собирались, но
      запускать их было нельзя; рабочим был только явный `--release`.
   2. target/debug раздувается до десятков ГБ на проект (кейс king_orch: 127 ГБ;
      ещё 7 проектов — 20-48 ГБ каждый), при том что build/release/installer от

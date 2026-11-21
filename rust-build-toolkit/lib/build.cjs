@@ -9,7 +9,7 @@ const { resolveTargetDir } = require('./config.cjs');
 const { run: sh, launchApp, killApp } = require('./run.cjs');
 const { bumpVersion, readVersion } = require('./version.cjs');
 const { ensureIcons } = require('./icons.cjs');
-const { syncConfiguredResources } = require('./sync-resources.cjs');
+const { syncConfiguredResources, copySyncDirsTo } = require('./sync-resources.cjs');
 const { copyVcRedistIfConfigured } = require('./copy-vc-redist.cjs');
 const { checkProjectEncodings } = require('./encoding-check.cjs');
 
@@ -166,11 +166,9 @@ function prep(cfg, opts = {}) {
         console.log(`Version: ${readVersion(cfg)} (kept)`);
     }
     if (cfg.kind === 'cargo') {
-        // cargo/GPUI-проекты: tauri-ресурсов нет; syncDirs туда копировать не в
-        // что — честно предупредить, если владелец их задал.
-        if (cfg.syncDirs && cfg.syncDirs.length) {
-            console.warn(`[prep] kind=cargo: sync-resources не поддерживается, syncDirs игнорируются: ${cfg.syncDirs.join(', ')}`);
-        }
+        // cargo/GPUI-проекты: Tauri-ресурсов нет; syncDirs копируются рядом
+        // с exe ПОСЛЕ сборки (copySyncDirsTo в run()) и в стейдж установщика
+        // (stageCargoFiles в nsis.cjs) — в prep копировать нечего.
     } else {
         syncConfiguredResources(cfg);
     }
@@ -215,6 +213,12 @@ async function run(cfg, opts = {}) {
 
     const exe = checkExeFresh(cfg, buildStart);
     copyVcRedistIfConfigured(cfg, exe);
+
+    // kind=cargo: syncDirs (напр. doc/ с инструкциями) — рядом с exe, чтобы
+    // dev-запуск имел файлы «рядом с exe» без подъёма по дереву проекта.
+    if (cfg.kind === 'cargo') {
+        copySyncDirsTo(cfg, path.dirname(exe));
+    }
 
     // launchApp: false → краш приложения в первые секунды (PANIC/missing DLL)
     // — фейлим билд, не молчим. 7s вместо дефолтных 2s: смерть приложения
