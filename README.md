@@ -32,6 +32,7 @@
 |--------|---------------|------------|---------------|
 | `plugin-log-collector` | `logs` | Единый `log::Log`: файл лога + `test/last_logs.txt` + UI-вкладка + опц. аналитика | `<logs-panel>` |
 | `plugin-about-updates` | `about-updates` | Версия, проверка обновлений, история релизов GitHub, откат | `<about-updates-panel>` |
+| `plugin-tauri-window-icon` | `window-icon` | Обход пробела tauri/tao: ICON_SMALL+ICON_BIG из ресурсов exe на окно до показа — кнопка панели задач без фолбэка на протухший кэш Explorer. Первый таури-специфичный плагин репы (GPUI-хосту не нужен — у GPUI бага нет) | — |
 | `plugin-speech-gen-engine` | `speech` | TTS/STT (движок CrispASR, голоса, модели) | да |
 
 `rust-build-toolkit/` — отдельный Node-CLI пакет для сборки/препа/релиза хост-проектов

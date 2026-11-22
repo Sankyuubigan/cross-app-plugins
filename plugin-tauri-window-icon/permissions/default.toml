@@ -1,0 +1,5 @@
+"$schema" = "../gen/schemas/acl.json"
+
+[default]
+description = "Плагин без команд: поверхность invoke отсутствует, разрешений не нужно."
+permissions = []

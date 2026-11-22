@@ -1,0 +1,16 @@
+[package]
+name = "window-icon-core"
+version = "0.1.0"
+edition = "2021"
+description = "Pure win32 core of plugin-tauri-window-icon: sets ICON_SMALL+ICON_BIG from the exe resources onto a window handle (hwnd) before the taskbar button is created - a workaround for the tauri/tao gap (tao set_window_icon is hardcoded to IconType::Small). No Tauri, no AppHandle."
+license = "MIT"
+
+[dependencies]
+log = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+
+[lib]
+name = "window_icon_core"
+path = "src/lib.rs"

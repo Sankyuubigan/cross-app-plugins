@@ -27,6 +27,11 @@ members = [
     "plugin-ytdlp-wrapper/core",
     "plugin-ffmpeg-wrapper",
     "plugin-ffmpeg-wrapper/core",
+    # Первый таури-СПЕЦИФИЧНЫЙ плагин репы (все прочие универсальны по фронтендам):
+    # обход пробела tauri/tao — taskbar ICON_BIG не выставляется (tao
+    # set_window_icon захардкожен на IconType::Small). GPUI-хосту не нужен.
+    "plugin-tauri-window-icon",
+    "plugin-tauri-window-icon/core",
     "tauri-plugin-system1",
     "json-store",
     # gpui-kit — НЕ член workspace: его опциональные депы gpui-webview/lb-wry

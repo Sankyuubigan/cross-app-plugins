@@ -1,0 +1,21 @@
+[package]
+name = "plugin-tauri-window-icon"
+version = "0.1.0"
+edition = "2021"
+links = "tauri-plugin-window-icon"
+description = "Tauri-specific workaround for the tauri/tao gap: the taskbar ICON_BIG is never set (tao set_window_icon is hardcoded to IconType::Small), so the Windows taskbar button falls back to a stale Explorer cache in dev builds. Sets ICON_SMALL+ICON_BIG from the exe resources via on_window_ready BEFORE the window is shown. First tauri-specific plugin of this repo - all others are frontend-universal (GPUI hosts don't have this bug)."
+license = "MIT"
+
+[dependencies]
+tauri = { workspace = true }
+log = { workspace = true }
+
+# Чистое win32-ядро (SSOT, без tauri): вся иконковая логика живёт здесь.
+window-icon-core = { path = "core" }
+
+[lib]
+name = "plugin_tauri_window_icon"
+path = "src/lib.rs"
+
+[build-dependencies]
+tauri-plugin = { version = "2", features = ["build"] }
