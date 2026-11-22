@@ -403,19 +403,37 @@ pub fn build_json_object_grammar_with_keys(bool_keys: &[String], string_keys: &[
 /// Лёгкий тип для промпта LLM — только role + content.
 /// Используется временно при вызове generate_chat(), не сохраняется в сессию.
 ///
-/// Дополнительные поля `tool_calls`/`tool_call_id` — `pub(crate)`: доступны
-/// сериализатору в llm.rs, но скрыты от хоста, поэтому существующие литералы
-/// `LlmMessage { role, content }` в хосте НЕ ломаются. Для нативного
-/// tool-calling хост используют билдеры `with_tool_calls`/`with_tool_call_id`.
+/// Поля — `pub`: литералы хоста с `..Default::default()` требуют видимости
+/// ВСЕХ полей (E0451 на приватном поле ломает 99 хост-литералов — кейс
+/// `pinned: pub(crate)` 21.11.2026, откачен в пользу `pub`). Билдеры
+/// `with_tool_calls`/`with_tool_call_id`/`with_pinned` — удобный доступ.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct LlmMessage {
     pub role: String,
     pub content: String,
     pub tool_calls: Option<Vec<serde_json::Value>>,
     pub tool_call_id: Option<String>,
+    /// Закреплённое сообщение (фрейм агента / persona_preamble): компакция
+    /// хоста не имеет права удалять или усекать его (спец 21.11.2026,
+    /// 07-ответ.md, инварианты компакции). Флаг живёт только на хосте: в
+    /// HTTP-тело не попадает (`serde(skip)`), при десериализации всегда
+    /// `false`.
+    #[serde(skip)]
+    pub pinned: bool,
 }
 
 impl LlmMessage {
+    /// Закреплено ли сообщение (компакция хоста не трогает).
+    pub fn is_pinned(&self) -> bool {
+        self.pinned
+    }
+
+    /// Пометить сообщение закреплённым (builder — как `with_tool_calls`).
+    pub fn with_pinned(mut self, pinned: bool) -> Self {
+        self.pinned = pinned;
+        self
+    }
+
     /// Нативный вызов инструмента в assistant-сообщении (OpenAI tools[]):
     /// `tool_calls: [{id, type: "function", function: {name, arguments}}]`.
     /// Заполняет поля для существующего сообщения (role/content уже заданы).

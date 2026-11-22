@@ -73,6 +73,7 @@ mod engine_liveness {
             content: "привет".into(),
             tool_calls: None,
             tool_call_id: None,
+            pinned: false,
         }];
         let params = ModelParams::default();
         let cancel = Arc::new(AtomicBool::new(false));

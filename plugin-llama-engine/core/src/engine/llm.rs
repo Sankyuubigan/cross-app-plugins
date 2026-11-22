@@ -181,14 +181,17 @@ pub fn estimate_vram_mb_with_spec(model_path: &str, ctx_size: u32, spec: &crate:
 }
 
 pub struct LlamaEngine {
-    pub global_ctx_limit: u32,
     /// Hardware-потолок слота (PRP C1): см. `compute_hardware_ctx_ceiling` в
     /// vram_estimate.rs. Хост привязывает бюджет компакции и step-up кэша
     /// движка к нему, а не к активному слоту.
     pub hardware_ctx_limit: u32,
-    /// Живой слот (текущий `--ctx-size` движка). Стартует равным
-    /// `global_ctx_limit`, растёт при mid-turn step-up (PRP C6) — respawn
-    /// строит `--ctx-size` из него. Cell: меняется на &self, как current_ngl.
+    /// Живой слот (текущий `--ctx-size` движка) — ЕДИНСТВЕННЫЙ источник правды
+    /// о текущем контексте (спец 21.11.2026, 07-ответ.md: старое plain-поле
+    /// `global_ctx_limit` расходилось со слотом после mid-turn step-up —
+    /// respawn обновлял только Cell, хост читал устаревшее значение).
+    /// Стартует равным стартовому контексту спавна, растёт при mid-turn
+    /// step-up (PRP C6) — respawn строит `--ctx-size` из него. Cell: меняется
+    /// на &self, как current_ngl.
     slot: std::cell::Cell<u32>,
     pub model_path: String,
     pub mmproj_path: Option<String>,
@@ -1279,7 +1282,6 @@ impl LlamaEngine {
         let child = engine_child.expect("engine child after successful launch");
 
         let engine = Self {
-            global_ctx_limit: attempt_ctx,
             hardware_ctx_limit,
             slot: std::cell::Cell::new(attempt_ctx),
             model_path: model_path.clone(),
@@ -1723,6 +1725,15 @@ impl LlamaEngine {
     /// chat_template) — клиент передаёт только `messages[]`. Вложения
     /// (`attachments`) превращаются в image-части последнего user-сообщения.
     /// `ctx_label` — контекст вызова для лога пиков памяти ("legacy:агент#N" / "graph:узел").
+    /// Живой слот (текущий `--ctx-size`) — SSOT вместо старого plain-поля
+    /// `global_ctx_limit`, которое расходилось со слотом после mid-turn
+    /// step-up (спец 21.11.2026, 07-ответ.md): respawn_with менял только
+    /// Cell, поле оставалось устаревшим, хост резал историю по мёртвому
+    /// слоту (лоботомия хода 09:53 21.11.2026).
+    pub fn slot(&self) -> u32 {
+        self.slot.get()
+    }
+
     pub fn run_chat_completions<F, L>(
         &self,
         messages: &[LlmMessage],
@@ -1933,7 +1944,7 @@ impl LlamaEngine {
                 "ctx": ctx_label,
                 "model": extract_model_filename(&self.model_path),
                 "mode": self.engine_mode.borrow().clone(),
-                "ctx_limit": self.global_ctx_limit,
+                "ctx_limit": self.slot.get(),
                 "max_tokens": max_tokens,
             })),
         );
@@ -2376,7 +2387,7 @@ impl LlamaEngine {
             .as_ref()
             .map(|c| c.kv_spec)
             .unwrap_or_else(|| crate::engine::vram_estimate::current_kv_spec(false, false));
-        let total_mb = estimate_vram_mb_with_spec(&self.model_path, self.global_ctx_limit, &peak_kv_spec);
+        let total_mb = estimate_vram_mb_with_spec(&self.model_path, self.slot.get(), &peak_kv_spec);
         let extra = format!(
             "{} токенов (+{} думателя) за {:.1}с ({:.0} tok/s), причина: {}",
             generated_tokens, reasoning_tokens, gen_elapsed, speed, stop_reason
@@ -2550,7 +2561,7 @@ impl LlamaEngine {
         let free_mb = mem.free as f64 / (1024.0 * 1024.0);
         Some(crate::engine::vram_estimate::max_fitting_ngl_safe_with_spec(
             &self.model_path,
-            self.global_ctx_limit,
+            self.slot.get(),
             &ctx.kv_spec,
             free_mb,
             crate::engine::vram_estimate::vram_reserve_mb(), // WDDM-запас (B2)
@@ -2791,6 +2802,47 @@ impl LlamaEngine {
         // (детерминированный крэш gbnf-стека; JSON-only тоже падал). Один за вызов.
         let mut effective_grammar = grammar.clone();
         let mut grammar_fallback_used = false;
+        // ── Proactive step-up (спец 21.11.2026, 07-ответ.md) ──
+        // Оценка промпта ДО отправки запроса: стартовый слот — ленивая
+        // аллокация VRAM, умеющая расти step-up'ом. Если оценка промпта +
+        // бюджет генерации не влезает в слот, но влезает в железный потолок —
+        // поднимаем слот ДО HTTP-запроса (без лишнего 400-цикла: каждый
+        // лишний цикл = лишний респавн движка). Коэффициент 10/27 симв/ток —
+        // верхняя оценка кириллицы (фактически ~3.0 симв/ток по замерам
+        // 21.11.2026): недооценка невозможна, цена ложного срабатывания —
+        // один респавн вместо 400-цикла. Реактивный step-up (HTTP 400)
+        // остаётся второй линией.
+        let est_prompt_tokens =
+            (messages.iter().map(|m| m.content.chars().count()).sum::<usize>() * 10 / 27) as u32;
+        if let Some(target) = proactive_step_up_target(
+            est_prompt_tokens,
+            max_tokens as u32,
+            self.slot.get(),
+            self.hardware_ctx_limit,
+        ) {
+            (self.log_cb.borrow())(format!(
+                "🔄 Оценка промпта ~{} ток + резерв {} > слота {} — поднимаю слот движка до {} ДО запроса (proactive step-up, потолок железа {})...",
+                est_prompt_tokens,
+                max_tokens,
+                self.slot.get(),
+                target,
+                self.hardware_ctx_limit
+            ));
+            log::warn!(
+                "proactive step-up: est={} + max_tokens={} > slot {} → {} (ceiling={})",
+                est_prompt_tokens,
+                max_tokens,
+                self.slot.get(),
+                target,
+                self.hardware_ctx_limit
+            );
+            if let Err(resp_err) = self.respawn_with(self.current_ngl.get(), target) {
+                return Err(format!(
+                    "Не удалось поднять слот движка до запроса (proactive step-up): {}",
+                    resp_err
+                ));
+            }
+        }
         loop {
             let result = self.run_chat_completions(
                 messages,
@@ -3364,10 +3416,49 @@ fn is_ctx_overflow_text(text: &str) -> bool {
 /// верифицировано логом 21.11.2026). Целевой тир step-up считается от
 /// ФАКТИЧЕСКОЙ потребности, а не слепым «тиром выше» (Баг A, 21.11.2026).
 /// Без regex-зависимости ради одного числа.
+/// Решение proactive step-up ДО запроса (чистая функция — тестируется без
+/// движка). `Some(новый тир)` — слот поднимается до отправки HTTP-запроса;
+/// `None` — оценка влезает в слот или потолок железа уже достигнут (дальше
+/// только компакция хоста / реактивный step-up / честный отказ).
+fn proactive_step_up_target(
+    est_prompt_tokens: u32,
+    max_tokens: u32,
+    slot: u32,
+    ceiling: u32,
+) -> Option<u32> {
+    if slot >= ceiling {
+        return None;
+    }
+    let need = est_prompt_tokens.saturating_add(max_tokens);
+    let target = crate::engine::vram_estimate::next_tier(need, ceiling);
+    if target > slot {
+        Some(target)
+    } else {
+        None
+    }
+}
+
 fn parse_overflow_prompt_tokens(text: &str) -> Option<u32> {
+    // 1) Строгое JSON-тело HTTP 400: {"error":{"message":…,"n_prompt_tokens":20725,…}}
+    //    (спец 21.11.2026, 07-ответ.md: старый скан не понимал форму `":"`,
+    //    тир step-up считался слепым «тир+1» и снова падал).
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(text) {
+        if let Some(n) = v
+            .get("error")
+            .and_then(|e| e.get("n_prompt_tokens"))
+            .and_then(|n| n.as_u64())
+        {
+            return u32::try_from(n).ok();
+        }
+    }
+    // 2) Фолбэк — скан в произвольном тексте ошибки: `n_prompt_tokens=20725`
+    //    (старые сборки) и `"n_prompt_tokens":20725` (JSON внутри message,
+    //    кавычки экранированы).
     let idx = text.find("n_prompt_tokens")?;
     let rest = &text[idx + "n_prompt_tokens".len()..];
-    let rest = rest.trim_start_matches(|c: char| c.is_whitespace() || c == '=');
+    let rest = rest.trim_start_matches(|c: char| {
+        c.is_whitespace() || c == '=' || c == ':' || c == '"' || c == '\\'
+    });
     let end = rest
         .find(|c: char| !c.is_ascii_digit())
         .unwrap_or(rest.len());
@@ -3998,6 +4089,30 @@ mod tests {
         assert_eq!(parse_overflow_prompt_tokens(body), Some(20725));
         assert_eq!(parse_overflow_prompt_tokens("n_prompt_tokens="), None);
         assert_eq!(parse_overflow_prompt_tokens("никакого overflow тут нет"), None);
+        // Строгое JSON-тело с n_prompt_tokens в error (новые сборки
+        // llama-server): тир берётся из JSON, не слепой «тир+1»
+        // (спец 21.11.2026, 07-ответ.md).
+        let json_body = "{\"error\":{\"message\":\"the request token limit exceeded\",\"n_prompt_tokens\":20725,\"n_ctx\":16384}}";
+        assert_eq!(parse_overflow_prompt_tokens(json_body), Some(20725));
+        // JSON внутри message-строки (кавычки экранированы) — фолбэк-скан.
+        let nested = "{\"error\":{\"message\":\"… (\\\"n_prompt_tokens\\\":20725, n_ctx=16384)\"}}";
+        assert_eq!(parse_overflow_prompt_tokens(nested), Some(20725));
+    }
+
+    #[test]
+    fn proactive_step_up_target_only_when_needed_and_possible() {
+        // Оценка влезает — слот не трогаем (лишний респавн — 3-4 с).
+        assert_eq!(proactive_step_up_target(5000, 2048, 16384, 262144), None);
+        // Оценка не влезает, потолок позволяет — тир выше.
+        assert_eq!(
+            proactive_step_up_target(20000, 2048, 16384, 262144),
+            Some(32768)
+        );
+        // Слот уже у потолка — подниматься некуда.
+        assert_eq!(proactive_step_up_target(50000, 2048, 262144, 262144), None);
+        // Потребность выше потолка — next_tier клампит к потолку (65536);
+        // нехватку выше потолка ловит реактивный путь/честный отказ.
+        assert_eq!(proactive_step_up_target(50000, 2048, 16384, 262144), Some(65536));
     }
 
     #[test]
