@@ -1,7 +1,7 @@
 // Точка входа vanilla-канала плагина (esbuild -> api-iife.js, см. PLUGIN_STANDARD.md §5.4).
 // Не содержит голых импортов '@tauri-apps/*' — они заменены алиасами esbuild на shims/,
 // которые биндятся на window.__TAURI__ (вшит Tauri при withGlobalTauri: true).
-import { checkForUpdate, downloadAndInstallUpdate, getAppVersion, getReleaseHistory, getSupportUrl, installRelease, } from './index';
+import { checkForUpdate, downloadAndInstallUpdate, getAppVersion, getReleaseHistory, getSupportUrl, installRelease, updateStore, } from './index';
 const g = window;
 if ('__TAURI__' in window) {
     const tauri = g.__TAURI__;
@@ -15,6 +15,7 @@ if ('__TAURI__' in window) {
                 getReleaseHistory,
                 getSupportUrl,
                 installRelease,
+                updateStore,
             },
         });
     }

@@ -48,4 +48,5 @@ export declare function checkForUpdate(): Promise<Update | null>;
  * фаза установки NSIS-инсталлера плагином не отчитывается.
  */
 export declare function downloadAndInstallUpdate(update: Update, onEvent?: (progress: DownloadEvent) => void): Promise<void>;
+export { updateStore, type UpdateState, type UpdateStatus, type UpdateStoreHooks, } from './update-store';
 import './web-components';

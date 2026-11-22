@@ -8,6 +8,7 @@ import {
   getReleaseHistory,
   getSupportUrl,
   installRelease,
+  updateStore,
 } from './index'
 
 const g = window as unknown as { __TAURI__?: Record<string, unknown> }
@@ -24,6 +25,7 @@ if ('__TAURI__' in window) {
         getReleaseHistory,
         getSupportUrl,
         installRelease,
+        updateStore,
       },
     })
   }

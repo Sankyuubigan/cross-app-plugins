@@ -78,5 +78,14 @@ export async function downloadAndInstallUpdate(
   await update.downloadAndInstall(onEvent)
 }
 
+// Модульный стор обновлений — SSOT состояния обновления/отката для хостов:
+// unmount UI не убивает стейт, гварды гонок внутри (см. update-store.ts).
+export {
+  updateStore,
+  type UpdateState,
+  type UpdateStatus,
+  type UpdateStoreHooks,
+} from './update-store'
+
 // Регистрируем Web Component при импорте пакета.
 import './web-components'

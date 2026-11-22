@@ -1,49 +1,17 @@
-import {
-  getAppVersion,
-  getReleaseHistory,
-  installRelease,
-  checkForUpdate,
-  downloadAndInstallUpdate,
-  getSupportUrl,
-  type ReleaseInfo,
-} from './index'
-import type { Update, DownloadEvent } from '@tauri-apps/plugin-updater'
+import { getAppVersion, getReleaseHistory, getSupportUrl, type ReleaseInfo } from './index'
+import { updateStore, errorText, logStageError } from './update-store'
 import { open } from '@tauri-apps/plugin-shell'
-import { logFront, logFrontendEvent } from '@my-tauri-plugins/plugin-logs'
-
-/**
- * Текст ошибки из reject-значения `invoke`.
- *
- * Tauri v2 реджектит промис СЫРОЙ строкой, когда команда вернула `Err(String)`.
- * Поэтому `(e as Error).message` у такой ошибки равен `undefined` — юзер видел
- * «Ошибка отката: undefined» вместо реальной причины. Приводим любую форму
- * (строка / Error / объект с message) к читаемому тексту.
- *
- * Дублировать лог здесь не нужно: каждая ветка `Err` на стороне Rust уже
- * пишется через `log::error!` (core rules §2.5 — дубли логов запрещены).
- */
-function errorText(e: unknown): string {
-  if (typeof e === 'string') return e
-  if (e instanceof Error) return e.message || String(e)
-  if (e && typeof e === 'object' && 'message' in e) return String((e as { message: unknown }).message)
-  return String(e)
-}
-
-/** Лог стадии обновления в файл лога хоста (plugin-logs). Префикс SSOT с Rust-стороной плагина. */
-function logStage(msg: string) {
-  logFront(`[about-updates] ${msg}`)
-}
-
-/** Ошибка стадии обновления — уровень ERROR в файл лога хоста. */
-function logStageError(msg: string) {
-  void logFrontendEvent('ERROR', `[about-updates] ${msg}`)
-}
 
 /**
  * <about-updates-panel repo="owner/repo"></about-updates-panel>
  *
  * Фреймворк-агностичная плашка «О приложении»: версия, проверка обновлений,
  * история релизов и откат. Работает в vanilla TS, React, Vue, Svelte и т.п.
+ *
+ * ВЕСЬ стейт обновления/отката живёт в модульном updateStore (update-store.ts):
+ * панель только рендерит его по подписке и зовёт действия. Удаление элемента
+ * из DOM (unmount вкладки хоста) и возврат обратно НЕ теряют прогресс скачивания
+ * и не позволяют запустить вторую параллельную установку — гварды в сторе.
  *
  * Атрибут `repo` опционален. Сам репозиторий для логики задаётся в
  * tauri.conf.json хоста (plugins.about-updates.repo).
@@ -55,16 +23,25 @@ class AboutUpdatesPanel extends HTMLElement {
 
   private repo = ''
   private root!: ShadowRoot
-  private busy = false
-  /** Обновление, найденное проверкой, но ещё не подтверждённое кликом «Обновить». */
-  private pendingUpdate: Update | null = null
+  private unsub: (() => void) | null = null
   private historyLoaded = false
   private historyOpen = false
+  private rollbackSelect: HTMLSelectElement | null = null
+  private rollbackBtn: HTMLButtonElement | null = null
 
   connectedCallback() {
     this.repo = this.getAttribute('repo') ?? ''
     this.root = this.attachShadow({ mode: 'open' })
-    this.render()
+    void this.render()
+    this.unsub = updateStore.subscribe(() => this.syncState())
+    this.syncState()
+  }
+
+  disconnectedCallback() {
+    // Стейт остаётся в updateStore — при возврате элемента в DOM
+    // connectedCallback переподпишется и syncState восстановит картинку.
+    this.unsub?.()
+    this.unsub = null
   }
 
   attributeChangedCallback() {
@@ -122,90 +99,79 @@ class AboutUpdatesPanel extends HTMLElement {
     this.root.getElementById('check')!.addEventListener('click', () => this.onCheck())
     this.root.getElementById('install')!.addEventListener('click', () => this.onInstall())
     this.root.getElementById('rollback')!.addEventListener('click', () => this.onRollback())
+    this.syncState()
   }
 
-  private setInstallVisible(visible: boolean) {
-    const el = this.root.getElementById('install')
-    if (el) el.hidden = !visible
-  }
+  /** Перерисовать DOM из стейта стора (единственный источник правды). */
+  private syncState() {
+    if (!this.root) return
+    const st = updateStore.getState()
 
-  /**
-   * Проверка ТОЛЬКО ищет обновление. Установка стартует исключительно из
-   * onInstall() по явному клику «Обновить» — правило хостов: auto-install запрещён.
-   */
-  private async onCheck() {
-    if (this.busy) return
-    this.busy = true
-    this.setStatus('Проверка…')
-    logStage('проверка обновлений начата')
-    try {
-      const update = await checkForUpdate()
-      if (update) {
-        this.pendingUpdate = update
-        this.setInstallVisible(true)
-        this.setStatus(`Доступно обновление ${update.version}.`)
-        logStage(`найдено обновление ${update.version}`)
-      } else {
-        this.pendingUpdate = null
-        this.setInstallVisible(false)
-        this.setStatus('У вас последняя версия.')
-        logStage('обновлений нет')
-      }
-    } catch (e) {
-      this.setStatus('Ошибка: ' + errorText(e))
-      logStageError(`ошибка проверки: ${errorText(e)}`)
-    } finally {
-      this.busy = false
+    const checkBtn = this.root.getElementById('check') as HTMLButtonElement | null
+    if (checkBtn) {
+      checkBtn.disabled =
+        st.status === 'checking' || st.status === 'downloading' || st.rollbackBusy
     }
-  }
+    const installBtn = this.root.getElementById('install')
+    if (installBtn) installBtn.hidden = st.status !== 'available'
 
-  private async onInstall() {
-    if (this.busy || !this.pendingUpdate) return
-    this.busy = true
     const bar = this.root.getElementById('install-progress') as HTMLProgressElement | null
-    logStage(`установка обновления ${this.pendingUpdate.version} начата`)
-    try {
-      // Прогресс есть только у скачивания (Started/Progress/Finished из plugin-updater);
-      // фаза установки NSIS-инсталлера плагином не отчитывается — там статус «Установка…».
-      let contentLength: number | null = null
-      let downloaded = 0
-      this.setStatus('Скачивание…')
-      if (bar) {
-        bar.hidden = false
-        bar.value = 0
-      }
-      await downloadAndInstallUpdate(this.pendingUpdate, (e: DownloadEvent) => {
-        if (e.event === 'Started') {
-          contentLength = e.data.contentLength ?? null
-          if (bar && contentLength) bar.max = contentLength
-          logStage(contentLength
-            ? `скачивание начато (${(contentLength / (1024 * 1024)).toFixed(1)} МБ)`
-            : 'скачивание начато')
-        } else if (e.event === 'Progress') {
-          downloaded += e.data.chunkLength
-          if (!bar) return
-          if (contentLength) {
-            bar.value = downloaded
-            this.setStatus(`Скачивание… ${Math.min(100, Math.round((downloaded / contentLength) * 100))}%`)
-          } else {
-            // Сервер не отдал размер — честные килобайты вместо выдуманного процента.
-            this.setStatus(`Скачивание… ${Math.round(downloaded / 1024)} КБ`)
-          }
-        } else if (e.event === 'Finished') {
-          if (bar) bar.value = bar.max
-          this.setStatus('Установка…')
-          logStage('скачивание завершено, запуск установки (NSIS)')
+    if (bar) {
+      bar.hidden = st.status !== 'downloading'
+      if (!bar.hidden) {
+        if (st.totalBytes) {
+          bar.max = st.totalBytes
+          bar.value = st.downloadedBytes
+        } else {
+          // Сервер не отдал размер — честная неопределённость вместо выдуманного процента.
+          bar.max = 100
+          bar.removeAttribute('value')
         }
-      })
-      this.setStatus('Обновление установлено, перезапуск…')
-      logStage('установка завершена, перезапуск…')
-    } catch (e) {
-      this.setStatus('Ошибка: ' + errorText(e))
-      logStageError(`ошибка установки: ${errorText(e)}`)
-    } finally {
-      if (bar) bar.hidden = true
-      this.busy = false
+      }
     }
+
+    if (this.rollbackBtn) {
+      const hasUrl = Boolean(this.rollbackSelect?.selectedOptions[0]?.dataset.url)
+      this.rollbackBtn.disabled = st.rollbackBusy || !hasUrl
+    }
+
+    if (st.rollbackBusy) {
+      this.setStatus(st.rollbackMsg || 'Откат…')
+    } else {
+      switch (st.status) {
+        case 'idle':
+          this.setStatus('')
+          break
+        case 'checking':
+          this.setStatus('Проверка…')
+          break
+        case 'up-to-date':
+          this.setStatus('У вас последняя версия.')
+          break
+        case 'available':
+          this.setStatus(`Доступно обновление ${st.update?.version ?? ''}.`)
+          break
+        case 'downloading':
+          this.setStatus(st.totalBytes
+            ? `Скачивание… ${st.progress}%`
+            : `Скачивание… ${Math.round(st.downloadedBytes / 1024)} КБ`)
+          break
+        case 'installed':
+          this.setStatus('Обновление установлено, перезапуск…')
+          break
+        case 'error':
+          this.setStatus('Ошибка: ' + st.errorMsg)
+          break
+      }
+    }
+  }
+
+  private onCheck() {
+    void updateStore.checkForUpdates()
+  }
+
+  private onInstall() {
+    void updateStore.startUpdate()
   }
 
   private async onRollback() {
@@ -215,7 +181,6 @@ class AboutUpdatesPanel extends HTMLElement {
     if (!this.historyOpen || this.historyLoaded) return
 
     this.historyLoaded = true
-    this.busy = true
     this.setStatus('Загрузка истории релизов…')
     try {
       const history: ReleaseInfo[] = await getReleaseHistory()
@@ -230,6 +195,7 @@ class AboutUpdatesPanel extends HTMLElement {
       row.className = 'row'
 
       const select = document.createElement('select')
+      this.rollbackSelect = select
       const placeholder = document.createElement('option')
       placeholder.value = ''
       placeholder.textContent = '— выберите версию —'
@@ -250,24 +216,15 @@ class AboutUpdatesPanel extends HTMLElement {
       rollbackBtn.className = 'primary'
       rollbackBtn.textContent = 'Откатить'
       rollbackBtn.disabled = true
-      rollbackBtn.addEventListener('click', async () => {
-        const selected = select.selectedOptions[0]
+      this.rollbackBtn = rollbackBtn
+      rollbackBtn.addEventListener('click', () => {
+        const selected = this.rollbackSelect?.selectedOptions[0]
         const url = selected?.dataset.url
         const version = selected?.value
-        if (!url || !version || this.busy) return
-        this.busy = true
-        this.setStatus(`Откат на ${version}…`)
-        try {
-          await installRelease(url, version)
-        } catch (e) {
-          this.setStatus('Ошибка отката: ' + errorText(e))
-        } finally {
-          this.busy = false
-        }
+        if (!url || !version) return
+        void updateStore.startRollback({ version, downloadUrl: url, isCurrent: false })
       })
-      select.addEventListener('change', () => {
-        rollbackBtn.disabled = select.selectedOptions[0]?.dataset.url ? false : true
-      })
+      select.addEventListener('change', () => this.syncState())
       row.appendChild(rollbackBtn)
       box.appendChild(row)
 
@@ -279,11 +236,10 @@ class AboutUpdatesPanel extends HTMLElement {
         box.appendChild(none)
       }
 
-      this.setStatus('')
+      this.syncState()
     } catch (e) {
+      logStageError(`ошибка загрузки истории: ${errorText(e)}`)
       this.setStatus('Ошибка: ' + errorText(e))
-    } finally {
-      this.busy = false
     }
   }
 }

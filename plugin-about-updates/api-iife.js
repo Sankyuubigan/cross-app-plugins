@@ -24,27 +24,17 @@
     return updater.check(options);
   }
 
-  // guest-js/shims/shell.ts
-  var g3 = window;
-  async function open(path, openWith) {
-    const shell = g3.__TAURI__?.shell;
-    if (!shell?.open) {
-      throw new Error("window.__TAURI__.shell.open \u043D\u0435\u0434\u043E\u0441\u0442\u0443\u043F\u0435\u043D");
-    }
-    return shell.open(path, openWith);
-  }
-
   // ../plugin-log-collector/node_modules/@tauri-apps/api/external/tslib/tslib.es6.js
-  function __classPrivateFieldGet(receiver, state, kind, f) {
+  function __classPrivateFieldGet(receiver, state2, kind, f) {
     if (kind === "a" && !f) throw new TypeError("Private accessor was defined without a getter");
-    if (typeof state === "function" ? receiver !== state || !f : !state.has(receiver)) throw new TypeError("Cannot read private member from an object whose class did not declare it");
-    return kind === "m" ? f : kind === "a" ? f.call(receiver) : f ? f.value : state.get(receiver);
+    if (typeof state2 === "function" ? receiver !== state2 || !f : !state2.has(receiver)) throw new TypeError("Cannot read private member from an object whose class did not declare it");
+    return kind === "m" ? f : kind === "a" ? f.call(receiver) : f ? f.value : state2.get(receiver);
   }
-  function __classPrivateFieldSet(receiver, state, value, kind, f) {
+  function __classPrivateFieldSet(receiver, state2, value, kind, f) {
     if (kind === "m") throw new TypeError("Private method is not writable");
     if (kind === "a" && !f) throw new TypeError("Private accessor was defined without a setter");
-    if (typeof state === "function" ? receiver !== state || !f : !state.has(receiver)) throw new TypeError("Cannot write private member to an object whose class did not declare it");
-    return kind === "a" ? f.call(receiver, value) : f ? f.value = value : state.set(receiver, value), value;
+    if (typeof state2 === "function" ? receiver !== state2 || !f : !state2.has(receiver)) throw new TypeError("Cannot write private member to an object whose class did not declare it");
+    return kind === "a" ? f.call(receiver, value) : f ? f.value = value : state2.set(receiver, value), value;
   }
 
   // ../plugin-log-collector/node_modules/@tauri-apps/api/core.js
@@ -387,7 +377,7 @@
     }
   }
 
-  // guest-js/web-components.ts
+  // guest-js/update-store.ts
   function errorText(e) {
     if (typeof e === "string") return e;
     if (e instanceof Error) return e.message || String(e);
@@ -400,15 +390,136 @@
   function logStageError(msg) {
     void logFrontendEvent("ERROR", `[about-updates] ${msg}`);
   }
+  var state = {
+    status: "idle",
+    update: null,
+    progress: 0,
+    downloadedBytes: 0,
+    totalBytes: null,
+    errorMsg: "",
+    rollbackBusy: false,
+    rollbackMsg: ""
+  };
+  var hooks = {};
+  var listeners = /* @__PURE__ */ new Set();
+  function set(patch) {
+    state = { ...state, ...patch };
+    for (const listener of listeners) listener();
+  }
+  var updateStore = {
+    subscribe(listener) {
+      listeners.add(listener);
+      return () => {
+        listeners.delete(listener);
+      };
+    },
+    getState() {
+      return state;
+    },
+    /** Хост-хуки: подключить до первого вызова startUpdate/startRollback. */
+    setHooks(partial) {
+      hooks = { ...hooks, ...partial };
+    },
+    /**
+     * Проверка ТОЛЬКО ищет обновление. Установка стартует исключительно из
+     * startUpdate() по явному действию юзера — правило хостов: auto-install запрещён.
+     */
+    async checkForUpdates() {
+      if (state.status === "checking" || state.status === "downloading") return;
+      set({ status: "checking", errorMsg: "" });
+      logStage("\u043F\u0440\u043E\u0432\u0435\u0440\u043A\u0430 \u043E\u0431\u043D\u043E\u0432\u043B\u0435\u043D\u0438\u0439 \u043D\u0430\u0447\u0430\u0442\u0430");
+      try {
+        const found = await checkForUpdate();
+        if (found) {
+          set({ update: found, status: "available" });
+          logStage(`\u043D\u0430\u0439\u0434\u0435\u043D\u043E \u043E\u0431\u043D\u043E\u0432\u043B\u0435\u043D\u0438\u0435 ${found.version}`);
+        } else {
+          set({ update: null, status: "up-to-date" });
+          logStage("\u043E\u0431\u043D\u043E\u0432\u043B\u0435\u043D\u0438\u0439 \u043D\u0435\u0442");
+        }
+      } catch (e) {
+        set({ status: "error", errorMsg: errorText(e) });
+        logStageError(`\u043E\u0448\u0438\u0431\u043A\u0430 \u043F\u0440\u043E\u0432\u0435\u0440\u043A\u0438: ${errorText(e)}`);
+      }
+    },
+    /** Скачивание и установка найденного обновления (по явному действию юзера). */
+    async startUpdate() {
+      if (state.status === "checking" || state.status === "downloading") return;
+      const update = state.update;
+      if (!update) return;
+      set({ status: "downloading", progress: 0, downloadedBytes: 0, totalBytes: null, errorMsg: "" });
+      logStage(`\u0443\u0441\u0442\u0430\u043D\u043E\u0432\u043A\u0430 \u043E\u0431\u043D\u043E\u0432\u043B\u0435\u043D\u0438\u044F ${update.version} \u043D\u0430\u0447\u0430\u0442\u0430`);
+      try {
+        if (hooks.onBeforeInstall) await hooks.onBeforeInstall();
+        let downloaded = 0;
+        let total = null;
+        await downloadAndInstallUpdate(update, (e) => {
+          if (e.event === "Started") {
+            total = e.data.contentLength ?? null;
+            set({ totalBytes: total });
+            logStage(total ? `\u0441\u043A\u0430\u0447\u0438\u0432\u0430\u043D\u0438\u0435 \u043D\u0430\u0447\u0430\u0442\u043E (${(total / (1024 * 1024)).toFixed(1)} \u041C\u0411)` : "\u0441\u043A\u0430\u0447\u0438\u0432\u0430\u043D\u0438\u0435 \u043D\u0430\u0447\u0430\u0442\u043E");
+          } else if (e.event === "Progress") {
+            downloaded += e.data.chunkLength;
+            set({
+              downloadedBytes: downloaded,
+              progress: total ? Math.min(100, Math.round(downloaded / total * 100)) : 0
+            });
+          } else if (e.event === "Finished") {
+            logStage("\u0441\u043A\u0430\u0447\u0438\u0432\u0430\u043D\u0438\u0435 \u0437\u0430\u0432\u0435\u0440\u0448\u0435\u043D\u043E, \u0437\u0430\u043F\u0443\u0441\u043A \u0443\u0441\u0442\u0430\u043D\u043E\u0432\u043A\u0438 (NSIS)");
+          }
+        });
+        set({ status: "installed" });
+        logStage("\u0443\u0441\u0442\u0430\u043D\u043E\u0432\u043A\u0430 \u0437\u0430\u0432\u0435\u0440\u0448\u0435\u043D\u0430, \u043F\u0435\u0440\u0435\u0437\u0430\u043F\u0443\u0441\u043A\u2026");
+        if (hooks.onInstalled) hooks.onInstalled();
+      } catch (e) {
+        set({ status: "error", errorMsg: errorText(e) });
+        logStageError(`\u043E\u0448\u0438\u0431\u043A\u0430 \u0443\u0441\u0442\u0430\u043D\u043E\u0432\u043A\u0438: ${errorText(e)}`);
+      }
+    },
+    /** Откат на конкретный релиз по URL установщика (по явному действию юзера). */
+    async startRollback(target) {
+      if (state.rollbackBusy) return;
+      set({
+        rollbackBusy: true,
+        rollbackMsg: `\u041E\u0442\u043A\u0430\u0442 \u043D\u0430 ${target.version}: \u0441\u043A\u0430\u0447\u0438\u0432\u0430\u043D\u0438\u0435 \u0443\u0441\u0442\u0430\u043D\u043E\u0432\u0449\u0438\u043A\u0430...`
+      });
+      logStage(`\u043E\u0442\u043A\u0430\u0442 \u043D\u0430 ${target.version}: \u0441\u043A\u0430\u0447\u0438\u0432\u0430\u043D\u0438\u0435 \u0443\u0441\u0442\u0430\u043D\u043E\u0432\u0449\u0438\u043A\u0430`);
+      try {
+        if (hooks.onBeforeInstall) await hooks.onBeforeInstall();
+        await installRelease(target.downloadUrl, target.version);
+        set({ rollbackMsg: `\u041E\u0442\u043A\u0430\u0442 \u043D\u0430 ${target.version} \u0437\u0430\u043F\u0443\u0449\u0435\u043D, \u043F\u0440\u0438\u043B\u043E\u0436\u0435\u043D\u0438\u0435 \u0431\u0443\u0434\u0435\u0442 \u043F\u0435\u0440\u0435\u0437\u0430\u043F\u0443\u0449\u0435\u043D\u043E.` });
+        logStage(`\u043E\u0442\u043A\u0430\u0442 \u043D\u0430 ${target.version} \u0437\u0430\u043F\u0443\u0449\u0435\u043D`);
+      } catch (e) {
+        set({ rollbackBusy: false, rollbackMsg: errorText(e) });
+        logStageError(`\u043E\u0448\u0438\u0431\u043A\u0430 \u043E\u0442\u043A\u0430\u0442\u0430: ${errorText(e)}`);
+      }
+    },
+    /** Сообщение об ошибке загрузки истории релизов (UI-флоу, не операция стора). */
+    setRollbackMsg(msg) {
+      set({ rollbackMsg: msg });
+    }
+  };
+
+  // guest-js/shims/shell.ts
+  var g3 = window;
+  async function open(path, openWith) {
+    const shell = g3.__TAURI__?.shell;
+    if (!shell?.open) {
+      throw new Error("window.__TAURI__.shell.open \u043D\u0435\u0434\u043E\u0441\u0442\u0443\u043F\u0435\u043D");
+    }
+    return shell.open(path, openWith);
+  }
+
+  // guest-js/web-components.ts
   var AboutUpdatesPanel = class extends HTMLElement {
     constructor() {
       super(...arguments);
       this.repo = "";
-      this.busy = false;
-      /** Обновление, найденное проверкой, но ещё не подтверждённое кликом «Обновить». */
-      this.pendingUpdate = null;
+      this.unsub = null;
       this.historyLoaded = false;
       this.historyOpen = false;
+      this.rollbackSelect = null;
+      this.rollbackBtn = null;
     }
     static get observedAttributes() {
       return ["repo"];
@@ -416,7 +527,13 @@
     connectedCallback() {
       this.repo = this.getAttribute("repo") ?? "";
       this.root = this.attachShadow({ mode: "open" });
-      this.render();
+      void this.render();
+      this.unsub = updateStore.subscribe(() => this.syncState());
+      this.syncState();
+    }
+    disconnectedCallback() {
+      this.unsub?.();
+      this.unsub = null;
     }
     attributeChangedCallback() {
       this.repo = this.getAttribute("repo") ?? "";
@@ -468,82 +585,68 @@
       this.root.getElementById("check").addEventListener("click", () => this.onCheck());
       this.root.getElementById("install").addEventListener("click", () => this.onInstall());
       this.root.getElementById("rollback").addEventListener("click", () => this.onRollback());
+      this.syncState();
     }
-    setInstallVisible(visible) {
-      const el = this.root.getElementById("install");
-      if (el) el.hidden = !visible;
-    }
-    /**
-     * Проверка ТОЛЬКО ищет обновление. Установка стартует исключительно из
-     * onInstall() по явному клику «Обновить» — правило хостов: auto-install запрещён.
-     */
-    async onCheck() {
-      if (this.busy) return;
-      this.busy = true;
-      this.setStatus("\u041F\u0440\u043E\u0432\u0435\u0440\u043A\u0430\u2026");
-      logStage("\u043F\u0440\u043E\u0432\u0435\u0440\u043A\u0430 \u043E\u0431\u043D\u043E\u0432\u043B\u0435\u043D\u0438\u0439 \u043D\u0430\u0447\u0430\u0442\u0430");
-      try {
-        const update = await checkForUpdate();
-        if (update) {
-          this.pendingUpdate = update;
-          this.setInstallVisible(true);
-          this.setStatus(`\u0414\u043E\u0441\u0442\u0443\u043F\u043D\u043E \u043E\u0431\u043D\u043E\u0432\u043B\u0435\u043D\u0438\u0435 ${update.version}.`);
-          logStage(`\u043D\u0430\u0439\u0434\u0435\u043D\u043E \u043E\u0431\u043D\u043E\u0432\u043B\u0435\u043D\u0438\u0435 ${update.version}`);
-        } else {
-          this.pendingUpdate = null;
-          this.setInstallVisible(false);
-          this.setStatus("\u0423 \u0432\u0430\u0441 \u043F\u043E\u0441\u043B\u0435\u0434\u043D\u044F\u044F \u0432\u0435\u0440\u0441\u0438\u044F.");
-          logStage("\u043E\u0431\u043D\u043E\u0432\u043B\u0435\u043D\u0438\u0439 \u043D\u0435\u0442");
-        }
-      } catch (e) {
-        this.setStatus("\u041E\u0448\u0438\u0431\u043A\u0430: " + errorText(e));
-        logStageError(`\u043E\u0448\u0438\u0431\u043A\u0430 \u043F\u0440\u043E\u0432\u0435\u0440\u043A\u0438: ${errorText(e)}`);
-      } finally {
-        this.busy = false;
+    /** Перерисовать DOM из стейта стора (единственный источник правды). */
+    syncState() {
+      if (!this.root) return;
+      const st = updateStore.getState();
+      const checkBtn = this.root.getElementById("check");
+      if (checkBtn) {
+        checkBtn.disabled = st.status === "checking" || st.status === "downloading" || st.rollbackBusy;
       }
-    }
-    async onInstall() {
-      if (this.busy || !this.pendingUpdate) return;
-      this.busy = true;
+      const installBtn = this.root.getElementById("install");
+      if (installBtn) installBtn.hidden = st.status !== "available";
       const bar = this.root.getElementById("install-progress");
-      logStage(`\u0443\u0441\u0442\u0430\u043D\u043E\u0432\u043A\u0430 \u043E\u0431\u043D\u043E\u0432\u043B\u0435\u043D\u0438\u044F ${this.pendingUpdate.version} \u043D\u0430\u0447\u0430\u0442\u0430`);
-      try {
-        let contentLength = null;
-        let downloaded = 0;
-        this.setStatus("\u0421\u043A\u0430\u0447\u0438\u0432\u0430\u043D\u0438\u0435\u2026");
-        if (bar) {
-          bar.hidden = false;
-          bar.value = 0;
-        }
-        await downloadAndInstallUpdate(this.pendingUpdate, (e) => {
-          if (e.event === "Started") {
-            contentLength = e.data.contentLength ?? null;
-            if (bar && contentLength) bar.max = contentLength;
-            logStage(contentLength ? `\u0441\u043A\u0430\u0447\u0438\u0432\u0430\u043D\u0438\u0435 \u043D\u0430\u0447\u0430\u0442\u043E (${(contentLength / (1024 * 1024)).toFixed(1)} \u041C\u0411)` : "\u0441\u043A\u0430\u0447\u0438\u0432\u0430\u043D\u0438\u0435 \u043D\u0430\u0447\u0430\u0442\u043E");
-          } else if (e.event === "Progress") {
-            downloaded += e.data.chunkLength;
-            if (!bar) return;
-            if (contentLength) {
-              bar.value = downloaded;
-              this.setStatus(`\u0421\u043A\u0430\u0447\u0438\u0432\u0430\u043D\u0438\u0435\u2026 ${Math.min(100, Math.round(downloaded / contentLength * 100))}%`);
-            } else {
-              this.setStatus(`\u0421\u043A\u0430\u0447\u0438\u0432\u0430\u043D\u0438\u0435\u2026 ${Math.round(downloaded / 1024)} \u041A\u0411`);
-            }
-          } else if (e.event === "Finished") {
-            if (bar) bar.value = bar.max;
-            this.setStatus("\u0423\u0441\u0442\u0430\u043D\u043E\u0432\u043A\u0430\u2026");
-            logStage("\u0441\u043A\u0430\u0447\u0438\u0432\u0430\u043D\u0438\u0435 \u0437\u0430\u0432\u0435\u0440\u0448\u0435\u043D\u043E, \u0437\u0430\u043F\u0443\u0441\u043A \u0443\u0441\u0442\u0430\u043D\u043E\u0432\u043A\u0438 (NSIS)");
+      if (bar) {
+        bar.hidden = st.status !== "downloading";
+        if (!bar.hidden) {
+          if (st.totalBytes) {
+            bar.max = st.totalBytes;
+            bar.value = st.downloadedBytes;
+          } else {
+            bar.max = 100;
+            bar.removeAttribute("value");
           }
-        });
-        this.setStatus("\u041E\u0431\u043D\u043E\u0432\u043B\u0435\u043D\u0438\u0435 \u0443\u0441\u0442\u0430\u043D\u043E\u0432\u043B\u0435\u043D\u043E, \u043F\u0435\u0440\u0435\u0437\u0430\u043F\u0443\u0441\u043A\u2026");
-        logStage("\u0443\u0441\u0442\u0430\u043D\u043E\u0432\u043A\u0430 \u0437\u0430\u0432\u0435\u0440\u0448\u0435\u043D\u0430, \u043F\u0435\u0440\u0435\u0437\u0430\u043F\u0443\u0441\u043A\u2026");
-      } catch (e) {
-        this.setStatus("\u041E\u0448\u0438\u0431\u043A\u0430: " + errorText(e));
-        logStageError(`\u043E\u0448\u0438\u0431\u043A\u0430 \u0443\u0441\u0442\u0430\u043D\u043E\u0432\u043A\u0438: ${errorText(e)}`);
-      } finally {
-        if (bar) bar.hidden = true;
-        this.busy = false;
+        }
       }
+      if (this.rollbackBtn) {
+        const hasUrl = Boolean(this.rollbackSelect?.selectedOptions[0]?.dataset.url);
+        this.rollbackBtn.disabled = st.rollbackBusy || !hasUrl;
+      }
+      if (st.rollbackBusy) {
+        this.setStatus(st.rollbackMsg || "\u041E\u0442\u043A\u0430\u0442\u2026");
+      } else {
+        switch (st.status) {
+          case "idle":
+            this.setStatus("");
+            break;
+          case "checking":
+            this.setStatus("\u041F\u0440\u043E\u0432\u0435\u0440\u043A\u0430\u2026");
+            break;
+          case "up-to-date":
+            this.setStatus("\u0423 \u0432\u0430\u0441 \u043F\u043E\u0441\u043B\u0435\u0434\u043D\u044F\u044F \u0432\u0435\u0440\u0441\u0438\u044F.");
+            break;
+          case "available":
+            this.setStatus(`\u0414\u043E\u0441\u0442\u0443\u043F\u043D\u043E \u043E\u0431\u043D\u043E\u0432\u043B\u0435\u043D\u0438\u0435 ${st.update?.version ?? ""}.`);
+            break;
+          case "downloading":
+            this.setStatus(st.totalBytes ? `\u0421\u043A\u0430\u0447\u0438\u0432\u0430\u043D\u0438\u0435\u2026 ${st.progress}%` : `\u0421\u043A\u0430\u0447\u0438\u0432\u0430\u043D\u0438\u0435\u2026 ${Math.round(st.downloadedBytes / 1024)} \u041A\u0411`);
+            break;
+          case "installed":
+            this.setStatus("\u041E\u0431\u043D\u043E\u0432\u043B\u0435\u043D\u0438\u0435 \u0443\u0441\u0442\u0430\u043D\u043E\u0432\u043B\u0435\u043D\u043E, \u043F\u0435\u0440\u0435\u0437\u0430\u043F\u0443\u0441\u043A\u2026");
+            break;
+          case "error":
+            this.setStatus("\u041E\u0448\u0438\u0431\u043A\u0430: " + st.errorMsg);
+            break;
+        }
+      }
+    }
+    onCheck() {
+      void updateStore.checkForUpdates();
+    }
+    onInstall() {
+      void updateStore.startUpdate();
     }
     async onRollback() {
       const box = this.root.getElementById("history");
@@ -551,7 +654,6 @@
       box.hidden = !this.historyOpen;
       if (!this.historyOpen || this.historyLoaded) return;
       this.historyLoaded = true;
-      this.busy = true;
       this.setStatus("\u0417\u0430\u0433\u0440\u0443\u0437\u043A\u0430 \u0438\u0441\u0442\u043E\u0440\u0438\u0438 \u0440\u0435\u043B\u0438\u0437\u043E\u0432\u2026");
       try {
         const history = await getReleaseHistory();
@@ -563,6 +665,7 @@
         const row = document.createElement("div");
         row.className = "row";
         const select = document.createElement("select");
+        this.rollbackSelect = select;
         const placeholder = document.createElement("option");
         placeholder.value = "";
         placeholder.textContent = "\u2014 \u0432\u044B\u0431\u0435\u0440\u0438\u0442\u0435 \u0432\u0435\u0440\u0441\u0438\u044E \u2014";
@@ -582,24 +685,15 @@
         rollbackBtn.className = "primary";
         rollbackBtn.textContent = "\u041E\u0442\u043A\u0430\u0442\u0438\u0442\u044C";
         rollbackBtn.disabled = true;
-        rollbackBtn.addEventListener("click", async () => {
-          const selected = select.selectedOptions[0];
+        this.rollbackBtn = rollbackBtn;
+        rollbackBtn.addEventListener("click", () => {
+          const selected = this.rollbackSelect?.selectedOptions[0];
           const url = selected?.dataset.url;
           const version = selected?.value;
-          if (!url || !version || this.busy) return;
-          this.busy = true;
-          this.setStatus(`\u041E\u0442\u043A\u0430\u0442 \u043D\u0430 ${version}\u2026`);
-          try {
-            await installRelease(url, version);
-          } catch (e) {
-            this.setStatus("\u041E\u0448\u0438\u0431\u043A\u0430 \u043E\u0442\u043A\u0430\u0442\u0430: " + errorText(e));
-          } finally {
-            this.busy = false;
-          }
+          if (!url || !version) return;
+          void updateStore.startRollback({ version, downloadUrl: url, isCurrent: false });
         });
-        select.addEventListener("change", () => {
-          rollbackBtn.disabled = select.selectedOptions[0]?.dataset.url ? false : true;
-        });
+        select.addEventListener("change", () => this.syncState());
         row.appendChild(rollbackBtn);
         box.appendChild(row);
         if (select.options.length <= 1) {
@@ -609,11 +703,10 @@
           none.textContent = "\u0420\u0435\u0435\u0441\u0442\u0440 \u0431\u043E\u043B\u0435\u0435 \u0441\u0442\u0430\u0440\u044B\u0445 \u0432\u0435\u0440\u0441\u0438\u0439 \u043F\u0443\u0441\u0442.";
           box.appendChild(none);
         }
-        this.setStatus("");
+        this.syncState();
       } catch (e) {
+        logStageError(`\u043E\u0448\u0438\u0431\u043A\u0430 \u0437\u0430\u0433\u0440\u0443\u0437\u043A\u0438 \u0438\u0441\u0442\u043E\u0440\u0438\u0438: ${errorText(e)}`);
         this.setStatus("\u041E\u0448\u0438\u0431\u043A\u0430: " + errorText(e));
-      } finally {
-        this.busy = false;
       }
     }
   };
@@ -654,7 +747,8 @@
           getAppVersion,
           getReleaseHistory,
           getSupportUrl,
-          installRelease
+          installRelease,
+          updateStore
         }
       });
     }
