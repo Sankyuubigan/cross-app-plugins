@@ -95,7 +95,7 @@ fn install_windows(window: &crate::Window) {
     // окна на главном потоке — там же обрабатываются все сообщения окна.
     let ok = unsafe { SetWindowSubclass(hwnd, Some(probe_proc), SUBCLASS_ID, 0) };
     if ok.as_bool() {
-        log::info!("drag-probe: замер установлен v2 (VIBEBRIDGE_DRAG_PROBE=1)");
+        log::info!("drag-probe: замер установлен v3 (VIBEBRIDGE_DRAG_PROBE=1)");
     } else {
         log::error!(
             "drag-probe: SetWindowSubclass не удался: {}",
