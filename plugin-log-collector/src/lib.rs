@@ -96,8 +96,30 @@ pub fn init() -> TauriPlugin<Wry, Config> {
             Ok(())
         })
         .on_event(|_app, event| {
-            if let tauri::RunEvent::ExitRequested { .. } = event {
-                error_reporting::flush_on_exit();
+            match event {
+                tauri::RunEvent::ExitRequested { .. } => error_reporting::flush_on_exit(),
+                tauri::RunEvent::Exit => {
+                    logger::write_regular("INFO", "=== стоп процесса (штатный выход) ===");
+                }
+                // Различение сценариев смерти: CloseRequested+Destroyed = штатно;
+                // Destroyed без CloseRequested = смерть webview; ни того ни другого
+                // перед концом процесса = внешний kill/fail-fast (смотреть WER-дамп).
+                tauri::RunEvent::WindowEvent { label, event, .. } => match event {
+                    tauri::WindowEvent::CloseRequested { .. } => {
+                        logger::write_regular(
+                            "INFO",
+                            &format!("пользователь закрывает окно (label: {label})"),
+                        );
+                    }
+                    tauri::WindowEvent::Destroyed => {
+                        logger::write_regular(
+                            "WARN",
+                            &format!("окно уничтожено (label: {label}) — если CloseRequested не было, похоже на смерть webview"),
+                        );
+                    }
+                    _ => {}
+                },
+                _ => {}
             }
         })
         .invoke_handler(tauri::generate_handler![

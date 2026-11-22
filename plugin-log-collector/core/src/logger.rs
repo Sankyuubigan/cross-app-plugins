@@ -419,7 +419,8 @@ pub fn install_panic_hook() {
                 .location()
                 .map(|l| format!("{}:{}", l.file(), l.line()))
                 .unwrap_or_default();
-            write_files("PANIC", &format!("{} | {}", msg, loc));
+            let bt = std::backtrace::Backtrace::force_capture();
+            write_files("PANIC", &format!("{} | {} | backtrace:\n{}", msg, loc, bt));
             crate::flight::dump_panic(&format!("{} | {}", msg, loc));
             crate::error_reporting::report_fatal("Backend Panic", &msg, &loc);
             default_hook(info);
