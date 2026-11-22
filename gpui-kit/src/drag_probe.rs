@@ -20,6 +20,15 @@
 //!   от полноценных кадров;
 //! - интервалы между PAINT (avg/min/max) — vsync-ритм vs спам;
 //! - распределение времени обработки (<1мс / 1-5мс / >5мс).
+//!
+//! v3 (22.11.26): полный сброс состояния на старте драга (SC_MOVE). Причина:
+//! счётчики копились от предыдущего отчёта, и первый после простоя драг
+//! смешивал холостые PAINT простоя с драговыми. Отсюда фиктивные «занятость
+//! 798%» и «711k PAINT/с» 17:53: 1.97M PAINT = 2ч45м простоя (старт 15:08) по
+//! ~200 PAINT/с (avg интервал 5.00мс = vsync-ритм), делённые на 2.8с драга.
+//! «Штормы» 19.11 — тот же артефакт (457619 PAINT «за 11.7с» = 38мин простоя).
+//! Реального шторма не было; фикс F3 проверен цифрами — PAINT/TIMER при
+//! move-драге погашены 100%.
 
 #[cfg(windows)]
 use std::cell::RefCell;
@@ -314,9 +323,14 @@ unsafe extern "system" fn probe_proc(
 ) -> LRESULT {
     if msg == WM_SYSCOMMAND && (wparam.0 & 0xFFF0) == SC_MOVE {
         STATE.with(|cell| {
-            let mut state = cell.borrow_mut();
-            state.drag_started = Some(Instant::now());
-            state.resize_seen = false;
+            // v3: полный сброс на старте драга (см. док v3 в шапке). Без него
+            // холостые PAINT простоя копились в счётчиках, и первый после
+            // простоя драг показывал фиктивный «шторм» (798%/711k PAINT/с).
+            *cell.borrow_mut() = ProbeState {
+                drag_started: Some(Instant::now()),
+                resize_seen: false,
+                ..Default::default()
+            };
         });
     } else if msg == WM_SIZING {
         STATE.with(|cell| cell.borrow_mut().resize_seen = true);
