@@ -14,6 +14,7 @@ CLI-набор инструментов для ИИ-агентов кодеро�
 | [`consult`](#consult--эскалация-к-умной-модели) | отчёт рабочего агента → умная модель через шлюз 9Router, с жёстким лимитом вызовов |
 | [`websearch`](#websearch--мульти-движковый-поиск) | интернет-поиск через 11 keyless-движков: цепочка фолбэков, multi-query, кеш и статистика отказов |
 | [`anim`](#anim--сделать-анимацию) | «сделать анимацию» одной командой: kimodo.cpp (нейро-движение) → гейт хореографии → neuro_soma проекта 3d_game |
+| [`vision`](#vision--зрение-для-агентов) | «глаза» для агентов без зрения: картинка/видео + промт → ответ VLM (LFM3-VL-2B) через движок llama.cpp |
 
 # полезные источники
 https://mcp.so/
@@ -569,6 +570,82 @@ agent-tools anim --name cast_zap --prompt "The character raises his right hand..
   гейт `probe_hand_path.gd`, не глаз;
 - без PASS ни один клип в проект не попадает (exit ≠ 0, в stdout вердикты гейтов);
 - перезапись существующего клипа — только с `--force`.
+
+## vision — зрение для агентов
+
+«Глаза» для ИИ-агентов без своего зрения (дешёвые текстовые LLM). Принимает промт +
+≥1 картинку (или видео), запускает локальную VLM **LFM3-VL-2B** через движок llama.cpp
+(плагин `plugin-llama-engine`, ядро `llama-engine-core`) и печатает текстовый ответ в
+stdout. Движок/модель берутся из общего `%APPDATA%/llama-engine/app_config.json`
+(vision-модель, приоритет LFM3-VL) или из флагов; можно подключиться к уже запущенному
+серверу через `--server-url` (экономит 1–2 с холодного старта, шаринг с хостом).
+
+```bash
+# Картинка (один ракурс)
+agent-tools vision --prompt "Что на скриншоте? Есть ли артефакты?" --image shot.png
+
+# 3D-модель: 4–6 ракурсов (повторяемый --image)
+agent-tools vision --prompt "Опиши пропорции, клиппинг, перевёрнутые нормали" \
+    --image front.png --image back.png --image left.png --image right.png
+
+# Видео/анимация: 6 равномерных кадров (таймкоды уходят в промт, не на пиксели)
+agent-tools vision --prompt "На каком кадре рука проходит сквозь корпус?" --video anim.mp4
+
+# Промт из файла/stdin (Windows-агенты ломают кавычки в --prompt "...")
+agent-tools vision --prompt-file q.txt --image shot.png
+cat q.txt | agent-tools vision --prompt - --image shot.png
+
+# Тёплый сервер (без спавна) + думатель с потолком
+agent-tools vision --server-url http://127.0.0.1:8080 --prompt "..." --image s.png --think
+
+# Явные пути к модели+проектору (если не в app_config)
+agent-tools vision --prompt "Что на видео? Есть ли артефакты?" --video anim.mp4 \
+    --model "D:\nn\models\vision\lfm3-vl-2b-heretic.i1-Q4_K_M.gguf" \
+    --mmproj "D:\nn\models\vision\mmproj-LFM3-VL-2B-Q8_0.gguf" --max-frames 6 --no-think
+```
+
+> ⚠️ **mmproj обязателен**: VLM = LLM `.gguf` + проектор `mmproj-*.gguf` (~200 МБ). Без него
+> модель запустится текстовой и не увидит картинок. Heretic-репозитории содержат только кванты
+> LLM — mmproj берётся из официального `LiquidAI/LFM3-VL-2B-GGUF` (`mmproj-LFM3-VL-2B-Q8_0.gguf`).
+
+Флаги: `--image` (повторяемый), `--video`, `--prompt`/`--prompt-file`/stdin(`-`),
+`--max-frames 6`, `--max-dim 1280`/`--no-resize`, `--timeout 120`, `--server-url`,
+`--engine-dir`/`--model`/`--mmproj`, `--think`/`--no-think` (дефолт off), `--verbose`.
+
+### Коды возврата
+
+| Код | Что произошло |
+|-----|---------------|
+| `0` | ответ получен (в stdout, при видео — шапка с таймкодами + ответ) |
+| `2` | ошибка ввода: нет медиа/файла, не-картинка (magic-bytes), битое видео, нет ffmpeg |
+| `3` | бэкенд/таймаут: llama-server не поднялся/не ответил, пустой вывод модели (thinking съел бюджет) |
+| `4` | внутренняя ошибка (lock, ctrlc-регистрация) |
+
+Лимита вызовов НЕТ (VLM локальна и бесплатна) — код `1` не используется. Ресурсные
+ограничители: `--timeout`, `--max-frames`, `--max-dim` + межпроцессный file-lock
+`vision.lock` (параллельные вызовы встают в очередь, а не пробивают VRAM).
+
+### Переменные окружения
+
+| Переменная | Дефолт | Перекрывается флагом |
+|------------|--------|----------------------|
+| `AGENT_TOOLS_VISION_URL` | — (локальный спавн) | `--server-url` |
+| `AGENT_TOOLS_VISION_ENGINE_DIR` | app_config.llamacpp_dir | `--engine-dir` |
+| `AGENT_TOOLS_VISION_MODEL` | vision-модель из app_config | `--model` |
+| `AGENT_TOOLS_VISION_MMPROJ` | mmproj_files/auto_detect | `--mmproj` |
+| `AGENT_TOOLS_LOG` | `warn` (уровень лога в stderr) | — |
+
+### Тесты
+
+```bash
+cargo test -p agent-tools --lib                 # unit: media/engine/cli/error
+cargo test -p agent-tools --test vision_e2e     # e2e: реальный бинарь + стаб-сервер (картинка+видео)
+```
+
+E2E гоняет **настоящий** JSON/base64/`image_url` из `llama-engine-core` против стаб-сервера
+(через `--server-url`), без дублирования HTTP. Видео-тесты генерят mp4 (`ffmpeg -f lavfi
+-i testsrc`) в `TempDir` — без коммита бинарников. Живой прогон с реальным VLM — `#[ignore]`
+(`cargo test -p agent-tools --test vision_e2e -- --ignored`).
 
 ## Архитектура
 

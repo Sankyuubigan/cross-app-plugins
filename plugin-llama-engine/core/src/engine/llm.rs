@@ -225,6 +225,10 @@ pub struct LlamaEngine {
     server_log_line_count: std::sync::Mutex<usize>,
     port: u16,
     api_key: String,
+    /// Внешний базовый URL (для `connect_external`, без спавна процесса):
+    /// `http://host:port`. `None` — обычный режим со спавном на `port`.
+    /// `url()` использует его, если задан (см. `LlamaEngine::connect_external`).
+    base_url: Option<String>,
     child: std::sync::Mutex<Option<Child>>,
     /// Текущее значение -ngl (оффлоад). Меняется на меньшее при автоперезапуске
     /// после CUDA OOM (внутренняя изменяемость — генерация идёт через &self).
@@ -1297,6 +1301,7 @@ impl LlamaEngine {
             server_log_line_count: std::sync::Mutex::new(0),
             port,
             api_key,
+            base_url: None,
             child: std::sync::Mutex::new(Some(child)),
             current_ngl: std::cell::Cell::new(gpu_layers),
             respawn_ctx: Some(Box::new(RespawnCtx {
@@ -1431,6 +1436,94 @@ impl LlamaEngine {
         Ok(engine)
     }
 
+    /// Подключиться к УЖЕ запущенному llama-server по HTTP, БЕЗ спавна процесса.
+    ///
+    /// Аддитивный конструктор для хостов/тулов, которые хотят переиспользовать
+    /// тёплый сервер (напр. от King Orch) или подменить транспорт в тестах
+    /// (стаб-сервер на `127.0.0.1:0`). Тот же `generate_chat_multimodal` и
+    /// HTTP-сериализация, что у спавн-режима — дублирования клиента нет.
+    ///
+    /// `base_url` — `http://host:port` (с `/v1` или без — `url()` нормализует
+    /// путь запроса сам). `api_key: None` — не слать `Authorization` (локальный
+    /// сервер без `--api-key`). `child` = `None`, поэтому `Drop` ничего не убивает
+    /// (проверено: `drop` берёт `child.lock().take()` и молча выходит на `None`).
+    /// `respawn_ctx` = `None` — перезапуска при OOM у внешнего сервера нет.
+    #[allow(clippy::too_many_arguments)]
+    pub fn connect_external(
+        base_url: &str,
+        api_key: Option<String>,
+        model_path: &str,
+        mmproj_path: Option<&str>,
+        initial_slot_ctx: u32,
+        reasoning_budget: u32,
+        log_cb: impl Fn(String) + Send + Sync + 'static,
+        stream_cb: impl Fn(String) + Send + Sync + 'static,
+    ) -> Result<Self, String> {
+        let base = base_url.trim().trim_end_matches('/');
+        if base.is_empty() {
+            return Err("connect_external: пустой base_url".to_string());
+        }
+        let log_cb: std::sync::Arc<dyn Fn(String) + Send + Sync> = std::sync::Arc::new(log_cb);
+        log_cb(format!(
+            "🔌 Подключение к внешнему llama-server: {} (без спавна процесса, reasoning_budget={})",
+            base, reasoning_budget
+        ));
+
+        let client = Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .no_proxy()
+            .timeout(None)
+            .build()
+            .map_err(|e| format!("Ошибка создания HTTP-клиента: {}", e))?;
+
+        let engine = Self {
+            hardware_ctx_limit: initial_slot_ctx,
+            slot: std::cell::Cell::new(initial_slot_ctx),
+            model_path: model_path.to_string(),
+            mmproj_path: mmproj_path.map(|s| s.to_string()),
+            is_multimodal_engine: mmproj_path.is_some(),
+            stream_cb: std::cell::RefCell::new(Arc::new(stream_cb)),
+            reasoning_cb: std::cell::RefCell::new(Arc::new(|_chunk: String| {})),
+            log_cb: std::cell::RefCell::new(log_cb.clone()),
+            client,
+            server_log: PathBuf::new(),
+            stderr_log: PathBuf::new(),
+            server_trace: ServerTrace::new(),
+            server_log_line_count: std::sync::Mutex::new(0),
+            port: 0,
+            api_key: api_key.unwrap_or_default(),
+            base_url: Some(base.to_string()),
+            child: std::sync::Mutex::new(None),
+            current_ngl: std::cell::Cell::new(0),
+            respawn_ctx: None,
+            engine_mode: std::cell::RefCell::new("external".to_string()),
+            engine_mode_detail: std::cell::RefCell::new(String::new()),
+            vram_before: 0,
+            last_tok_per_sec: std::cell::Cell::new(0.0),
+            pending_grammar: std::sync::Mutex::new(None),
+            pending_tools: std::sync::Mutex::new(None),
+            engine_last_progress_ms: Arc::new(AtomicU64::new(now_unix_ms())),
+        };
+
+        // Проверка живости: внешний сервер ДОЛЖЕН отвечать на /health, но это не
+        // повод падать на старте — реальная ошибка соединения всплывёт при первом
+        // запросе генерации (код 3 у тула) с внятным текстом. Здесь — только
+        // предупреждение в лог, чтобы connect_external оставался тестируемым без
+        // живого сервера (стаб-сервер в e2e поднимается отдельно).
+        if !engine.is_healthy() {
+            log_cb(format!(
+                "⚠️ Внешний llama-server {} пока не отвечает на /health — проверьте, что он запущен (ошибка всплывёт при запросе)",
+                base
+            ));
+        } else {
+            log_cb(format!(
+                "✅ Подключено к внешнему llama-server: {} (модель {}, режим external)",
+                base, engine.model_path
+            ));
+        }
+        Ok(engine)
+    }
+
     /// Режим движка: "gpu" (модель в VRAM) или "cpu" (fallback)
     pub fn engine_mode(&self) -> String {
         self.engine_mode.borrow().clone()
@@ -1485,8 +1578,21 @@ impl LlamaEngine {
         format!("Bearer {}", self.api_key)
     }
 
+    /// Заголовок `Authorization` только если ключ непустой (внешний сервер
+    /// может работать без `--api-key` — `connect_external` с `api_key: None`).
+    fn auth_header_opt(&self) -> Option<String> {
+        if self.api_key.trim().is_empty() {
+            None
+        } else {
+            Some(self.auth_header())
+        }
+    }
+
     fn url(&self, path: &str) -> String {
-        format!("http://127.0.0.1:{}{}", self.port, path)
+        match &self.base_url {
+            Some(base) => format!("{}{}", base.trim_end_matches('/'), path),
+            None => format!("http://127.0.0.1:{}{}", self.port, path),
+        }
     }
 
     pub fn is_alive(&self) -> bool {
@@ -1494,11 +1600,13 @@ impl LlamaEngine {
     }
 
     fn is_healthy(&self) -> bool {
-        let resp = self.client
+        let mut req = self.client
             .get(self.url("/health"))
-            .header(AUTHORIZATION, self.auth_header())
-            .timeout(Duration::from_secs(3))
-            .send();
+            .timeout(Duration::from_secs(3));
+        if let Some(auth) = self.auth_header_opt() {
+            req = req.header(AUTHORIZATION, auth);
+        }
+        let resp = req.send();
         match resp {
             Ok(r) => r.status().is_success(),
             Err(_) => false,
@@ -1520,15 +1628,17 @@ impl LlamaEngine {
     ) -> Result<reqwest::blocking::Response, String> {
         let (tx, rx) = std::sync::mpsc::channel();
         let url = self.url("/v1/chat/completions");
-        let auth = self.auth_header();
+        let auth = self.auth_header_opt();
         let client = self.client.clone();
         std::thread::spawn(move || {
-            let sent = client
+            let mut req = client
                 .post(url)
-                .header(AUTHORIZATION, auth)
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
-                .body(body)
-                .send();
+                .body(body);
+            if let Some(a) = auth {
+                req = req.header(AUTHORIZATION, a);
+            }
+            let sent = req.send();
             let _ = tx.send(sent);
         });
         match rx.recv_timeout(timeout) {
@@ -1550,16 +1660,17 @@ impl LlamaEngine {
     }
 
     fn post_json<T: Serialize, R: DeserializeOwned>(&self, path: &str, body: &T) -> Result<R, String> {
-        let resp = self.client
+        let mut req = self.client
             .post(self.url(path))
-            .header(AUTHORIZATION, self.auth_header())
             .json(body)
             // Дефолт reqwest отключён ради стрима генерации, поэтому у всех
             // служебных запросов таймаут проставляется явно — иначе зависший
             // движок будет блокировать вызывающий поток навсегда.
-            .timeout(StreamTimeouts::default().inter_token)
-            .send()
-            .map_err(|e| format!("Ошибка HTTP {}: {}", path, e))?;
+            .timeout(StreamTimeouts::default().inter_token);
+        if let Some(auth) = self.auth_header_opt() {
+            req = req.header(AUTHORIZATION, auth);
+        }
+        let resp = req.send().map_err(|e| format!("Ошибка HTTP {}: {}", path, e))?;
         let status = resp.status();
         let text = resp.text().map_err(|e| format!("Ошибка чтения ответа {}: {}", path, e))?;
         if !status.is_success() {
@@ -3756,6 +3867,49 @@ mod tests {
             t.headers <= t.first_token,
             "очередь слота ждёт меньше, чем сам prompt eval — иначе значения перепутаны"
         );
+    }
+
+    /// `connect_external` собирает движок без спавна: child=None (Drop безвреден),
+    /// base_url задан, is_multimodal по mmproj, respawn_ctx=None (нет OOM-перезапуска).
+    /// Живьём /health не проверяем (нет сервера) — только структурные инварианты.
+    #[test]
+    fn connect_external_builds_engine_without_child() {
+        let engine = LlamaEngine::connect_external(
+            "http://127.0.0.1:9",
+            None,
+            "model.gguf",
+            Some("mmproj.gguf"),
+            4096,
+            0,
+            |_| {},
+            |_| {},
+        )
+        .expect("connect_external не должен падать без живого сервера (health игнорируем)");
+        assert!(engine.child.lock().unwrap().is_none(), "child обязан быть None");
+        assert_eq!(engine.base_url.as_deref(), Some("http://127.0.0.1:9"));
+        assert!(engine.is_multimodal_engine, "mmproj задан → мультимодалка");
+        assert_eq!(engine.slot(), 4096);
+        assert!(engine.respawn_ctx.is_none(), "у внешнего сервера нет OOM-перезапуска");
+        assert_eq!(engine.engine_mode(), "external");
+    }
+
+    /// Пустой base_url — честная ошибка, а не движок с пустым URL.
+    #[test]
+    fn connect_external_rejects_empty_base_url() {
+        let result = LlamaEngine::connect_external(
+            "   ",
+            None,
+            "m.gguf",
+            None,
+            2048,
+            0,
+            |_| {},
+            |_| {},
+        );
+        match result {
+            Ok(_) => panic!("пустой base_url обязан быть ошибкой"),
+            Err(err) => assert!(err.contains("base_url")),
+        }
     }
 
     // ─── Liveness-сторож по stderr (инцидент 30.10.26) ───

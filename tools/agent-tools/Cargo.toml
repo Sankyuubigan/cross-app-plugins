@@ -44,3 +44,16 @@ rustpython-parser = { workspace = true }
 rustpython-ast = { workspace = true }
 # Метка времени в индексе. Чистый Rust, C не компилирует.
 chrono = { workspace = true }
+
+# Тул зрения (vision): переиспользует ядро движка llama.cpp (мультимодалка уже
+# там — generate_chat_multimodal). Ядро чистое, без Tauri (как code-tools/web-tools).
+llama-engine-core = { path = "../../plugin-llama-engine/core" }
+# Декод/ресайз картинки (magic-bytes-валидация, приведение к PNG/JPEG, --max-dim).
+# Без тяжёлых кодеков (exr/avif/tiff) — только форматы 3D-движков и скриншотов.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "bmp", "gif", "tga"] }
+# base64 для image_url data-URL (ChatAttachment.data_base64).
+base64 = "0.22"
+# Временные каталоги для кадров видео (TempDir) — в тестах и рантайме.
+tempfile = "3"
+# Ctrl+C → cancel_flag (гасит зависший запрос/спавн, не оставляя зомби).
+ctrlc = "3"

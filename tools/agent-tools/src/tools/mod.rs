@@ -13,11 +13,19 @@ pub mod anim;
 pub mod code;
 pub mod codemap;
 pub mod consult;
+pub mod vision;
 pub mod websearch;
 
 /// Реестр инструментов: единственный список, по которому печатается справка
 /// и который обходится при добавлении нового инструмента.
-pub const ALL: &[Tool] = &[Tool::Consult, Tool::Codemap, Tool::Code, Tool::Websearch, Tool::Anim];
+pub const ALL: &[Tool] = &[
+    Tool::Consult,
+    Tool::Codemap,
+    Tool::Code,
+    Tool::Websearch,
+    Tool::Anim,
+    Tool::Vision,
+];
 
 /// Инструмент набора.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,6 +40,8 @@ pub enum Tool {
     Websearch,
     /// «Сделать анимацию»: kimodo.cpp → гейт хореографии → neuro_soma.
     Anim,
+    /// Зрение для агентов без зрения: картинка/видео + промт → VLM (LFM3-VL-2B).
+    Vision,
 }
 
 impl Tool {
@@ -43,6 +53,7 @@ impl Tool {
             Tool::Code => "code",
             Tool::Websearch => "websearch",
             Tool::Anim => "anim",
+            Tool::Vision => "vision",
         }
     }
 
@@ -64,6 +75,9 @@ impl Tool {
             Tool::Anim => {
                 "«Сделать анимацию» одной командой: kimodo.cpp → гейт хореографии → neuro_soma"
             }
+            Tool::Vision => {
+                "Зрение для агентов без зрения: картинка/видео + промт → ответ VLM (LFM3-VL-2B)"
+            }
         }
     }
 
@@ -78,6 +92,7 @@ impl Tool {
             Some("code") => Some(Tool::Code),
             Some("websearch") => Some(Tool::Websearch),
             Some("anim") => Some(Tool::Anim),
+            Some("vision") => Some(Tool::Vision),
             _ => None,
         }
     }
@@ -91,6 +106,7 @@ impl Tool {
             Tool::Code => code::run(args),
             Tool::Websearch => websearch::run(args),
             Tool::Anim => anim::run(args),
+            Tool::Vision => vision::run(args),
         }
     }
 }
@@ -109,6 +125,7 @@ mod tests {
         assert_eq!(Tool::from_args(&args(&["codemap"])), Some(Tool::Codemap));
         assert_eq!(Tool::from_args(&args(&["code"])), Some(Tool::Code));
         assert_eq!(Tool::from_args(&args(&["websearch"])), Some(Tool::Websearch));
+        assert_eq!(Tool::from_args(&args(&["vision"])), Some(Tool::Vision));
     }
 
     #[test]
@@ -128,6 +145,8 @@ mod tests {
         assert!(!Tool::Code.about().is_empty());
         assert_eq!(Tool::Websearch.name(), "websearch");
         assert!(!Tool::Websearch.about().is_empty());
+        assert_eq!(Tool::Vision.name(), "vision");
+        assert!(!Tool::Vision.about().is_empty());
     }
 
     #[test]
@@ -139,7 +158,8 @@ mod tests {
                 Tool::Codemap,
                 Tool::Code,
                 Tool::Websearch,
-                Tool::Anim
+                Tool::Anim,
+                Tool::Vision
             ],
             "новый инструмент обязан попасть в ALL"
         );

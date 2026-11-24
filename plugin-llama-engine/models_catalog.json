@@ -1,5 +1,16 @@
 [
   {
+    "name": "lfm3-vl-2b",
+    "is_default": false,
+    "size_gb": "1.10",
+    "download_url": "https://huggingface.co/LiquidAI/LFM3-VL-2B-GGUF/resolve/main/LFM3-VL-2B-QAD-Q4_0.gguf?download=true",
+    "mmproj_url": "https://huggingface.co/LiquidAI/LFM3-VL-2B-GGUF/resolve/main/mmproj-LFM3-VL-2B-Q8_0.gguf?download=true",
+    "tokenizer_id": "LiquidAI/LFM3-VL-2B",
+    "uncen": false,
+    "vision": true,
+    "audio": false
+  },
+  {
     "name": "gemma-4-8b",
     "is_default": true,
     "size_gb": "4.26",
