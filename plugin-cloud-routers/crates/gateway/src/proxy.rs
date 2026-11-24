@@ -441,14 +441,10 @@ async fn route_provider(
             let stream = payload.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
             state.dump().request(requested_model, &provider_id, &key_id, url, stream, &up.body);
         }
-        let via_proxy = up
-            .route
-            .proxy()
-            .map(|spec| format!(" (через прокси {})", spec.describe()))
-            .unwrap_or_default();
+        let route_note = up.route.describe(provider.relay_id.as_deref());
         state.events().info(format!(
-            "запрос {} → провайдер «{}» модель «{}» ключ {}{}",
-            requested_model, provider_id, upstream_model, key_id, via_proxy
+            "запрос {} → провайдер «{}» модель «{}» ключ {} ({})",
+            requested_model, provider_id, upstream_model, key_id, route_note
         ));
 
         let attempt_started = Instant::now();
@@ -463,9 +459,12 @@ async fn route_provider(
                     attempt_started.elapsed().as_millis() as u64,
                 );
                 state.rotation().mark_failure(&provider_id, &key_id, FailureKind::Transport, None);
-                state.events().warn(format!(
-                    "ключ {} провайдера «{}»: транспортная ошибка ({}), пробуем следующий",
-                    key_id, provider_id, crate::neterr::describe(&e)
+                // Транспортный отказ — реальная ошибка (не 429-лимит): красный
+                // уровень, чтобы «релей нестабилен / работает через раз» было
+                // видно (запрос владельца 24.11.2026).
+                state.events().error(format!(
+                    "ключ {} провайдера «{}» ({}): транспортная ошибка ({}), пробуем следующий",
+                    key_id, provider_id, route_note, crate::neterr::describe(&e)
                 ));
                 last = Some(openai_error(
                     StatusCode::BAD_GATEWAY,
@@ -527,8 +526,8 @@ async fn route_provider(
                 if kind.deactivates_key() && !is_oauth {
                     deactivate_key(&state, &provider_id, &key_id);
                     state.events().error(format!(
-                        "ключ {} провайдера «{}» отклонён апстримом (HTTP {}) — ключ выключен",
-                        key_id, provider_id, status.as_u16()
+                        "ключ {} провайдера «{}» ({}) отклонён апстримом (HTTP {}) — ключ выключен",
+                        key_id, provider_id, route_note, status.as_u16()
                     ));
                 } else if kind.deactivates_key() && is_oauth {
                     // OAuth-сессию деактивацией ключа не лечат: 401/403 здесь —
@@ -536,14 +535,22 @@ async fn route_provider(
                     // помечается протухшей проактивным рефрешем (шаг 4), а не
                     // выключением несуществующего ключа.
                     state.events().error(format!(
-                        "OAuth-сессия провайдера «{}» отклонена апстримом (HTTP {}) — нужен рефреш токена",
-                        provider_id,
-                        status.as_u16()
+                        "OAuth-сессия провайдера «{}» ({}) отклонена апстримом (HTTP {}) — нужен рефреш токена",
+                        provider_id, route_note, status.as_u16()
+                    ));
+                } else if status.as_u16() == 429 {
+                    // 429 — лимит провайдера, а не отказ релея: жёлтый уровень
+                    // (владелец 24.11.2026: «429 — это понятно, лимит»).
+                    state.events().warn(format!(
+                        "ключ {} провайдера «{}» ({}): HTTP 429, пауза {} с, пробуем следующий",
+                        key_id, provider_id, route_note, cooldown.as_secs()
                     ));
                 } else {
-                    state.events().warn(format!(
-                        "ключ {} провайдера «{}»: HTTP {}, пауза {} с, пробуем следующий",
-                        key_id, provider_id, status.as_u16(), cooldown.as_secs()
+                    // 5xx (в т.ч. 502 из воркера релея) — реальный отказ
+                    // апстрима/канала: красный уровень, не 429-ный жёлтый.
+                    state.events().error(format!(
+                        "ключ {} провайдера «{}» ({}): HTTP {}, пауза {} с, пробуем следующий",
+                        key_id, provider_id, route_note, status.as_u16(), cooldown.as_secs()
                     ));
                 }
 

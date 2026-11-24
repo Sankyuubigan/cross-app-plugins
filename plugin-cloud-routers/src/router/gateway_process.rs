@@ -238,7 +238,7 @@ pub fn start_server(app: &AppHandle, router_id: RouterId, cfg: &RouterConfig) ->
 /// держит антивирус), шлюз всё равно должен стартовать: ломать
 /// функциональность из-за второстепенной функции нельзя.
 fn log_stdio(data_dir: &Path) -> std::process::Stdio {
-    let path = data_dir.join("gateway.log");
+    let path = cloud_routers_core::store::log_path(data_dir);
     match std::fs::OpenOptions::new()
         .create(true)
         .write(true)

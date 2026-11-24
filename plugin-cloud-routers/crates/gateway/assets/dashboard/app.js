@@ -65,6 +65,11 @@ function renderHeader() {
   $('#relay-token').textContent = c.vercel_relay_token_set
     ? 'задан (воркер требует его при каждом запросе)'
     : 'не задан — релей работать не будет';
+  // Путь к полному логу шлюза — как в <logs-panel> плагина log-collector:
+  // «Файл: …», чтобы пользователь знал, где лежат ВСЕ события (в RAM-буфере
+  // вкладки — только последние, и они сессионные).
+  const logPath = $('#log-path');
+  if (logPath) logPath.textContent = s.log_path ? `Файл: ${s.log_path}` : '';
 }
 
 // Карточка проблем конфигурации рисуется ВМЕСТЕ со списком провайдеров —
@@ -455,6 +460,27 @@ export async function syncPresets(btn) {
 
 // ──────────────────────────────── журнал ────────────────────────────────
 
+/** Подписан ли пользователь на «дно» журнала (см. nearBottom в utils.js).
+ *
+ * Автопрокрутка живёт по тому же принципу, что в <logs-panel> плагина
+ * log-collector: пока пользователь смотрит на дно — новые строки подтягиваются
+ * вниз сами; как только он прокрутил вверх читать — автоскролл выключается, и
+ * никакой перерисовка его не «ебашит вниз» (инцидент: журнал обновлялся
+ * каждые 3 с и читатать было невозможно). */
+function logNearBottom(box) {
+  return box.scrollHeight - box.scrollTop - box.clientHeight < 40;
+}
+
+/** Обновить чекбокс «Следить за новыми» по фактическому положению скролла.
+ *  Чекбокс не должен врать: он всегда показывает, включён ли автоскролл. */
+function syncAutoscrollCheckbox(box) {
+  const cb = $('#log-autoscroll');
+  if (!cb) return;
+  const near = logNearBottom(box);
+  state.logFollow = near;
+  cb.checked = near;
+}
+
 export async function loadEvents(append = false) {
   try {
     const q = append && state.lastSeq ? `?since=${state.lastSeq}` : '?limit=200';
@@ -468,6 +494,9 @@ export async function loadEvents(append = false) {
 
 function renderLog() {
   const box = $('#log-list');
+  // Запоминаем «прилипание к дну» ДО перерисовки: innerHTML сбрасывает
+  // scrollTop, и без этого чтение с середины было невозможно.
+  const stick = state.logFollow !== false && logNearBottom(box);
   box.innerHTML = state.events.map(e => {
     const t = new Date(e.ts_ms);
     const hh = String(t.getHours()).padStart(2, '0');
@@ -478,7 +507,15 @@ function renderLog() {
     const lvl = e.level === 'warn' || e.level === 'error' ? `gw-${esc(e.level)}` : '';
     return `<div class="gw-line ${lvl}"><span class="gw-time">${hh}:${mm}:${ss}</span>${esc(e.message)}</div>`;
   }).join('') || logEmptyHint();
-  if ($('#log-autoscroll').checked) box.scrollTop = box.scrollHeight;
+  // Автоскролл — только когда пользователь на дне (или явно включил слежение):
+  // перерисовка «середины» журнала не должна телепортировать его вниз.
+  if (stick || state.logFollow) {
+    // Шлём scroll-событие вниз СВОИМ скроллом — не даём ему «выключить»
+    // слежение: пользователь не трогал полосу, это мы догнали его до дна.
+    state.logAutoScrolling = true;
+    box.scrollTop = box.scrollHeight;
+    requestAnimationFrame(() => { state.logAutoScrolling = false; });
+  }
 }
 
 /** Пустой журнал — не молчание, а факт «сессия с ЧЧ:ММ» (журнал RAM-овый,
@@ -503,6 +540,75 @@ function startLogPolling() {
   }, 3000);
 }
 
+/** Панель журнала: пользовательский скролл главнее автоскролла.
+ *
+ * Корень бага «ебашит вниз»: renderLog перерисовывался каждые 3 с и всегда
+ * телепортировал вниз, а оторванный от дна пользователь не мог ничего
+ * прочитать. Теперь: прокрутил вверх — автоскролл выключается (чекбокс
+ * «Следить за новыми» снимается, чтобы не врать), вернулся к дну — включается.
+ * Клик по чекбоксу — явное «следить» даже с середины (до следующего скролла). */
+function bindLogPanel() {
+  const box = $('#log-list');
+  const cb = $('#log-autoscroll');
+  if (!box) return;
+  state.logFollow = cb ? cb.checked : true;
+
+  box.addEventListener('scroll', () => {
+    const near = logNearBottom(box);
+    // Программный скролл (renderLog) тоже триггерит scroll — различаем по
+    // флагу: наш автоскролл не должен «выключать сам себя».
+    if (state.logAutoScrolling) return;
+    state.logFollow = near;
+    if (cb) cb.checked = near;
+  });
+
+  if (cb) {
+    cb.addEventListener('change', () => {
+      state.logFollow = cb.checked;
+      if (cb.checked) box.scrollTop = box.scrollHeight;
+    });
+  }
+
+  const copyBtn = $('#btn-log-copy');
+  if (copyBtn) {
+    copyBtn.addEventListener('click', () => void copyLog());
+  }
+}
+
+/** Скопировать видимый журнал в буфер обмена (по образцу <logs-panel>:
+ *  «Копировать» копирует ВСЁ, что показано, а не только выделенное).
+ *  Фолбэк на execCommand — для WebView, где Clipboard API может быть
+ *  недоступен (http-страница без «secure context»). */
+async function copyLog() {
+  const text = state.events
+    .map(e => {
+      const t = new Date(e.ts_ms);
+      const hh = String(t.getHours()).padStart(2, '0');
+      const mm = String(t.getMinutes()).padStart(2, '0');
+      const ss = String(t.getSeconds()).padStart(2, '0');
+      return `${hh}:${mm}:${ss} ${e.message}`;
+    })
+    .join('\n');
+  if (!text) { toast('Журнал пуст — копировать нечего'); return; }
+  try {
+    await navigator.clipboard.writeText(text);
+    toast(`Журнал скопирован (${state.events.length} строк)`);
+  } catch {
+    // Фолбэк: execCommand копирует через выделение textarea (работает и
+    // вне secure context, и в старых WebView).
+    const area = document.createElement('textarea');
+    area.value = text;
+    area.style.position = 'fixed';
+    area.style.opacity = '0';
+    document.body.appendChild(area);
+    area.select();
+    let ok = false;
+    try { ok = document.execCommand('copy'); } catch { /* нет execCommand */ }
+    document.body.removeChild(area);
+    toast(ok ? `Журнал скопирован (${state.events.length} строк)` : 'Не удалось скопировать (буфер обмена недоступен)', ok ? 'ok' : 'err');
+  }
+}
+
 // ──────────────────────────────── вкладки ────────────────────────────────
 
 function initTabs() {
@@ -516,6 +622,7 @@ function initTabs() {
 function init() {
   initTabs();
   bindProviderExtras();
+  bindLogPanel();
   bindModelExtras();
   bindComboExtras();
   $('#btn-sync-presets').addEventListener('click', (e) => void syncPresets(e.currentTarget));

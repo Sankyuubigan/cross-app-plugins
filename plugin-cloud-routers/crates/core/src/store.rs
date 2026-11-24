@@ -42,6 +42,15 @@ pub fn config_path(data_dir: &Path) -> PathBuf {
     data_dir.join("gateway.json")
 }
 
+/// Путь к полному логу шлюза (`<data_dir>/gateway.log`).
+///
+/// SSOT: плагин (хост) открывает этот файл как stdout/stderr процесса шлюза
+/// (`src/router/gateway_process.rs::log_stdio`), шлюз отдаёт его путь дашборду
+/// (`admin.rs::status`). Одно место, чтобы путь не разъехался при правках.
+pub fn log_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("gateway.log")
+}
+
 /// Путь к кэшу каталога провайдеров.
 pub fn presets_cache_path(data_dir: &Path) -> PathBuf {
     data_dir.join("presets_cache.json")
@@ -290,6 +299,15 @@ mod tests {
     fn resolve_data_dir_nests_under_cloud_routers() {
         let p = resolve_data_dir(Path::new("/appdata/com.example.app"), "gateway");
         assert!(p.ends_with("cloud_routers/gateway"), "{}", p.display());
+    }
+
+    /// SSOT пути лога: шлюз (stdout/stderr) и дашборд («Файл: …») обязаны
+    /// ссылаться на один и тот же `gateway.log`, иначе пользователь искал бы
+    /// лог там, где его нет.
+    #[test]
+    fn log_path_is_gateway_log_in_data_dir() {
+        let p = log_path(Path::new("/data/gw"));
+        assert_eq!(p, PathBuf::from("/data/gw/gateway.log"));
     }
 
     #[test]

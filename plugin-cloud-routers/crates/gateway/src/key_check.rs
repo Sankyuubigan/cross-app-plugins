@@ -461,7 +461,7 @@ pub async fn run_plan(
                     &masked,
                     status.unwrap_or(0)
                 )),
-                CheckVerdict::Unknown => state.events().warn(format!(
+                CheckVerdict::Unknown => state.events().error(format!(
                     "ключ {} {}: {target_label}: непонятный ответ (HTTP {}) — ключ не осуждён — {detail}",
                     provider.id,
                     &masked,

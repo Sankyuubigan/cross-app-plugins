@@ -87,7 +87,11 @@ struct StatusDto {
     relay_token_set: bool,
     auto_start: bool,
     presets_sources: Vec<String>,
-    log_hint: String,
+    /// Путь к полному логу шлюза (`<data_dir>/gateway.log`) — вкладка
+    /// «Журнал» показывает его как подсказку «Файл: …» (по образцу
+    /// плагина log-collector): события в RAM-буфере сессионные, а полный
+    /// лог ещё и на диске, и пользователь должен знать где.
+    log_path: String,
 }
 
 async fn status(State(state): State<AppState>) -> Response {
@@ -112,7 +116,7 @@ async fn status(State(state): State<AppState>) -> Response {
             .unwrap_or(false),
         auto_start: config.auto_start,
         presets_sources: config.effective_presets_sources(),
-        log_hint: "События последних запросов и ретраев".to_string(),
+        log_path: core_store::log_path(state.data_dir()).to_string_lossy().to_string(),
     };
     Json(dto).into_response()
 }
@@ -1179,7 +1183,9 @@ async fn sync_presets(State(state): State<AppState>) -> ApiResult<Json<PresetsSy
     // и пользователь не видел в журнале причин провала sync.
     let push_fail = |attempts: &mut Vec<SourceAttempt>, url: &str, detail: String| {
         log::error!("cloud-routers: sync каталога: {url}: {detail}");
-        state.events().warn(format!("sync каталога: {url}: {detail}"));
+        // Отказ загрузки каталога — реальная ошибка (не 429-лимит): красный
+        // уровень (правило подсветки 24.11.2026: всё, кроме 429, — красное).
+        state.events().error(format!("sync каталога: {url}: {detail}"));
         attempts.push(SourceAttempt { url: url.to_string(), ok: false, detail });
     };
 

@@ -129,6 +129,34 @@ impl Route {
         matches!(self, Route::Relay { .. })
     }
 
+    /// Короткое описание маршрута для журнала: «через релей <id слота>
+    /// (<хост>)» / «через прокси …» / «напрямую».
+    ///
+    /// Пишется в КАЖДОЕ событие отказа (`proxy.rs`): по журналу должно быть
+    /// видно, шёл ли запрос через релей и через какой — иначе «транспортная
+    /// ошибка» не отличить от «релей нестабилен, работает через раз»
+    /// (запрос владельца 24.11.2026: нужна стабильность самих релеев).
+    /// `provider_relay_id` — привязка провайдера к слоту (`relay_id`).
+    pub fn describe(&self, provider_relay_id: Option<&str>) -> String {
+        match self {
+            Route::Relay { url, .. } => {
+                let slot = provider_relay_id.unwrap_or("?");
+                // Хост релея без пути и схемы: по нему узнаётся слот в UI
+                // (например, «relay-abc123.vercel.app»).
+                let host = url
+                    .split("://")
+                    .nth(1)
+                    .unwrap_or(url.as_str())
+                    .split('/')
+                    .next()
+                    .unwrap_or("");
+                format!("через релей «{slot}» ({host})")
+            }
+            Route::Proxied { proxy, .. } => format!("через прокси {}", proxy.describe()),
+            Route::Direct { .. } => "напрямую".to_string(),
+        }
+    }
+
     /// Сетевой прокси маршрута, если он есть.
     pub fn proxy(&self) -> Option<&ProxySpec> {
         match self {
@@ -699,5 +727,48 @@ mod tests {
         // маркер; ошибка всплывёт как ошибка отправки, а не как паника.
         let v = auth_header("ключ-не-латиница");
         assert!(!v.is_sensitive());
+    }
+
+    // ── Route::describe: маршрут в журнале (запрос владельца 24.11.2026) ──
+
+    #[test]
+    fn describe_direct_says_directly() {
+        let r = Route::Direct { url: "https://api.groq.com/openai/v1/chat/completions".into() };
+        assert_eq!(r.describe(None), "напрямую");
+    }
+
+    #[test]
+    fn describe_relay_names_slot_and_host() {
+        // По журналу должно быть видно, через какой релей шёл запрос:
+        // слот (id привязки) + хост деплоя.
+        let r = Route::Relay {
+            url: "https://relay-abc123.vercel.app/api/gateway/chat/completions".into(),
+            target_url: "https://api.groq.com/openai/v1/chat/completions".into(),
+            token: Some("secret".into()),
+        };
+        assert_eq!(
+            r.describe(Some("vercel")),
+            "через релей «vercel» (relay-abc123.vercel.app)"
+        );
+        // Без привязки (релей не указан) — «?», но хост всё равно виден.
+        assert_eq!(
+            r.describe(None),
+            "через релей «?» (relay-abc123.vercel.app)"
+        );
+    }
+
+    #[test]
+    fn describe_proxied_names_proxy_spec() {
+        let r = Route::Proxied {
+            url: "https://api.groq.com/openai/v1/chat/completions".into(),
+            proxy: ProxySpec {
+                kind: PROXY_TYPE_SOCKS5.into(),
+                host: "127.0.0.1".into(),
+                port: 1080,
+                user: None,
+                password: None,
+            },
+        };
+        assert_eq!(r.describe(Some("px")), "через прокси socks5://127.0.0.1:1080");
     }
 }
