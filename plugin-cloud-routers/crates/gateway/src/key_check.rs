@@ -106,16 +106,23 @@ pub struct KeyCheckSummary {
     pub results: Vec<KeyCheckResult>,
 }
 
-/// Счётчик бесплатных (`:free`) запросов на день в сводке проверки
-/// OpenRouter. Кап — производный от тиров проверенных ключей
-/// ([`crate::openrouter_check::free_usage_cap`]); `None` — «лимит неизвестен».
+/// Точная дневная квота бесплатных запросов аккаунта OpenRouter
+/// (`data.free_model_daily_requests` из `GET /api/v1/key`).
+///
+/// Источник истины — платформа: учитывает запросы мимо шлюза, сбрасывается
+/// в 00:00 UTC. `None` — блок не пришёл (старый API, BYOK, освобождён от
+/// лимита) → в UI «лимит неизвестен», а не выдуманная цифра.
 #[derive(Debug, Clone, Serialize)]
 pub struct FreeUsageDto {
     pub provider_id: String,
-    /// Ключ дня счётчика (UTC `ГГГГ-ММ-ДД`).
+    /// Ключ дня (UTC `ГГГГ-ММ-ДД`) — сброс квоты в 00:00 UTC.
     pub ymd: String,
-    pub count: u64,
-    pub cap: Option<u64>,
+    /// Засчитано платформой за сегодня.
+    pub used: u64,
+    /// Реальный дневной потолок аккаунта.
+    pub limit: u64,
+    /// Остаток до сброса — истина платформы, не `limit - used`.
+    pub remaining: u64,
 }
 
 /// Провайдер Gemini? SSOT: используется и хендлером проверки, и полем
@@ -493,17 +500,19 @@ pub async fn run_plan(
         plan.models.len()
     ));
 
+    // Квота бесплатных запросов — аккаунтная, а не per-key: все ключи одного
+    // аккаунта вернут одинаковый блок. Берём ПЕРВЫЙ валидный и не суммируем.
     let free_usage = match plan.kind {
-        KeyCheckKind::OpenRouterKeyInfo => {
-            let infos: Vec<Option<crate::openrouter_check::OpenRouterKeyInfo>> =
-                results.iter().map(|r| r.openrouter.clone()).collect();
-            Some(FreeUsageDto {
+        KeyCheckKind::OpenRouterKeyInfo => results
+            .iter()
+            .find_map(|r| r.openrouter.as_ref()?.free_model_daily_requests.clone())
+            .map(|q| FreeUsageDto {
                 provider_id: provider.id.clone(),
-                ymd: crate::free_usage::today_ymd(),
-                count: state.free_usage().today_count(&provider.id),
-                cap: crate::openrouter_check::free_usage_cap(&infos),
-            })
-        }
+                ymd: crate::openrouter_check::today_ymd(),
+                used: q.used,
+                limit: q.limit,
+                remaining: q.remaining,
+            }),
         KeyCheckKind::GeminiCountTokens => None,
     };
 

@@ -28,7 +28,6 @@ mod app;
 mod bodydump;
 mod combos_admin;
 mod eventstream;
-mod free_usage;
 mod key_check;
 mod kiro_oauth;
 mod kiro_stream;

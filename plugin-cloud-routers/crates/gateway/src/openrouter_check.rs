@@ -1,7 +1,7 @@
 //! Детектор и проверка ключей OpenRouter.
 //!
-//! SSOT для всего, что специфично для OpenRouter (счётчик `:free`-запросов
-//! в [`crate::free_usage`], проверка ключей): по образцу
+//! SSOT для всего, что специфично для OpenRouter (дневная квота
+//! бесплатных запросов, проверка ключей): по образцу
 //! `is_gemini_provider` ([`crate::key_check`]) — host/base_url, а не
 //! protocol или id: пользователь переименовывает и пересоздаёт провайдеров.
 //!
@@ -12,15 +12,52 @@
 //!
 //! `GET {base_url}/key` (Bearer-ключ) возвращает
 //! `{ "data": { label, usage, usage_daily, usage_weekly, usage_monthly,
-//! limit, limit_remaining, limit_reset, is_free_tier, … } }`. API НЕ отдаёт
-//! счётчик бесплатных запросов (аккаунтный дневной лимит — в деньгах), это
-//! чинит локальный счётчик [`crate::free_usage`]; предполагаемый кап
-//! выводится из тиров ключей ([`free_usage_cap`]).
+//! limit, limit_remaining, limit_reset, is_free_tier,
+//! free_model_daily_requests, … } }`.
+//!
+//! `free_model_daily_requests` (`{ used, limit, remaining }`, все целые) —
+//! **точная** дневная квота бесплатных запросов аккаунта, добавлена
+//! OpenRouter 16.09.2026. Это источник истины для дашборда: аккаунтная
+//! (не per-key), учитывает запросы мимо шлюза, сбрасывается в 00:00 UTC.
+//! Локальный счётчик `free_usage.json` удалён — он считал ретраи и врал.
+//!
+//! Денежные поля (`usage*`, `limit*` в $) — про долларовый потолок ключа,
+//! к бесплатной квоте запросов отношения не имеют.
 
 use cloud_routers_core::config::{GatewayConfig, ProviderConfig};
 use serde::{Deserialize, Serialize};
 
 use crate::key_check::{CheckPlan, CheckVerdict, KeyCheckKind};
+
+/// Сегодняшний UTC-день `ГГГГ-ММ-ДД` — ключ дня квоты (сброс в 00:00 UTC).
+///
+/// Без `chrono`: в шлюзе календарных часов нет, а тащить зависимость ради
+/// одной строки запрещено минимализмом. Считаем дни от эпохи Unix.
+pub fn today_ymd() -> String {
+    let days = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() / 86_400)
+        .unwrap_or(0);
+    let (y, m, d) = civil_from_days(days as i64);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// Дни от эпохи Unix → (год, месяц, день) — алгоритм «civil_from_days»
+/// Говарда Хиннанта. Чистая функция: покрывается точными тестами на
+/// известные дни (в отличие от обёртки над `now()`). Guard отрицательного z
+/// (trunc-деление Rust ≠ floor).
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m as u32, d as u32)
+}
 
 /// Провайдер — OpenRouter? (base_url содержит `openrouter.ai`).
 pub fn is_openrouter_provider(p: &ProviderConfig) -> bool {
@@ -34,31 +71,6 @@ pub fn key_info_target_url(base_url: &str) -> Result<String, String> {
         return Err("у провайдера нет адреса — проверять нечего".to_string());
     }
     Ok(format!("{base}/key"))
-}
-
-/// Порядок платформы по дневному числу бесплатных запросов: ключи free-тира
-/// — 50, платные — 1000. Числа только для отображения капа (жёсткого гейта
-/// нет), API самого числа не отдаёт.
-pub const FREE_DAILY_CAP_FREE_KEY: u64 = 50;
-pub const FREE_DAILY_CAP_PAID_KEY: u64 = 1000;
-
-/// Данные ключа из `data` ответа `/api/v1/key`. Отсутствующие/null поля —
-/// честный `None`: рисовать «—» честнее, чем выдумывать 0.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct OpenRouterKeyInfo {
-    /// Тир ключа платформы: `false` — платный, `true` — бесплатный.
-    pub is_free_tier: Option<bool>,
-    /// Потрачено всего, $.
-    pub usage: Option<f64>,
-    /// Потрачено за сегодня, $.
-    pub usage_daily: Option<f64>,
-    /// Аккаунтный лимит расхода, $.
-    pub limit: Option<f64>,
-    /// Остаток лимита расхода, $.
-    pub limit_remaining: Option<f64>,
-    /// Как часто обнуляется лимит (`daily`/`weekly`/`monthly`/…).
-    /// Незнакомое значение отображается как есть — не паникуем.
-    pub limit_reset: Option<String>,
 }
 
 /// Конверт ответа `/api/v1/key`: данные лежат под ключом `data`.
@@ -84,24 +96,45 @@ pub fn classify_openrouter(status: Option<u16>, body: &str) -> CheckVerdict {
     }
 }
 
-/// Кап дневной квоты бесплатных запросов по тирам проверенных ключей.
+/// Дневная квота бесплатных запросов аккаунта из `data.free_model_daily_requests`
+/// (добавлена OpenRouter 16.09.2026). Все поля целые.
 ///
-/// Кап определяется аккаунтом: платный ключ (`is_free_tier == false`)
-/// поднимает кап до [`FREE_DAILY_CAP_PAID_KEY`]; все проверенные ключи
-/// free-тира — [`FREE_DAILY_CAP_FREE_KEY`]. Тир неизвестен хотя бы у одного
-/// ключа (401, мусорный ответ, поле отсутствует) — кап выставлять наугад
-/// нельзя: `None` (в UI — «лимит неизвестен»). Одна функция-вывод: кап не
-/// хардкодится в двух местах.
-pub fn free_usage_cap(infos: &[Option<OpenRouterKeyInfo>]) -> Option<u64> {
-    let tiers: Vec<bool> = infos.iter().flatten().filter_map(|i| i.is_free_tier).collect();
-    if tiers.iter().any(|&free| !free) {
-        return Some(FREE_DAILY_CAP_PAID_KEY);
-    }
-    // Все ключи прошли проверку (каждый дал info) и у всех известный free-тир.
-    if infos.len() == tiers.len() && !tiers.is_empty() {
-        return Some(FREE_DAILY_CAP_FREE_KEY);
-    }
-    None
+/// Квота **аккаунтная**, а не per-key: все ключи одного аккаунта вернут одно
+/// и то же значение — суммировать нельзя. `used` может превышать `limit`
+/// (BYOK / аккаунт освобождён от лимита), поэтому остаток берётся из
+/// `remaining`, а не считается как `limit - used` (underflow на u64).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FreeModelDailyRequests {
+    /// Реально засчитанных `:free`-запросов за текущие UTC-сутки.
+    pub used: u64,
+    /// Реальный дневной потолок аккаунта (50 или 1000).
+    pub limit: u64,
+    /// Остаток до сброса (00:00 UTC). Истина платформы — не `limit - used`.
+    pub remaining: u64,
+}
+
+/// Данные ключа из `data` ответа `/api/v1/key`. Отсутствующие/null поля —
+/// честный `None`: рисовать «—» честнее, чем выдумывать 0.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct OpenRouterKeyInfo {
+    /// Тир ключа платформы: `false` — платный, `true` — бесплатный.
+    pub is_free_tier: Option<bool>,
+    /// Потрачено всего, $.
+    pub usage: Option<f64>,
+    /// Потрачено за сегодня, $.
+    pub usage_daily: Option<f64>,
+    /// Аккаунтный лимит расхода, $.
+    pub limit: Option<f64>,
+    /// Остаток лимита расхода, $.
+    pub limit_remaining: Option<f64>,
+    /// Как часто обнуляется долларовый лимит (`daily`/`weekly`/`monthly`/…).
+    /// Незнакомое значение отображается как есть — не паникуем. Про запросы
+    /// отношения не имеет.
+    pub limit_reset: Option<String>,
+    /// Точная дневная квота бесплатных запросов аккаунта. `None` — блок не
+    /// пришёл (старый API, BYOK, освобождён от лимита) → «лимит неизвестен».
+    #[serde(default)]
+    pub free_model_daily_requests: Option<FreeModelDailyRequests>,
 }
 
 /// План проверки ключей OpenRouter: один `GET {base}/key` на ключ.
@@ -170,6 +203,8 @@ mod tests {
         assert_eq!(info.limit, Some(10.0));
         assert_eq!(info.limit_remaining, Some(9.97));
         assert_eq!(info.limit_reset.as_deref(), Some("daily"));
+        // Блока бесплатной квоты в старом ответе нет — честный None.
+        assert_eq!(info.free_model_daily_requests, None);
 
         // Отсутствующие поля → None; незнакомый limit_reset доходит как есть.
         let partial = parse_key_info(r#"{"data":{"limit_reset":"weekly","extra_field":123}}"#)
@@ -182,6 +217,29 @@ mod tests {
         assert_eq!(parse_key_info(r#"{"data":null}"#), None);
         assert_eq!(parse_key_info(r#"{"foo":1}"#), None);
         assert_eq!(parse_key_info("<html>page</html>"), None);
+    }
+
+    #[test]
+    fn parse_key_info_reads_free_model_daily_requests() {
+        // Блок добавлен OpenRouter 16.09.2026 — точная дневная квота.
+        let body = r#"{"data":{"label":"k","is_free_tier":false,"usage_daily":0.03,
+            "free_model_daily_requests":{"used":12,"limit":50,"remaining":38}}}"#;
+        let info = parse_key_info(body).expect("parsed");
+        let q = info.free_model_daily_requests.expect("квота");
+        assert_eq!(q.used, 12);
+        assert_eq!(q.limit, 50);
+        assert_eq!(q.remaining, 38);
+        // limit не зависит от is_free_tier: платный ключ, но квота 50.
+        assert_eq!(info.is_free_tier, Some(false));
+
+        // used > limit (BYOK / освобождён от лимита) — remaining берётся из ответа.
+        let over = parse_key_info(
+            r#"{"data":{"free_model_daily_requests":{"used":1004,"limit":1000,"remaining":0}}}"#,
+        )
+        .expect("parsed");
+        let q = over.free_model_daily_requests.expect("квота");
+        assert_eq!(q.used, 1004);
+        assert_eq!(q.remaining, 0, "остаток — истина платформы, не limit-used");
     }
 
     #[test]
@@ -200,27 +258,6 @@ mod tests {
         assert_eq!(classify_openrouter(Some(429), "rate limited"), CheckVerdict::ValidLimited);
         assert_eq!(classify_openrouter(Some(500), "boom"), CheckVerdict::Unknown);
         assert_eq!(classify_openrouter(None, "сеть: timeout"), CheckVerdict::Unknown);
-    }
-
-    #[test]
-    fn free_usage_cap_from_tiers() {
-        let free = Some(OpenRouterKeyInfo { is_free_tier: Some(true), ..Default::default() });
-        let paid = Some(OpenRouterKeyInfo { is_free_tier: Some(false), ..Default::default() });
-        let unknown_tier = Some(OpenRouterKeyInfo { is_free_tier: None, ..Default::default() });
-        let no_info: Option<OpenRouterKeyInfo> = None;
-
-        assert_eq!(free_usage_cap(&[free.clone()]), Some(FREE_DAILY_CAP_FREE_KEY), "free — 50");
-        assert_eq!(free_usage_cap(&[free.clone(), free.clone()]), Some(FREE_DAILY_CAP_FREE_KEY));
-        assert_eq!(
-            free_usage_cap(&[paid.clone(), free.clone()]),
-            Some(FREE_DAILY_CAP_PAID_KEY),
-            "платный ключ поднимает кап до 1000"
-        );
-        assert_eq!(free_usage_cap(&[paid.clone()]), Some(FREE_DAILY_CAP_PAID_KEY));
-        assert_eq!(free_usage_cap(&[free.clone(), no_info.clone()]), None, "401 — тир неизвестен");
-        assert_eq!(free_usage_cap(&[free, unknown_tier]), None, "поле absent — тир неизвестен");
-        assert_eq!(free_usage_cap(&[no_info.clone(), no_info]), None);
-        assert_eq!(free_usage_cap(&[]), None, "пусто — неизвестно");
     }
 
     #[test]

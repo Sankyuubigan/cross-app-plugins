@@ -380,9 +380,8 @@ async function runOpenRouterCheck(id) {
       if (fu) {
         out.innerHTML +=
           `<div class="gw-check-model-title">Бесплатные запросы сегодня</div>` +
-          `<div class="gw-hint gw-check-detail">${esc(String(fu.count))} из ` +
-          `${fu.cap != null ? esc(String(fu.cap)) : 'лимит неизвестен'} ` +
-          `(${esc(fu.ymd)}). Счётчик видит только запросы через шлюз.</div>`;
+          `<div class="gw-hint gw-check-detail">Осталось ${esc(String(fu.remaining))} из ` +
+          `${esc(String(fu.limit))} · сброс в 00:00 UTC (${esc(fu.ymd)}).</div>`;
       }
     }
     const nValid = r.results.filter(x => x.verdict === 'valid').length;

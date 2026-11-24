@@ -1146,7 +1146,7 @@ async fn relay_echo(
     (
         StatusCode::OK,
         [(axum::http::header::CONTENT_TYPE, "application/json")],
-        r#"{"data":{"label":"my-key","is_free_tier":true,"usage":0.42,"usage_daily":0.03,"limit":10.0,"limit_remaining":9.97,"limit_reset":"daily"}}"#,
+        r#"{"data":{"label":"my-key","is_free_tier":true,"usage":0.42,"usage_daily":0.03,"limit":10.0,"limit_remaining":9.97,"limit_reset":"daily","free_model_daily_requests":{"used":12,"limit":50,"remaining":38}}}"#,
     )
         .into_response()
 }
@@ -1161,7 +1161,8 @@ async fn relay_echo_serve(echo: Arc<RelayEcho>) -> String {
 }
 
 /// Проверка ключей OpenRouter через релей: GET /key едет к эхо-релею с
-/// абсолютной целью и токеном слота, ответ спарсивается, кап free-тира — 50.
+/// абсолютной целью и токеном слота, ответ спарсивается, квота — из
+/// `free_model_daily_requests` (used 12 / limit 50 / remaining 38).
 /// Прямого запроса к openrouter.ai из теста быть не может (127.0.0.1-эхо) —
 /// любой уход «напрямую» не дал бы тесту пройти.
 #[tokio::test]
@@ -1212,12 +1213,13 @@ async fn openrouter_key_check_travels_through_relay_with_target_headers() {
     assert_eq!(info.limit_reset.as_deref(), Some("daily"));
     assert!(r0.detail.is_empty(), "JSON-тело валидного ответа в detail не нужно: {}", r0.detail);
 
-    // Сводка счётчика: чат-запросов не было — счёт 0; кап от free-тира — 50.
+    // Сводка квоты: точные данные платформы из ответа, не локальный счёт.
     let fu = summary.free_usage.as_ref().expect("free_usage только для OpenRouter");
     assert_eq!(fu.provider_id, "mock");
-    assert_eq!(fu.count, 0);
-    assert_eq!(fu.cap, Some(crate::openrouter_check::FREE_DAILY_CAP_FREE_KEY));
-    assert_eq!(fu.ymd, crate::free_usage::today_ymd());
+    assert_eq!(fu.used, 12);
+    assert_eq!(fu.limit, 50);
+    assert_eq!(fu.remaining, 38);
+    assert_eq!(fu.ymd, crate::openrouter_check::today_ymd());
     assert!(summary.via_relay);
 
     let _ = std::fs::remove_dir_all(&dir);

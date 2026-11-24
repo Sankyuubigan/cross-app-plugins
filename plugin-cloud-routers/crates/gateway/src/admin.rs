@@ -35,8 +35,8 @@ use cloud_routers_core::presets;
 use cloud_routers_core::store as core_store;
 
 use crate::app::AppState;
-use crate::free_usage::today_ymd;
 use crate::key_check;
+use crate::openrouter_check::today_ymd;
 use crate::logbuf::mask_secret;
 use crate::proxy;
 use crate::relay;
@@ -1337,9 +1337,8 @@ fn merge_hints(into: &mut Vec<(String, Vec<String>)>, hints: Vec<(String, Vec<St
 
 /// Сегодняшняя дата `ГГГГ-ММ-ДД` для `updated_at` каталога.
 ///
-/// Календарь шлюза — `crate::free_usage::today_ymd` (перенесён туда
-/// 27.10.26, когда счётчику бесплатных запросов понадобился тот же ключ
-/// дня; без chrono — см. комментарий там).
+/// Календарь шлюза — `crate::openrouter_check::today_ymd` (без chrono —
+/// см. комментарий там).
 
 /// Честная причина «неизвестный формат тела».
 ///

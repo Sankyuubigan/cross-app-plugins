@@ -389,17 +389,9 @@ async fn route_provider(
     // Тело запроса в дамп — один раз на запрос (первая попытка): между
     // попытками ключей тело не меняется, дублирование сделало бы файл враньём.
     let mut request_dumped = false;
-    // Запрос расходует дневную бесплатную квоту OpenRouter (`:free`-модель)?
-    // Предикат чистый, вычисляется один раз до цикла.
-    let count_free = crate::free_usage::counts_toward_free_limit(&provider, &upstream_model);
 
     for (key_id, api_key) in attempts {
         attempted.push(key_id.clone());
-        // OpenRouter засчитывает НЕУДАЧНЫЕ попытки тоже — инкремент до запроса,
-        // на каждую пару ключ/ретрай (одна точка, не рассыпать).
-        if count_free {
-            state.free_usage().increment(&provider_id);
-        }
 
         let up = match adapter.chat_request(
             &provider,
@@ -480,29 +472,6 @@ async fn route_provider(
             Some(kind) => {
                 // ── Отказ, который имеет смысл повторить ────────────────────
                 let retry_after = parse_retry_after(response.headers().get("retry-after").and_then(|v| v.to_str().ok()));
-                // Платформенный 429 — истина о расходе дневной квоты:
-                // синхронизируем счётчик заголовками (best-effort — заголовков
-                // нет, ничего не меняем: попытка уже посчитана инкрементом).
-                if count_free && status.as_u16() == 429 {
-                    let parse_num = |name: &str| {
-                        response
-                            .headers()
-                            .get(name)
-                            .and_then(|v| v.to_str().ok())
-                            .and_then(|v| v.trim().parse::<u64>().ok())
-                    };
-                    match (parse_num("x-ratelimit-limit"), parse_num("x-ratelimit-remaining")) {
-                        (Some(limit), Some(remaining)) => {
-                            state.free_usage().correct(&provider_id, limit, remaining);
-                        }
-                        _ => {
-                            state.events().warn(format!(
-                                "429 «{}»: заголовков X-RateLimit нет — счётчик бесплатных запросов оставлен как есть (инкремент)",
-                                provider_id
-                            ));
-                        }
-                    }
-                }
                 let detail = response.text().await.unwrap_or_default();
                 // Отказ ключа — тоже факт о провайдере: тело ответа (текст квоты,
                 // причина 401) в дампе, чтобы разбирать ротацию по файлам.
