@@ -16,6 +16,7 @@
 //! `Theme::update`. Всё это внутри [`setup_theme`]; хостам вручную не делать.
 
 pub mod card;
+pub mod checkbox;
 pub mod palette;
 pub mod shell;
 pub mod theme;
@@ -50,6 +51,7 @@ pub use about_updates_card::{
 };
 
 pub use card::AppCard;
+pub use checkbox::Checkbox;
 pub use gpui_kit::component::theme::ThemeMode;
 pub use shell::{AppShell, AppTab, window_options};
 pub use theme::setup_theme;
