@@ -14,6 +14,7 @@
 
 import {
   $, $$, state, api, toast, fail, busy, esc, plural, notifyHost, reportUiError,
+  copyToClipboard,
 } from './utils.js';
 // Циклический импорт безопасен: это function-декларации в providers.js,
 // к моменту любого вызова модуль с ними уже вычислен.
@@ -577,8 +578,8 @@ function bindLogPanel() {
 
 /** Скопировать видимый журнал в буфер обмена (по образцу <logs-panel>:
  *  «Копировать» копирует ВСЁ, что показано, а не только выделенное).
- *  Фолбэк на execCommand — для WebView, где Clipboard API может быть
- *  недоступен (http-страница без «secure context»). */
+ *  Сам буфер — `copyToClipboard` (utils.js): одна реализация с фолбэком на
+ *  execCommand на весь дашборд, здесь только текст и тост. */
 async function copyLog() {
   const text = state.events
     .map(e => {
@@ -590,23 +591,12 @@ async function copyLog() {
     })
     .join('\n');
   if (!text) { toast('Журнал пуст — копировать нечего'); return; }
-  try {
-    await navigator.clipboard.writeText(text);
-    toast(`Журнал скопирован (${state.events.length} строк)`);
-  } catch {
-    // Фолбэк: execCommand копирует через выделение textarea (работает и
-    // вне secure context, и в старых WebView).
-    const area = document.createElement('textarea');
-    area.value = text;
-    area.style.position = 'fixed';
-    area.style.opacity = '0';
-    document.body.appendChild(area);
-    area.select();
-    let ok = false;
-    try { ok = document.execCommand('copy'); } catch { /* нет execCommand */ }
-    document.body.removeChild(area);
-    toast(ok ? `Журнал скопирован (${state.events.length} строк)` : 'Не удалось скопировать (буфер обмена недоступен)', ok ? 'ok' : 'err');
-  }
+  const ok = await copyToClipboard(text);
+  toast(
+    ok ? `Журнал скопирован (${state.events.length} строк)`
+      : 'Не удалось скопировать (буфер обмена недоступен)',
+    ok ? 'ok' : 'err'
+  );
 }
 
 // ──────────────────────────────── вкладки ────────────────────────────────

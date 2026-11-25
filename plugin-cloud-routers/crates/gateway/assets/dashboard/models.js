@@ -18,9 +18,17 @@
 // Stale-выбор («пометить нерабочими»): модель, отмеченная юзером, но исчезнувшая
 // у апстрима, ОСТАЁТСЯ отмеченной в visible_models (чекбокса у неё нет — список
 // рисуется из p.models); когда модель вернётся, она снова видима сама.
+//
+// Копирование комбо-id (25.11.2026): клик по НАЗВАНИЮ модели кладёт в буфер
+// `провайдер/модель` — ровно ту строку, что понимает хост/IDE (разделитель —
+// первый `/`: id моделей реальных апстримов сам содержит слэши, id провайдера —
+// никогда). Галочка видимости переключается кликом по самому чекбоксу: у
+// <label> клик по названию по умолчанию активирует чекбокс, и обработчик
+// копирования это поведение ОТМЕНЯЕТ намеренно — иначе копирование молча
+// меняло бы выбор моделей.
 
 import {
-  $, $$, state, api, esc, plural, fail, busy, notifyHost,
+  $, $$, state, api, esc, plural, fail, busy, notifyHost, toast, copyToClipboard,
 } from './utils.js';
 // Циклический импорт безопасен: refreshAll — function-декларация в app.js,
 // к моменту любого вызова модуль с ней уже вычислен (паттерн combos.js).
@@ -69,12 +77,18 @@ function providerCard(p) {
   // namespace (server.rs) токенизирует класс-литералы по пробелам, голое слово
   // `total` внутри атрибута — ложный «нарушитель gw-».
   const warn = shown === total ? '' : ' gw-warn';
-  const items = p.models.map(m =>
-    `<label class="gw-inline gw-model-item" data-model="${esc(m)}" title="${esc(m)}">` +
-    `<input type="checkbox" data-model-toggle data-provider="${esc(p.id)}" data-model="${esc(m)}"${chosen.has(m) ? ' checked' : ''}>` +
-    `<span>${esc(m)}</span>` +
-    `</label>`
-  ).join('');
+  const items = p.models.map((m) => {
+    // Комбо-id — то, чем модель зовётся снаружи: `{provider_id}/{model_id}`.
+    // Та же строка уже показана в шапке карточки («В чате как»), поэтому в
+    // буфер уходит именно она, а не голый id модели.
+    const combo = `${p.id}/${m}`;
+    return (
+      `<label class="gw-inline gw-model-item" data-model="${esc(m)}">` +
+      `<input type="checkbox" data-model-toggle data-provider="${esc(p.id)}" data-model="${esc(m)}"${chosen.has(m) ? ' checked' : ''}>` +
+      `<span data-model-copy="${esc(combo)}" title="${esc(combo)} — клик, чтобы скопировать">${esc(m)}</span>` +
+      `</label>`
+    );
+  }).join('');
   return (
     `<div class="gw-card" data-models-provider="${esc(p.id)}">` +
     `<div class="gw-card-head">` +
@@ -139,6 +153,19 @@ function staleChosen(p) {
   return (p.visible_models || []).filter(m => !models.has(m));
 }
 
+/** Видимость из DOM: отмеченные галочки карточки (включая скрытые фильтром —
+ *  их состояние юзер не менял) + stale-выбор. Единственное место, где
+ *  visible_models пересобирается из чекбоксов: клик по галочке и булк-кнопки
+ *  идут одним путём, иначе «Показать все» и ручной клик разошлись бы. */
+function chosenFromDom(card, p) {
+  return [...new Set([
+    ...[...card.querySelectorAll('.gw-model-item input')]
+      .filter(x => x.checked)
+      .map(x => x.dataset.model),
+    ...staleChosen(p),
+  ])];
+}
+
 /** Клик по галочке: пересчитать visible_models провайдера из DOM карточки.
  *  Галочки — union DOM-состояния и stale-выбора: id, отмеченные ранее, но
  *  исчезнувшие у апстрима (чекбокса нет — список рисуется из p.models), не
@@ -148,13 +175,7 @@ function onModelToggle(input) {
   const p = state.config.providers.find(x => x.id === providerId);
   const card = input.closest('.gw-card');
   if (!p || !card) return;
-  const checked = [
-    ...card.querySelectorAll('.gw-model-item input')
-      .filter(x => x.checked)
-      .map(x => x.dataset.model),
-    ...staleChosen(p),
-  ];
-  p.visible_models = [...new Set(checked)];
+  p.visible_models = chosenFromDom(card, p);
   updateModelsBadge(providerId);
   scheduleSave(providerId);
   // Фильтр не пере-применяется: текст модели не менялся, совпадение с поиском
@@ -163,22 +184,33 @@ function onModelToggle(input) {
 
 /** «Показать все»/«Скрыть все»: одно атомарное действие с немедленным
  *  сохранением — отложенный PATCH отменяется, чтобы выбор не потерялся, если
- *  страницу закроют сразу после клика. Stale-выбор переживает оба действия:
- *  «показать все» его не трогает (он и так выбран), «скрыть все» прячет только
- *  то, что есть у апстрима сейчас. */
+ *  страницу закроют сразу после клика.
+ *
+ *  Кнопка работает по ТОМУ, ЧТО ВИДНО: модели, скрытые фильтром поиска, она
+ *  не трогает. Раньше действие игнорировало фильтр — при запросе, оставившем
+ *  три строки из ста, «Показать все» отмечало все сто (баг 25.11.2026).
+ *  Пустой запрос фильтр ничего не скрывает → прежнее поведение «все = все».
+ *  «Скрыть все» подчиняется тому же правилу: скрыть можно то, что показано.
+ *
+ *  Stale-выбор (модель ушла с апстрима, осталась отмеченной) переживает оба
+ *  действия: чекбокса у него нет, поэтому из DOM он не читается и приходит
+ *  из staleChosen внутри chosenFromDom. */
 async function bulkVisibility(providerId, hideAll, btn) {
   busy(btn, true);
   const p = state.config.providers.find(x => x.id === providerId);
   if (!p) { busy(btn, false); return; }
   clearTimeout(saveTimers.get(providerId));
   saveTimers.delete(providerId);
-  const stale = staleChosen(p);
-  p.visible_models = hideAll
-    ? stale
-    : [...new Set([...p.models, ...stale])];
   const card = $(`#models-list .gw-card[data-models-provider="${CSS.escape(providerId)}"]`);
   if (card) {
-    card.querySelectorAll('.gw-model-item input').forEach(x => { x.checked = !hideAll; });
+    card.querySelectorAll('.gw-model-item').forEach((item) => {
+      // Отсев скрытого фильтром — здесь единственное ветвление «что видно»;
+      // класс тот же, которым applyModelsFilter помечает несовпадения.
+      if (item.classList.contains('gw-filter-hidden')) return;
+      const input = item.querySelector('input[data-model-toggle]');
+      if (input) input.checked = !hideAll;
+    });
+    p.visible_models = chosenFromDom(card, p);
   }
   updateModelsBadge(providerId);
   try {
@@ -264,9 +296,34 @@ export function bindModelExtras() {
     }
   });
   list.addEventListener('click', (e) => {
+    // Копирование стоит ПЕРВЫМ: название модели живёт внутри <label>, и
+    // отменить активацию чекбокса нужно до разбора остальных кликов.
+    const nameEl = e.target.closest('[data-model-copy]');
+    if (nameEl) {
+      // Без этого клик по span активирует связанный чекбокс label'а —
+      // копирование переключало бы видимость модели.
+      e.preventDefault();
+      void copyModelId(nameEl);
+      return;
+    }
     const show = e.target.closest('[data-models-showall]');
     const hide = e.target.closest('[data-models-hideall]');
     if (show) void bulkVisibility(show.dataset.modelsShowall, false, show);
     else if (hide) void bulkVisibility(hide.dataset.modelsHideall, true, hide);
   });
+}
+
+/** Клик по названию модели: скопировать комбо-id `провайдер/модель`.
+ *
+ *  Копируется ровно то, что видно в title/шапке карточки — то, что хост и IDE
+ *  принимают как id модели. Тост честный: при отказе буфера (нет ни Clipboard
+ *  API, ни execCommand) пользователь видит ошибку, а не «скопировано». */
+async function copyModelId(el) {
+  const combo = el.dataset.modelCopy;
+  if (!combo) return;
+  const ok = await copyToClipboard(combo);
+  toast(
+    ok ? `Скопировано: ${combo}` : 'Не удалось скопировать (буфер обмена недоступен)',
+    ok ? 'ok' : 'err'
+  );
 }

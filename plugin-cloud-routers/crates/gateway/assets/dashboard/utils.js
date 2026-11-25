@@ -124,6 +124,34 @@ export function busy(selector, on) {
   el.classList.toggle('gw-busy', on);
 }
 
+/** Скопировать текст в буфер обмена; `true` — получилось, `false` — нет.
+ *
+ *  Единственная реализация в дашборде (журнал и вкладка «Модели» ею же
+ *  пользуются): страница отдаётся по http с локального шлюза и не всегда живёт
+ *  в «secure context», где существует `navigator.clipboard`, поэтому фолбэк на
+ *  `execCommand` (копирование через выделение textarea) — не перестраховка, а
+ *  рабочий путь в WebView хоста и в старой вкладке браузера.
+ *
+ *  Исключение не пробрасывается: вызывающий получает честный `false` и решает,
+ *  что сказать пользователю (молчаливой «скопировалось» без копии не бывает). */
+export async function copyToClipboard(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    const area = document.createElement('textarea');
+    area.value = text;
+    area.style.position = 'fixed';
+    area.style.opacity = '0';
+    document.body.appendChild(area);
+    area.select();
+    let ok = false;
+    try { ok = document.execCommand('copy'); } catch { /* нет execCommand */ }
+    document.body.removeChild(area);
+    return ok;
+  }
+}
+
 export function esc(s) {
   return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;')
     .replace(/>/g, '&gt;').replace(/"/g, '&quot;');

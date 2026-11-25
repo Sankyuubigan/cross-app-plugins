@@ -283,6 +283,19 @@ textarea { font-family: var(--mono); resize: vertical; }
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* Название модели — зона копирования комбо-id «провайдер/модель» (решение
+   владельца 25.11.26: клик по названию = копировать). Курсор `copy` — честная
+   подсказка, что клик по тексту НЕ переключает галочку видимости; span
+   растянут на всю ширину строки, поэтому свободного места справа, где клик
+   всё ещё тоглил бы чекбокс, нет. */
+.gw-model-item > span[data-model-copy] {
+  flex: 1 1 auto;
+  cursor: copy;
+}
+.gw-model-item > span[data-model-copy]:hover {
+  color: var(--primary);
+  text-decoration: underline dotted;
+}
 .gw-model-item.gw-filter-hidden { display: none; }
 
 /* ── Комбо-связки (gw-combo) ─────────────────────────────────────────── */
