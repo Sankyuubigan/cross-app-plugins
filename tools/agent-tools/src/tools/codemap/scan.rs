@@ -13,6 +13,9 @@
 //!   следующую же сборку и разросся.
 //! - `.gitignore` репозитория: пользователь уже решил, что не является частью
 //!   проекта. Повторное решение здесь было бы спором с ним без оснований.
+//! - Виртуальное окружение Python: опознаётся по маркер-файлу `pyvenv.cfg`,
+//!   а не по имени каталога. Иначе `env`/`virt_env`/`myenv` уходили бы в разбор
+//!   целиком (тысячи файлов зависимостей) — `map` вис на минуты.
 //! - Файлы крупнее [`MAX_FILE_BYTES`]: разбор минимификата на несколько
 //!   мегабайт съедает время агента, а карты из него всё равно не выйдет.
 //!
@@ -146,6 +149,17 @@ fn visit(dir: &Path, root: &Path, ignore: &mut GitIgnore, scan: &mut Scan) -> Re
         };
 
         if file_type.is_dir() {
+            // Виртуальное окружение Python носит произвольное имя (`env`,
+            // `virt_env`, …), поэтому список имён его не ловит. Единственный
+            // надёжный признак — маркер `pyvenv.cfg`, который создаёт любой
+            // `python -m venv`. Проверка идёт ПЕРВОЙ, до списка имён: иначе
+            // `.venv`/`venv` с маркером получали бы причину «артефакты сборки»,
+            // хотя это окружение, и самая частая причина пропуска не называлась
+            // бы. Здесь, а не в `skip_reason`: у того нет доступа к `Path`.
+            if path.join("pyvenv.cfg").is_file() {
+                scan.ignored.push(IgnoredDir { path: rel, reason: IgnoreReason::Venv });
+                continue;
+            }
             if let Some(reason) = skip_reason(&name, &rel, ignore) {
                 scan.ignored.push(IgnoredDir { path: rel, reason });
                 continue;
@@ -473,6 +487,80 @@ mod tests {
         assert!(
             scan.ignored.iter().any(|d| d.path == "tasks" && d.reason == IgnoreReason::GitIgnore),
             "каталог из .gitignore обязан быть виден с правильной причиной: {:?}",
+            scan.ignored
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// venv с нестандартным именем опознаётся по маркеру `pyvenv.cfg` и не
+    /// уходит в разбор: иначе `map` вис бы на тысячах файлов зависимостей.
+    #[test]
+    fn python_venv_is_skipped_by_marker_not_by_name() {
+        let root = temp_root("venv_marker");
+        // Имя намеренно нестандартное — в SKIP_DIRS такого нет.
+        write(&root, "virt_env/pyvenv.cfg", "home = /usr/bin\nversion = 3.12.0\n");
+        write(&root, "virt_env/lib/python3.12/site-packages/pkg/mod.py", "x = 1\n");
+        write(&root, "src/main.py", "print('hi')\n");
+
+        let scan = walk(&root).expect("обход");
+        // Каталог окружения не раскрыт и назван с правильной причиной.
+        assert!(
+            scan.ignored.iter().any(|d| d.path == "virt_env" && d.reason == IgnoreReason::Venv),
+            "venv обязан попасть в сводку с причиной Venv: {:?}",
+            scan.ignored
+        );
+        // Файлы зависимостей внутрь индекса не попали.
+        let paths: Vec<&str> = scan.files.iter().map(|f| f.rel_path.as_str()).collect();
+        assert_eq!(paths, vec!["src/main.py"], "ожидался только исходник проекта, получили {paths:?}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Обычный каталог без маркера раскрывается: детекция по факту, а не по имени.
+    #[test]
+    fn ordinary_directory_without_marker_is_expanded() {
+        let root = temp_root("no_marker");
+        write(&root, "virt_env/notes.txt", "not a venv\n");
+        write(&root, "virt_env/app.py", "x = 1\n");
+
+        let scan = walk(&root).expect("обход");
+        assert!(
+            !scan.ignored.iter().any(|d| d.path == "virt_env"),
+            "каталог без pyvenv.cfg раскрывается, а не игнорируется: {:?}",
+            scan.ignored
+        );
+        let paths: Vec<&str> = scan.files.iter().map(|f| f.rel_path.as_str()).collect();
+        assert_eq!(paths, vec!["virt_env/app.py", "virt_env/notes.txt"]);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Каталог с именем `venv` и маркером внутри — это окружение, а не просто
+    /// «артефакты сборки»: причина обязана называть факт. Проверка маркера идёт
+    /// до списка имён именно ради этого случая — `venv`/`.venv` самые частые.
+    #[test]
+    fn venv_named_directory_with_marker_is_reported_as_venv() {
+        let root = temp_root("venv_marker_name");
+        write(&root, "venv/pyvenv.cfg", "home = /usr/bin\n");
+        write(&root, "venv/lib/dep.py", "x = 1\n");
+        write(&root, "src/app.py", "x = 2\n");
+        let scan = walk(&root).expect("обход");
+        assert!(
+            scan.ignored.iter().any(|d| d.path == "venv" && d.reason == IgnoreReason::Venv),
+            "каталог с маркером обязан иметь причину Venv, а не Build: {:?}",
+            scan.ignored
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Регрессия: `venv` без маркера ведёт себя как раньше — пропускается по
+    /// имени (Build). Маркер не обязателен, чтобы не раскрыть старый каталог.
+    #[test]
+    fn bare_venv_name_without_marker_keeps_old_behaviour() {
+        let root = temp_root("venv_nomarker");
+        write(&root, "venv/lib.py", "x = 1\n");
+        let scan = walk(&root).expect("обход");
+        assert!(
+            scan.ignored.iter().any(|d| d.path == "venv" && d.reason == IgnoreReason::Build),
+            "`venv` без маркера пропускается по имени как артефакт: {:?}",
             scan.ignored
         );
         let _ = fs::remove_dir_all(&root);

@@ -22,7 +22,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::tools::codemap::model::{FileEntry, Index, FORMAT_VERSION};
+use crate::tools::codemap::model::{FileEntry, IgnoreReason, Index, FORMAT_VERSION};
 
 use super::flat_lang::FlatChunk;
 use super::lang::Lang;
@@ -279,7 +279,7 @@ fn build_from_old(
 pub fn refresh(root: &Path) -> Result<Index, String> {
     let scan = scan::walk(root)?;
     match load(root)? {
-        Some(index) if is_fresh(&index, &scan.files) => Ok(index),
+        Some(index) if is_fresh(&index, &scan) => Ok(index),
         _ => {
             let (index, _) = build(root, scan)?;
             save(root, &index)?;
@@ -314,8 +314,14 @@ pub fn compute_only(root: &Path) -> Result<Index, String> {
 /// Сравниваются множество путей и `mtime` каждого файла. Одного числа файлов
 /// мало: файл мог быть удалён, а другой добавлен, и количество бы совпало —
 /// проверка по `mtime` такой случай ловит, потому что нового пути в кеше нет.
-fn is_fresh(index: &Index, scanned: &[FileEntry]) -> bool {
-    if index.files.len() != scanned.len() {
+///
+/// Сводка [`Index::ignored`] сверяется тоже: она часть ответа агента («что
+/// инструмент не смотрел»), а не украшение. Без этой сверки появление venv
+/// (`pyvenv.cfg` — файл ВНУТРИ пропущенного каталога, сам каталог в обход не
+/// попадает) оставляло бы индекс «свежим», и карта продолжала бы молчать о
+/// новом пропуске — то есть утверждала бы неправду о проекте.
+fn is_fresh(index: &Index, scan: &scan::Scan) -> bool {
+    if index.files.len() != scan.files.len() || index.ignored.len() != scan.ignored.len() {
         return false;
     }
     let cached: std::collections::HashMap<&str, u64> = index
@@ -323,9 +329,26 @@ fn is_fresh(index: &Index, scanned: &[FileEntry]) -> bool {
         .iter()
         .map(|f| (f.rel_path.as_str(), f.mtime_secs))
         .collect();
-    scanned
+    if !scan
+        .files
         .iter()
         .all(|f| cached.get(f.rel_path.as_str()) == Some(&f.mtime_secs))
+    {
+        return false;
+    }
+    // Порядок в обходе не гарантирован (порядок файловой системы), а `walk`
+    // сортирует `ignored` по пути — сравниваем как множества пар.
+    let cached_dirs: std::collections::HashSet<(&str, IgnoreReason)> = index
+        .ignored
+        .iter()
+        .map(|d| (d.path.as_str(), d.reason))
+        .collect();
+    let scanned_dirs: std::collections::HashSet<(&str, IgnoreReason)> = scan
+        .ignored
+        .iter()
+        .map(|d| (d.path.as_str(), d.reason))
+        .collect();
+    cached_dirs == scanned_dirs
 }
 
 /// Теги старого индекса, сгруппированные по файлу.
@@ -558,6 +581,62 @@ mod tests {
         assert_eq!(stats.reused, 1, "неизменившийся файл обязан прийти из кеша");
         assert_eq!(stats.parsed, 0, "перечитывать неизменившееся — значит читать впустую");
         assert!(rebuilt.tags.iter().any(|t| t.name == "alpha"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Сводка `ignored` — часть ответа агенту, поэтому появление venv обязано
+    /// пересобрать индекс, даже когда ни один индексированный файл не изменился.
+    ///
+    /// Регрессия: `pyvenv.cfg` лежит ВНУТРИ пропущенного каталога, в обход файлов
+    /// он не попадает вовсе — сверка только по `files` признавала индекс свежим,
+    /// и карта продолжала молчать о новом пропуске.
+    #[test]
+    fn refresh_notices_a_new_ignored_directory() {
+        let root = temp_root("ignored_appears");
+        fs::create_dir_all(root.join("src")).expect("каталог");
+        fs::write(root.join("src/app.py"), "def main():\n    return 1\n").expect("файл");
+        let first = refresh(&root).expect("первый refresh");
+        assert!(first.ignored.is_empty(), "пропусков ещё нет: {:?}", first.ignored);
+
+        // Окружение появляется после сборки индекса.
+        fs::create_dir_all(root.join("myenv/lib")).expect("каталог окружения");
+        fs::write(root.join("myenv/pyvenv.cfg"), "home = /usr/bin\n").expect("маркер");
+        fs::write(root.join("myenv/lib/dep.py"), "x = 1\n").expect("файл зависимости");
+
+        let healed = refresh(&root).expect("второй refresh");
+        assert!(
+            healed
+                .ignored
+                .iter()
+                .any(|d| d.path == "myenv" && d.reason == IgnoreReason::Venv),
+            "новый venv обязан появиться в сводке: {:?}",
+            healed.ignored
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Обратный случай: каталог перестал быть venv (маркер удалён) — запись о
+    /// пропуске обязана исчезнуть, иначе карта называла бы несуществующий пропуск.
+    #[test]
+    fn refresh_drops_an_ignored_directory_that_is_no_longer_skipped() {
+        let root = temp_root("ignored_disappears");
+        fs::create_dir_all(root.join("myenv/lib")).expect("каталог окружения");
+        fs::write(root.join("myenv/pyvenv.cfg"), "home = /usr/bin\n").expect("маркер");
+        fs::write(root.join("myenv/lib/dep.py"), "x = 1\n").expect("файл");
+        let first = refresh(&root).expect("первый refresh");
+        assert!(
+            first.ignored.iter().any(|d| d.path == "myenv"),
+            "venv обязан быть пропущен: {:?}",
+            first.ignored
+        );
+
+        fs::remove_file(root.join("myenv/pyvenv.cfg")).expect("убрать маркер");
+        let healed = refresh(&root).expect("второй refresh");
+        assert!(
+            !healed.ignored.iter().any(|d| d.path == "myenv"),
+            "каталог без маркера раскрывается и не значится пропущенным: {:?}",
+            healed.ignored
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
