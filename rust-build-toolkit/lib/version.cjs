@@ -80,6 +80,32 @@ function readVersion(cfg) {
     return `${m[1]}.${m[2]}.${m[3]}`;
 }
 
+// Версия [package] из Cargo.toml крейта — БЕЗ учёта kind. Нужна там, где
+// tauri.conf.json и Cargo.toml обязаны сходиться (SSOT-страж версионных
+// ресурсов: установщик раскладывает resources/<tauri-версия>/, а exe ищет
+// resources/<CARGO_PKG_VERSION>/ — расхождение даёт пустой каталог агентов
+// у пользователя).
+function readCargoVersion(crateDir) {
+    const cargoPath = path.join(crateDir, 'Cargo.toml');
+    const text = fs.readFileSync(cargoPath, 'utf8');
+    const pkgIdx = text.indexOf('[package]');
+    const scope = pkgIdx === -1 ? text : text.slice(pkgIdx);
+    if (CARGO_WORKSPACE_VERSION_RE.test(scope)) {
+        const wsDir = workspaceRootOf(crateDir);
+        if (!wsDir) {
+            throw new Error(`version.workspace = true, но Cargo.toml с [workspace.package] не найден вверх от ${crateDir}`);
+        }
+        const wsText = fs.readFileSync(path.join(wsDir, 'Cargo.toml'), 'utf8');
+        const wsIdx = wsText.indexOf('[workspace.package]');
+        const m = wsText.slice(wsIdx).match(CARGO_VERSION_RE);
+        if (!m) throw new Error(`Версия не найдена в [workspace.package] (${path.join(wsDir, 'Cargo.toml')})`);
+        return `${m[1]}.${m[2]}.${m[3]}`;
+    }
+    const m = scope.match(CARGO_VERSION_RE);
+    if (!m) throw new Error(`Версия не найдена в [package] (${cargoPath})`);
+    return `${m[1]}.${m[2]}.${m[3]}`;
+}
+
 function readLatestVersion(projectRoot) {
     const latestPath = path.join(projectRoot, 'latest.json');
     if (!fs.existsSync(latestPath)) return null;
@@ -228,4 +254,4 @@ function bumpVersion(cfg, opts = {}) {
     return version;
 }
 
-module.exports = { readVersion, bumpVersion, writeVersionToConf, writeVersionToCargo, cargoVersionFilePath };
+module.exports = { readVersion, readCargoVersion, bumpVersion, writeVersionToConf, writeVersionToCargo, cargoVersionFilePath };

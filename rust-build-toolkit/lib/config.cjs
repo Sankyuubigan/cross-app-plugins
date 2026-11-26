@@ -183,6 +183,16 @@ function loadProjectConfig(projectArg, cwd) {
 
         npmInstallArgs: Array.isArray(cfgRaw.npmInstallArgs) ? cfgRaw.npmInstallArgs : ['--legacy-peer-deps'],
         syncDirs: Array.isArray(cfgRaw.syncDirs) ? cfgRaw.syncDirs : [],
+
+        // Версионные ресурсы (opt-in, 26.11.2026): бандлимые ресурсы Tauri
+        // кладутся не в корень $INSTDIR, а в resources/<version>/. Причина —
+        // NSIS /UPDATE не удаляет файлы, которых нет в текущей сборке: призраки
+        // прошлых версий остаются в $INSTDIR навсегда и участвуют в резолве
+        // (инцидент: старый shadow_worker из archive/ отвечал в чате вместо
+        // актуального frontend/). rootResources — source-ключи bundle.resources,
+        // которые остаются в корне (redist/, gateway exe рядом с хостом).
+        versionedResources: cfgRaw.versionedResources === true,
+        rootResources: Array.isArray(cfgRaw.rootResources) ? cfgRaw.rootResources : [],
         devWindow: cfgRaw.devWindow || null,
 
         // Временная папка сборки. null → <projectRoot>/temp/buildtmp (см.
