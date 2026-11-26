@@ -238,6 +238,17 @@ pub struct ProviderConfig {
     /// его при удалении из структуры — и выбор юзера пропал бы безмолвно).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hidden_models: Vec<String>,
+    /// Коды ошибок, которые этот провайдер использует для «занято/перегрузка».
+    ///
+    /// Дополняет встроенную таблицу [`crate::keys::BUSY_PROVIDER_CODES`], не
+    /// заменяя её: апстримы называют одну и ту же ошибку по-разному, и новый
+    /// вариант не должен требовать пересборки шлюза. Код сравнивается без
+    /// учёта регистра, пустые строки игнорируются.
+    ///
+    /// Пусто (обычный случай и все старые конфиги) — работает только встроенный
+    /// список. См. [`crate::keys::busy_kind_for_code`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub busy_error_codes: Vec<String>,
 }
 
 impl Default for ProviderConfig {
@@ -255,6 +266,7 @@ impl Default for ProviderConfig {
             models: Vec::new(),
             visible_models: Vec::new(),
             hidden_models: Vec::new(),
+            busy_error_codes: Vec::new(),
         }
     }
 }

@@ -40,6 +40,18 @@ pub enum FailureKind {
     Server,
     /// Таймаут/обрыв соединения.
     Transport,
+    /// Апстрим «занят»: перегрузка/очередь, а не лимит и не поломка.
+    ///
+    /// Приходит двумя путями: HTTP `529` и — чаще — **внутри SSE-потока при
+    /// HTTP 200** (`data: {"error":{...,"code":"upstream_busy"}}`). Второй путь
+    /// HTTP-статусом не виден, поэтому классифицируется отдельно, по коду
+    /// ошибки в кадре (см. [`busy_kind_for_code`]).
+    ///
+    /// Отличие от [`FailureKind::RateLimit`] принципиально: ключ не исчерпал
+    /// лимит, его нельзя «полечить» долгим кулдауном — занят сам апстрим, и
+    /// через пару секунд он с большой вероятностью свободен. Отличие от
+    /// [`FailureKind::Server`]: это не отказ, а просьба подождать.
+    Busy,
 }
 
 /// Кулдаун для `401/403`. Ключ дополнительно выключается на диске, поэтому
@@ -50,13 +62,69 @@ pub const AUTH_COOLDOWN: Duration = Duration::from_secs(3600);
 pub const TRANSIENT_COOLDOWN: Duration = Duration::from_secs(15);
 /// Кулдаун для `429` без заголовка `Retry-After`.
 pub const DEFAULT_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(60);
+/// Кулдаун для [`FailureKind::Busy`].
+///
+/// Короткий намеренно: «занято» — это очередь, а не лимит. Пять секунд дают
+/// соседним ключам шанс, но не превращают провайдера в «выключенного на
+/// минуту» из-за одной перегрузки. Значение меньше `TRANSIENT_COOLDOWN`:
+/// перегрузка проходит быстрее, чем чинится 5xx.
+pub const BUSY_COOLDOWN: Duration = Duration::from_secs(5);
+
+/// Коды ошибок в теле ответа, означающие «апстрим занят».
+///
+/// ## Зачем таблица, а не `if` на провайдера
+///
+/// Один и тот же смысл («попробуй позже») разные апстримы называют по-разному,
+/// и набор меняется без нашего участия. Список — **данные**: новое имя
+/// добавляется одной строкой здесь, без правок в `proxy.rs`. Ни один код не
+/// привязан к конкретному провайдеру: механизм одинаков для всех.
+///
+/// ## Почему эти имена
+///
+/// - `upstream_busy` — 100milionseek (подтверждено дампами шлюза 26.11.2026:
+///   HTTP 200 + `data: {"error":{...,"code":"upstream_busy"}}`);
+/// - `service_busy` / `upstream_overloaded` — типовые варианты той же ошибки
+///   у OpenAI-совместимых прокси;
+/// - `overloaded_error` / `engine_overloaded_error` — формы Anthropic-style,
+///   уже известные клиентам ZCode как ретраибельные.
+pub const BUSY_PROVIDER_CODES: &[&str] = &[
+    "upstream_busy",
+    "service_busy",
+    "upstream_overloaded",
+    "overloaded_error",
+    "engine_overloaded_error",
+];
+
+/// Классифицировать код ошибки из тела ответа как «апстрим занят».
+///
+/// Сравнение без учёта регистра и краевых пробелов: апстримы пишут
+/// `upstream_busy`, `UPSTREAM_BUSY`, ` upstream_busy `. `None` — код не про
+/// занятость (или кода нет), вызывающий решает сам.
+///
+/// `extra` — коды, добавленные пользователем в конфиге провайдера
+/// ([`crate::config::ProviderConfig::busy_error_codes`]): расширение без
+/// пересборки шлюза. Пустой список — обычный случай.
+pub fn busy_kind_for_code(code: &str, extra: &[String]) -> Option<FailureKind> {
+    let code = code.trim();
+    if code.is_empty() {
+        return None;
+    }
+    let known = BUSY_PROVIDER_CODES.iter().any(|c| c.eq_ignore_ascii_case(code))
+        || extra.iter().any(|c| c.trim().eq_ignore_ascii_case(code));
+    known.then_some(FailureKind::Busy)
+}
 
 impl FailureKind {
     /// Классифицировать HTTP-статус ответа апстрима.
+    ///
+    /// `529` — «апстрим перегружен» (нестандартный, но используемый: так
+    /// отвечает Anthropic и совместимые). Ошибка «занято» чаще приходит
+    /// внутри SSE при `200` — см. [`FailureKind::Busy`] и [`busy_kind_for_code`].
     pub fn from_status(status: u16) -> Option<FailureKind> {
         match status {
             401 | 403 => Some(FailureKind::Auth),
             429 => Some(FailureKind::RateLimit),
+            529 => Some(FailureKind::Busy),
             500..=599 => Some(FailureKind::Server),
             _ => None,
         }
@@ -71,6 +139,7 @@ impl FailureKind {
             FailureKind::Auth => AUTH_COOLDOWN,
             FailureKind::RateLimit => retry_after.unwrap_or(DEFAULT_RATE_LIMIT_COOLDOWN),
             FailureKind::Server | FailureKind::Transport => TRANSIENT_COOLDOWN,
+            FailureKind::Busy => BUSY_COOLDOWN,
         }
     }
 
@@ -306,6 +375,57 @@ mod tests {
         assert!(!FailureKind::RateLimit.deactivates_key());
         assert!(!FailureKind::Server.deactivates_key());
         assert!(!FailureKind::Transport.deactivates_key());
+        assert!(!FailureKind::Busy.deactivates_key());
+    }
+
+    #[test]
+    fn busy_status_and_cooldown() {
+        // 529 — единственный HTTP-статус, означающий «занято».
+        assert_eq!(FailureKind::from_status(529), Some(FailureKind::Busy));
+        // Кулдаун короткий и Retry-After его не удлиняет: занятость проходит сама.
+        assert_eq!(FailureKind::Busy.cooldown(None), BUSY_COOLDOWN);
+        assert_eq!(FailureKind::Busy.cooldown(Some(Duration::from_secs(600))), BUSY_COOLDOWN);
+        // Короче, чем у 5xx: очередь рассасывается быстрее, чем чинится поломка.
+        assert!(BUSY_COOLDOWN < TRANSIENT_COOLDOWN);
+    }
+
+    #[test]
+    fn busy_codes_are_recognised_case_insensitively() {
+        for code in BUSY_PROVIDER_CODES {
+            assert_eq!(busy_kind_for_code(code, &[]), Some(FailureKind::Busy), "{code}");
+            assert_eq!(
+                busy_kind_for_code(&code.to_uppercase(), &[]),
+                Some(FailureKind::Busy),
+                "верхний регистр {code}"
+            );
+            assert_eq!(
+                busy_kind_for_code(&format!("  {code}  "), &[]),
+                Some(FailureKind::Busy),
+                "краевые пробелы {code}"
+            );
+        }
+        // Живой код из дампов 26.11.2026 обязан быть в таблице.
+        assert_eq!(busy_kind_for_code("upstream_busy", &[]), Some(FailureKind::Busy));
+    }
+
+    #[test]
+    fn unknown_and_empty_codes_are_not_busy() {
+        assert_eq!(busy_kind_for_code("", &[]), None);
+        assert_eq!(busy_kind_for_code("   ", &[]), None);
+        assert_eq!(busy_kind_for_code("rate_limit_exceeded", &[]), None);
+        assert_eq!(busy_kind_for_code("insufficient_quota", &[]), None);
+    }
+
+    #[test]
+    fn provider_configured_codes_extend_the_table() {
+        // Расширение без пересборки: код, которого нет в таблице, приходит из конфига.
+        let extra = vec!["custom_busy".to_string(), "  also_busy  ".to_string()];
+        assert_eq!(busy_kind_for_code("custom_busy", &extra), Some(FailureKind::Busy));
+        assert_eq!(busy_kind_for_code("ALSO_BUSY", &extra), Some(FailureKind::Busy));
+        // Таблица при этом не «забывается»: конфиг дополняет, а не заменяет.
+        assert_eq!(busy_kind_for_code("upstream_busy", &extra), Some(FailureKind::Busy));
+        // Пустые строки в конфиге не делают «занятым» всё подряд.
+        assert_eq!(busy_kind_for_code("", &["".to_string()]), None);
     }
 
     #[test]

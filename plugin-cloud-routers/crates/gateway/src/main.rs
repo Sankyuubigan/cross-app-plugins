@@ -41,6 +41,7 @@ mod relay;
 mod relay_cf;
 mod respawn;
 mod server;
+mod streamprobe;
 mod upstream;
 
 #[cfg(test)]

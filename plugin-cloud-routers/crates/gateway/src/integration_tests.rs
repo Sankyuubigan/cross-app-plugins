@@ -944,6 +944,300 @@ async fn long_stream_survives_without_total_request_timeout() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// ───────────────── ошибка «занято» внутри SSE-потока (26.11.2026) ─────────────────
+
+/// SSE-поток с кадром-ошибкой «апстрим занят» — ровно так отвечает
+/// 100milionseek (подтверждено дампом шлюза 26.11.2026): HTTP 200,
+/// `text/event-stream`, ошибка внутри потока.
+fn busy_sse_behavior() -> MockBehavior {
+    MockBehavior {
+        chat_status: 200,
+        chat_content_type: "text/event-stream".into(),
+        chat_body: concat!(
+            ": waiting for the model\n\n",
+            "data: {\"error\":{\"message\":\"The service is busy right now. Please try again in a moment.\",",
+            "\"type\":\"server_error\",\"code\":\"upstream_busy\"}}\n\n"
+        )
+        .as_bytes()
+        .to_vec(),
+        models_body: models_body_json(),
+        ..Default::default()
+    }
+}
+
+/// Здоровый SSE-поток с одним токеном и завершением.
+fn ok_sse_behavior() -> MockBehavior {
+    MockBehavior {
+        chat_status: 200,
+        chat_content_type: "text/event-stream".into(),
+        chat_body: concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n",
+            "data: [DONE]\n\n"
+        )
+        .as_bytes()
+        .to_vec(),
+        models_body: models_body_json(),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn busy_inside_stream_fails_over_to_next_key() {
+    // Ключевой тест механизма: апстрим ответил HTTP 200, но внутри потока
+    // сказал «занят». Шлюз обязан не отдать это клиенту, а перейти на
+    // следующий ключ.
+    let (base, mock) = start_mock_with(ok_sse_behavior(), busy_sse_behavior(), 1).await;
+    let (state, dir) = state_for(&base, vec![key("k1", "sk-1", true), key("k2", "sk-2", true)]);
+
+    let r = post_chat(
+        state,
+        serde_json::json!({"model":"mock/m1","messages":[],"stream":true}),
+    )
+    .await;
+
+    assert_eq!(r.status(), StatusCode::OK, "клиент должен увидеть успех второго ключа");
+    let text = body_string(r).await;
+    assert!(text.contains("\"ok\""), "контент второго ключа обязан дойти: {text}");
+    assert!(
+        !text.contains("upstream_busy"),
+        "кадр-ошибка первого ключа не должен уйти клиенту: {text}"
+    );
+
+    let auths = mock.auths();
+    assert_eq!(auths.len(), 2, "должны были попробоваться оба ключа: {auths:?}");
+    assert_eq!(auths[0], "Bearer sk-1");
+    assert_eq!(auths[1], "Bearer sk-2");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn all_keys_busy_returns_429_with_original_code() {
+    // Все ключи заняты → клиент получает честный 429: его ретраят все IDE
+    // (и ZCode — без патча бандла). Исходный код апстрима сохраняется.
+    let (base, mock) = start_mock(busy_sse_behavior()).await;
+    let (state, dir) = state_for(&base, vec![key("k1", "sk-1", true), key("k2", "sk-2", true)]);
+
+    let r = post_chat(
+        state,
+        serde_json::json!({"model":"mock/m1","messages":[],"stream":true}),
+    )
+    .await;
+
+    assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS, "наружу обязан быть 429");
+    let text = body_string(r).await;
+    assert!(text.contains("rate_limit_error"), "тип ошибки OpenAI-формы: {text}");
+    assert!(text.contains("upstream_busy"), "исходный код не теряется: {text}");
+    assert!(text.contains("The service is busy"), "текст апстрима сохранён: {text}");
+    assert_eq!(mock.chat_count(), 2, "оба ключа должны были попробоваться");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn busy_key_is_not_deactivated_and_gets_short_cooldown() {
+    // «Занято» — не вина ключа: выключать его на диске нельзя, иначе одна
+    // перегрузка провайдера «сожгла» бы все ключи пользователя.
+    let (base, _mock) = start_mock(busy_sse_behavior()).await;
+    let (state, dir) = state_for(&base, vec![key("k1", "sk-1", true)]);
+
+    let r = post_chat(
+        state.clone(),
+        serde_json::json!({"model":"mock/m1","messages":[],"stream":true}),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    let on_disk = cloud_routers_core::load_config(&dir);
+    assert!(
+        on_disk.providers[0].keys[0].is_active,
+        "ключ обязан остаться включённым"
+    );
+    assert!(
+        !state.rotation().is_available("mock", "k1"),
+        "ключ должен быть в кулдауне"
+    );
+    let remaining = state
+        .rotation()
+        .cooldown_remaining("mock", "k1")
+        .expect("кулдаун выставлен");
+    assert!(
+        remaining <= std::time::Duration::from_secs(5),
+        "кулдаун «занято» короткий, а не 15/60 с: {remaining:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn healthy_stream_passes_through_probe_unchanged() {
+    // Проба не имеет права ни задержать, ни испортить здоровый поток:
+    // байты доходят те же, в том же порядке, с тем же content-type.
+    let (base, _mock) = start_mock(MockBehavior {
+        chat_chunk_delay_ms: 20,
+        ..ok_sse_behavior()
+    })
+    .await;
+    let (state, dir) = state_for(&base, vec![key("k1", "sk-1", true)]);
+
+    let r = post_chat(
+        state,
+        serde_json::json!({"model":"mock/m1","messages":[],"stream":true}),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::OK);
+    assert_eq!(
+        r.headers().get(axum::http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+        Some("text/event-stream")
+    );
+    assert!(
+        !r.headers().contains_key(axum::http::header::CONTENT_LENGTH),
+        "у потока не может быть content-length"
+    );
+    let text = body_string(r).await;
+    assert!(text.contains("\"ok\""), "{text}");
+    assert!(text.contains("[DONE]"), "маркер завершения обязан дойти: {text}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn non_busy_stream_error_is_passed_through() {
+    // Незнакомый код в потоке — не наш случай: поведение прежнее, клиент
+    // получает поток как есть (шлюз не придумывает за апстрима).
+    let (base, mock) = start_mock(MockBehavior {
+        chat_status: 200,
+        chat_content_type: "text/event-stream".into(),
+        chat_body: concat!(
+            "data: {\"error\":{\"message\":\"some vendor thing\",\"code\":\"vendor_specific\"}}\n\n",
+            "data: [DONE]\n\n"
+        )
+        .as_bytes()
+        .to_vec(),
+        models_body: models_body_json(),
+        ..Default::default()
+    })
+    .await;
+    let (state, dir) = state_for(&base, vec![key("k1", "sk-1", true), key("k2", "sk-2", true)]);
+
+    let r = post_chat(
+        state,
+        serde_json::json!({"model":"mock/m1","messages":[],"stream":true}),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::OK, "незнакомый код не превращается в 429");
+    let text = body_string(r).await;
+    assert!(text.contains("vendor_specific"), "поток отдан как есть: {text}");
+    assert_eq!(mock.chat_count(), 1, "ротации по незнакомому коду нет");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn non_stream_json_is_untouched_by_probe() {
+    // Нестримовый ответ проба не трогает вообще: это другой путь.
+    let (base, mock) = start_mock(MockBehavior {
+        chat_status: 200,
+        chat_content_type: "application/json".into(),
+        chat_body: br#"{"ok":true}"#.to_vec(),
+        models_body: models_body_json(),
+        ..Default::default()
+    })
+    .await;
+    let (state, dir) = state_for(&base, vec![key("k1", "sk-1", true)]);
+
+    let r = post_chat(state, serde_json::json!({"model":"mock/m1","messages":[]})).await;
+    assert_eq!(r.status(), StatusCode::OK);
+    assert_eq!(body_string(r).await, r#"{"ok":true}"#);
+    assert_eq!(mock.chat_count(), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn busy_status_with_busy_code_is_treated_as_busy_not_server_error() {
+    // Живой случай 100milionseek (26.11.2026): тот же смысл приходит и обычным
+    // статусом 503 с телом `code=upstream_busy`. Это «занято», а не поломка:
+    // короткий кулдаун и 429 наружу, чтобы клиент ретраил штатно.
+    let (base, mock) = start_mock_with(
+        ok_sse_behavior(),
+        MockBehavior {
+            chat_status: 503,
+            chat_content_type: "application/json".into(),
+            chat_body: concat!(
+                r#"{"error":{"code":"upstream_busy","message":"The service is busy right now.","#,
+                r#""type":"server_error"}}"#
+            )
+            .as_bytes()
+            .to_vec(),
+            models_body: models_body_json(),
+            ..Default::default()
+        },
+        1,
+    )
+    .await;
+    let (state, dir) = state_for(&base, vec![key("k1", "sk-1", true), key("k2", "sk-2", true)]);
+
+    let r = post_chat(
+        state.clone(),
+        serde_json::json!({"model":"mock/m1","messages":[],"stream":true}),
+    )
+    .await;
+
+    assert_eq!(r.status(), StatusCode::OK, "второй ключ отдал поток");
+    assert_eq!(mock.chat_count(), 2, "503 с busy-кодом должен ротировать ключ");
+    // Кулдаун короткий (5 с), а не 15 с как у обычного 5xx.
+    let remaining = state
+        .rotation()
+        .cooldown_remaining("mock", "k1")
+        .expect("кулдаун выставлен");
+    assert!(
+        remaining <= std::time::Duration::from_secs(5),
+        "кулдаун busy обязан быть коротким: {remaining:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn busy_status_on_all_keys_returns_429_not_503() {
+    let (base, _mock) = start_mock(MockBehavior {
+        chat_status: 503,
+        chat_content_type: "application/json".into(),
+        chat_body: br#"{"error":{"code":"upstream_busy","message":"The service is busy right now.","type":"server_error"}}"#.to_vec(),
+        models_body: models_body_json(),
+        ..Default::default()
+    })
+    .await;
+    let (state, dir) = state_for(&base, vec![key("k1", "sk-1", true)]);
+
+    let r = post_chat(state, serde_json::json!({"model":"mock/m1","messages":[],"stream":true})).await;
+    assert_eq!(
+        r.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "наружу 429, а не 503: клиент обязан понять, что это ретраибельно"
+    );
+    let text = body_string(r).await;
+    assert!(text.contains("upstream_busy"), "код апстрима сохранён: {text}");
+    assert!(text.contains("rate_limit_error"), "тип OpenAI-формы: {text}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn plain_503_without_busy_code_stays_server_error() {
+    // Обычный 5xx без busy-кода не должен притворяться «занято»: иначе любая
+    // поломка провайдера получила бы 5-секундный кулдаун и бесконечные ретраи.
+    let (base, mock) = start_mock(MockBehavior {
+        chat_status: 503,
+        chat_content_type: "application/json".into(),
+        chat_body: br#"{"error":{"message":"upstream exploded","type":"api_error"}}"#.to_vec(),
+        models_body: models_body_json(),
+        ..Default::default()
+    })
+    .await;
+    let (state, dir) = state_for(&base, vec![key("k1", "sk-1", true)]);
+
+    let r = post_chat(state, serde_json::json!({"model":"mock/m1","messages":[]})).await;
+    assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE, "статус апстрима сохранён");
+    let text = body_string(r).await;
+    assert!(text.contains("api_error"), "тип остался серверным: {text}");
+    assert_eq!(mock.chat_count(), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ────────────────────────────── опрос моделей ──────────────────────────────
 
 #[tokio::test]
@@ -1361,6 +1655,8 @@ async fn body_dump_captures_streamed_response() {
     assert_eq!(recs[1]["stream"], true);
     assert_eq!(recs[1]["completed"], true, "поток дочитан — дамп помечен как полный");
     assert_eq!(recs[1]["body"], String::from_utf8_lossy(&sse).as_ref(), "тело потока сохранено целиком");
-    assert!(recs[1]["dur_ms"].as_u64().expect("dur_ms") > 0);
+    // Длительность — факт, а не гарантия: локальный мок отвечает быстрее
+    // миллисекунды, и честное значение здесь 0. Проверяем, что поле записано.
+    assert!(recs[1]["dur_ms"].is_u64(), "dur_ms обязан быть в записи: {:?}", recs[1]);
     let _ = std::fs::remove_dir_all(&dir);
 }

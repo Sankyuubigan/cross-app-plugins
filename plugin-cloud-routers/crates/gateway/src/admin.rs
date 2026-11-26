@@ -580,6 +580,7 @@ async fn add_provider(State(state): State<AppState>, Json(body): Json<NewProvide
         models: Vec::new(),
         visible_models: Vec::new(),
         hidden_models: Vec::new(),
+        busy_error_codes: Vec::new(),
     };
 
     let key_count = provider.keys.len();

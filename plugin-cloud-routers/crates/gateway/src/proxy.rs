@@ -30,8 +30,9 @@ use axum::body::{Body, Bytes};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use cloud_routers_core::config::{ComboConfig, GatewayConfig, ProviderConfig, trim_base_url};
-use cloud_routers_core::keys::{parse_retry_after, FailureKind};
+use cloud_routers_core::keys::{busy_kind_for_code, parse_retry_after, FailureKind};
 use cloud_routers_core::models::{resolve_combo, resolve_user_combo};
+use futures_util::StreamExt;
 use serde_json::json;
 use std::time::Instant;
 
@@ -473,6 +474,12 @@ async fn route_provider(
                 // ── Отказ, который имеет смысл повторить ────────────────────
                 let retry_after = parse_retry_after(response.headers().get("retry-after").and_then(|v| v.to_str().ok()));
                 let detail = response.text().await.unwrap_or_default();
+                // Уточнение по телу: «занято» приходит не только кадром внутри
+                // SSE, но и обычным статусом (`503` + `{"error":{"code":
+                // "upstream_busy"}}` — живой случай 100milionseek 26.11.2026).
+                // Тело уже прочитано, разбор бесплатен, а семантика другая:
+                // короткий кулдаун и 429 наружу вместо 15 с и 5xx.
+                let kind = busy_code_in_body(&detail, &provider.busy_error_codes).unwrap_or(kind);
                 // Отказ ключа — тоже факт о провайдере: тело ответа (текст квоты,
                 // причина 401) в дампе, чтобы разбирать ротацию по файлам.
                 state.dump().response(
@@ -507,6 +514,18 @@ async fn route_provider(
                         "OAuth-сессия провайдера «{}» ({}) отклонена апстримом (HTTP {}) — нужен рефреш токена",
                         provider_id, route_note, status.as_u16()
                     ));
+                } else if kind == FailureKind::Busy {
+                    // «Занято» статусом (503/529 с busy-кодом в теле): ключ не
+                    // виноват, апстрим просит подождать — жёлтый уровень, как у
+                    // 429, а не красный «провайдер сломался».
+                    state.events().warn(format!(
+                        "ключ {} провайдера «{}» ({}): апстрим занят (HTTP {}), пауза {} с, пробуем следующий",
+                        key_id,
+                        provider_id,
+                        route_note,
+                        status.as_u16(),
+                        cooldown.as_secs()
+                    ));
                 } else if status.as_u16() == 429 {
                     // 429 — лимит провайдера, а не отказ релея: жёлтый уровень
                     // (владелец 24.11.2026: «429 — это понятно, лимит»).
@@ -523,20 +542,52 @@ async fn route_provider(
                     ));
                 }
 
-                last = Some(upstream_error_response(
-                    status,
-                    &provider_id,
-                    &key_id,
-                    &detail,
-                    kind,
-                ));
+                // Наружу: для «занято» — 429 независимо от того, пришёл отказ
+                // статусом или кадром в потоке (клиент должен видеть один и тот
+                // же ретраибельный ответ). Остальные отказы — как пришли.
+                last = Some(if kind == FailureKind::Busy {
+                    match crate::protocol::error_from_value(
+                        &serde_json::from_str(&detail).unwrap_or(serde_json::Value::Null),
+                    ) {
+                        Some(error) => upstream_busy_response(&provider_id, &key_id, &error),
+                        None => openai_error(
+                            StatusCode::TOO_MANY_REQUESTS,
+                            format!(
+                                "[провайдер {}, ключ {}] апстрим занят (HTTP {})",
+                                provider_id,
+                                key_id,
+                                status.as_u16()
+                            ),
+                            openai_error_type(kind),
+                        ),
+                    }
+                } else {
+                    upstream_error_response(status, &provider_id, &key_id, &detail, kind)
+                });
                 continue;
             }
             None => {
-                // ── Точка невозврата: ответ отдан клиенту как есть ──────────
-                // Всё, что ниже, не содержит ни одного `continue` по ключу:
-                // байты уйдут клиенту, повтор приведёт к склейке двух ответов.
+                // ── Окно «передумать»: ответ получен, но клиенту не отдан ────
+                // Апстрим умеет сообщать об отказе внутри успешного потока:
+                // HTTP 200 + `data: {"error":{...,"code":"upstream_busy"}}`. По
+                // статусу это неотличимо от здорового ответа, поэтому решает
+                // проба начала потока. Пока клиенту не ушёл ни один байт,
+                // повтор другим ключом не создаёт склейки двух ответов —
+                // инвариант модуля соблюдён. Как только префикс отдан, возврата
+                // нет: ниже ни одного `continue` по ключу.
                 let final_status = status;
+                let content_type = response
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                // Проба — только для потоков, размеченных кадрами, которые
+                // адаптер умеет разбирать. Kiro (бинарный EventStream) сюда не
+                // попадает: поиск `\n\n` в нём бессмыслен и добавил бы задержку.
+                let inspectable = adapter.is_stream_response(&content_type)
+                    && adapter.stream_frames_are_inspectable();
+
                 let dump_ctx = crate::bodydump::DumpCtx {
                     dumper: state.dump(),
                     model: requested_model.to_string(),
@@ -544,8 +595,135 @@ async fn route_provider(
                     key: key_id.clone(),
                     started: attempt_started,
                 };
-                let passthrough =
-                    build_passthrough_response(response, adapter.as_ref(), Some(dump_ctx)).await;
+
+                let passthrough = if inspectable {
+                    match crate::streamprobe::probe_stream(
+                        Box::pin(response.bytes_stream()),
+                        adapter.as_ref(),
+                        crate::streamprobe::ProbeLimits::default(),
+                    )
+                    .await
+                    {
+                        crate::streamprobe::ProbeOutcome::Pass { prefix, rest, reason } => {
+                            // Сдача пробы по тишине/потолку — не ошибка, но и не
+                            // норма: поздняя ошибка апстрима уйдёт клиенту как
+                            // есть, и failover не сработает. Без этой строки
+                            // такой случай неотличим от здорового потока —
+                            // именно на этом разбор 27.11.2026 и застрял.
+                            if matches!(
+                                reason,
+                                crate::streamprobe::PassReason::Idle
+                                    | crate::streamprobe::PassReason::HardCap
+                            ) {
+                                state.events().warn(format!(
+                                    "ключ {} провайдера «{}» ({}): проба не дождалась контента за {} с ({}), отдаём поток как есть — поздняя ошибка апстрима клиенту не будет заменена",
+                                    key_id,
+                                    provider_id,
+                                    route_note,
+                                    attempt_started.elapsed().as_secs(),
+                                    match reason {
+                                        crate::streamprobe::PassReason::Idle => "тишина",
+                                        _ => "потолок ожидания",
+                                    }
+                                ));
+                            }
+                            build_stream_passthrough(
+                                final_status,
+                                content_type,
+                                prefix,
+                                rest,
+                                Some(dump_ctx),
+                            )
+                        }
+                        crate::streamprobe::ProbeOutcome::Broken(e) => {
+                            // Обрыв до первого содержательного кадра: клиенту не
+                            // ушло ни байта — попытку можно повторить.
+                            state.dump().transport_error(
+                                requested_model,
+                                &provider_id,
+                                &key_id,
+                                &crate::neterr::describe(&e),
+                                attempt_started.elapsed().as_millis() as u64,
+                            );
+                            state.rotation().mark_failure(
+                                &provider_id,
+                                &key_id,
+                                FailureKind::Transport,
+                                None,
+                            );
+                            state.events().warn(format!(
+                                "ключ {} провайдера «{}» ({}): поток оборвался до первого кадра ({}), пробуем следующий",
+                                key_id,
+                                provider_id,
+                                route_note,
+                                crate::neterr::describe(&e)
+                            ));
+                            last = Some(openai_error(
+                                StatusCode::BAD_GATEWAY,
+                                format!(
+                                    "Провайдер «{}» оборвал поток до первого кадра: {}",
+                                    provider_id,
+                                    crate::neterr::describe(&e)
+                                ),
+                                "upstream_read_error",
+                            ));
+                            continue;
+                        }
+                        crate::streamprobe::ProbeOutcome::Error { error, prefix, rest } => {
+                            let busy = error.code.as_deref().and_then(|code| {
+                                busy_kind_for_code(code, &provider.busy_error_codes)
+                            });
+                            match busy {
+                                Some(kind) => {
+                                    // «Занято»: ключ не виноват, апстрим просит
+                                    // подождать. Короткий кулдаун, ключ не
+                                    // выключаем, наружу — 429 (ретраибелен для
+                                    // любого клиента, включая ZCode).
+                                    state.rotation().mark_failure(
+                                        &provider_id,
+                                        &key_id,
+                                        kind,
+                                        None,
+                                    );
+                                    state.dump().response(
+                                        requested_model,
+                                        &provider_id,
+                                        &key_id,
+                                        final_status.as_u16(),
+                                        attempt_started.elapsed().as_millis() as u64,
+                                        false,
+                                        &prefix,
+                                        prefix.len() as u64,
+                                        true,
+                                    );
+                                    state.events().warn(format!(
+                                        "ключ {} провайдера «{}» ({}): апстрим занят ({}), пауза {} с, пробуем следующий",
+                                        key_id,
+                                        provider_id,
+                                        route_note,
+                                        error.code.as_deref().unwrap_or("busy"),
+                                        kind.cooldown(None).as_secs()
+                                    ));
+                                    last =
+                                        Some(upstream_busy_response(&provider_id, &key_id, &error));
+                                    continue;
+                                }
+                                // Код не из таблицы «занято»: это не наш случай —
+                                // поток отдаётся клиенту как есть, поведение
+                                // прежнее.
+                                None => build_stream_passthrough(
+                                    final_status,
+                                    content_type,
+                                    prefix,
+                                    rest,
+                                    Some(dump_ctx),
+                                ),
+                            }
+                        }
+                    }
+                } else {
+                    build_passthrough_response(response, adapter.as_ref(), Some(dump_ctx)).await
+                };
                 let body_hint = summarize(passthrough.body_hint.as_deref());
                 state.events().info(format!(
                     "ответ {} от провайдера «{}» ключ {} (HTTP {}){}",
@@ -693,6 +871,83 @@ async fn build_passthrough_response(
     }
 }
 
+/// Код «апстрим занят» из тела ответа со статусом (не из потока).
+///
+/// Ошибка «занято» приходит двумя путями: кадром внутри SSE при HTTP 200 и
+/// обычным статусом (`503` + `{"error":{"code":"upstream_busy"}}` — живой
+/// случай 100milionseek 26.11.2026, 5 из 29 busy-ответов). Второй путь уже
+/// прочитан в `detail`, поэтому распознать его бесплатно — и важно: иначе
+/// «занято» лечится как поломка (кулдаун 15 с, наружу 5xx) вместо просьбы
+/// подождать (5 с, наружу 429).
+///
+/// `None` — код не про занятость; вызывающий оставляет исходную классификацию
+/// по статусу.
+fn busy_code_in_body(detail: &str, extra: &[String]) -> Option<FailureKind> {
+    let value: serde_json::Value = serde_json::from_str(detail).ok()?;
+    let error = crate::protocol::error_from_value(&value)?;
+    busy_kind_for_code(error.code.as_deref()?, extra)
+}
+
+/// Собрать потоковый ответ из уже прочитанного префикса и продолжения потока.
+///
+/// Проба начала потока ([`crate::streamprobe`]) забирает первые байты себе —
+/// их нельзя выбросить: клиент должен получить исходную последовательность
+/// байт. Поэтому префикс уходит первым чанком, дальше идёт `rest`. Для дампа
+/// поток оборачивается в tee целиком (префикс + остаток) — файл видит то же,
+/// что клиент.
+fn build_stream_passthrough<S>(
+    status: StatusCode,
+    content_type: String,
+    prefix: Bytes,
+    rest: S,
+    dump: Option<crate::bodydump::DumpCtx>,
+) -> Passthrough
+where
+    S: futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+{
+    let stream = futures_util::stream::iter(std::iter::once(Ok::<Bytes, reqwest::Error>(prefix)))
+        .chain(rest);
+    let body = match dump {
+        Some(ctx) => {
+            Body::from_stream(crate::bodydump::TeeBody::new(stream, status.as_u16(), ctx))
+        }
+        None => Body::from_stream(stream),
+    };
+    let response = Response::builder()
+        .status(status)
+        .header("content-type", content_type)
+        // Без content-length: длина потока неизвестна заранее.
+        .header("cache-control", "no-cache")
+        .header("x-accel-buffering", "no")
+        .body(body)
+        .unwrap_or_else(|_| {
+            openai_error(StatusCode::BAD_GATEWAY, "Не удалось собрать ответ", "gateway_error")
+        });
+    Passthrough { response, body_hint: None }
+}
+
+/// Ответ клиенту, когда апстрим «занят» (ошибка пришла внутри потока).
+///
+/// Наружу — **429**, а не исходный статус: 429 понимают и ретраят все клиенты
+/// (Cursor, Cline, Roo, ZCode), тогда как 200 с error-кадром или нестандартный
+/// 529 — нет. Исходный код апстрима (`upstream_busy`) сохраняется в теле:
+/// диагностика не теряется, а `type` приведён к OpenAI-форме.
+fn upstream_busy_response(
+    provider_id: &str,
+    key_id: &str,
+    error: &crate::protocol::StreamError,
+) -> Response {
+    let body = json!({
+        "error": {
+            "message": format!("[провайдер {}, ключ {}] {}", provider_id, key_id, error.message),
+            "type": "rate_limit_error",
+            "param": serde_json::Value::Null,
+            "code": error.code,
+        }
+    });
+    (StatusCode::TOO_MANY_REQUESTS, axum::Json(body)).into_response()
+}
+
 /// Собрать `reqwest::Request` из запроса адаптера — тонкая склейка.
 ///
 /// Вся политика (метод, путь, заголовки, `content-type` только при непустом
@@ -771,6 +1026,8 @@ fn openai_error_type(kind: FailureKind) -> &'static str {
         FailureKind::RateLimit => "rate_limit_error",
         FailureKind::Server => "api_error",
         FailureKind::Transport => "api_connection_error",
+        // «Занято» для клиента — тот же смысл, что лимит: подожди и повтори.
+        FailureKind::Busy => "rate_limit_error",
     }
 }
 
