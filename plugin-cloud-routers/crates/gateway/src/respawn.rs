@@ -42,9 +42,20 @@ pub const SHUTDOWN_WAIT: Duration = Duration::from_secs(30);
 ///
 /// Отдельный процесс, а не `exec`: мы должны дождаться, пока новый экземпляр
 /// поднимется, и только тогда завершиться.
+///
+/// Запуск идёт через короткоживущий лончер `cmd /C start "" /B`, а не прямым
+/// `spawn`. Прямой spawn сделал бы новый экземпляр РЕБЁНКОМ перезапускающего
+/// процесса, и `taskkill /T` по нему убил бы уже перезапущенный шлюз. Та же
+/// причина, что у старта из хоста (`gateway_process::gateway_launch_args`);
+/// инцидент 27.11.2026 — сборка убила работающий шлюз через обход дерева.
 pub fn spawn_replacement(exe: &Path, data_dir: &Path, config: &GatewayConfig) -> Result<(), String> {
-    let mut cmd = std::process::Command::new(exe);
-    cmd.arg("--data-dir")
+    let mut cmd = std::process::Command::new("cmd");
+    cmd.arg("/C")
+        .arg("start")
+        .arg("") // пустой title: иначе start съест путь exe как заголовок окна
+        .arg("/B")
+        .arg(exe)
+        .arg("--data-dir")
         .arg(data_dir)
         // Передаём порт явно: новый экземпляр обязан взять его из свежего
         // конфига, а не из аргументов старого процесса.
@@ -58,9 +69,10 @@ pub fn spawn_replacement(exe: &Path, data_dir: &Path, config: &GatewayConfig) ->
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        // CREATE_NO_WINDOW — не мигает консолью; DETACHED_PROCESS — новый
-        // экземпляр не умирает вместе с нами.
-        cmd.creation_flags(0x08000000 | 0x00000008);
+        // CREATE_NO_WINDOW — не мигает консолью. Лончер выходит сразу, поэтому
+        // новый экземпляр остаётся сиротой и переживает закрытие того, кто его
+        // перезапустил.
+        cmd.creation_flags(0x08000000);
     }
 
     cmd.spawn()

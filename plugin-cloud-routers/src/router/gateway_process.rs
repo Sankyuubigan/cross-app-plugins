@@ -73,14 +73,51 @@ fn try_http_shutdown(port: u16) -> bool {
 }
 
 
-/// Флаги `CreateProcess` для Windows.
+/// Флаги `CreateProcess` для лончера `cmd` (см. [`gateway_launch_args`]).
 ///
 /// * `CREATE_NO_WINDOW` (0x08000000) — не мигать чёрным окном консоли.
-/// * `DETACHED_PROCESS` (0x00000008) — процесс не умирает вместе с хостом.
-/// * `CREATE_NEW_PROCESS_GROUP` (0x00000200) — отделить от группы управления
-///   консоли хоста, чтобы Ctrl+C в терминале не гасил шлюз.
+///
+/// `DETACHED_PROCESS` здесь НЕ нужен и обманчив: он отвязывает только консоль,
+/// а родство в таблице процессов Windows (`InheritedFromUniqueProcessId`)
+/// оставляет прежним. Именно из-за этого `taskkill /T` по хосту доставал до
+/// шлюза и убивал его (инцидент 27.11.2026). Живучесть даёт не флаг, а то, что
+/// лончер завершается сразу и шлюз остаётся сиротой — см. [`gateway_launch_args`].
 #[cfg(windows)]
-const CREATE_FLAGS: u32 = 0x08000000 | 0x00000008 | 0x00000200;
+const LAUNCHER_FLAGS: u32 = 0x08000000;
+
+/// Аргументы запуска шлюза ЧЕРЕЗ ЛОНЧЕР `cmd /C start "" /B …`.
+///
+/// ## Зачем лончер, а не прямой `spawn`
+///
+/// Контракт плагина: шлюз переживает закрытие приложения-хоста (он обслуживает
+/// внешние IDE). Прямой `Command::new(exe).spawn()` делает шлюз РЕБЁНКОМ хоста,
+/// и тогда `taskkill /T` по хосту убивает и шлюз — ровно это случилось
+/// 27.11.2026 при сборке установщика (`killApp` в rust-build-toolkit).
+///
+/// `cmd /C start "" /B <exe>` запускает процесс и **немедленно выходит**, поэтому
+/// `ParentProcessId` шлюза указывает на мёртвый pid. Обход дерева процессов
+/// (`taskkill /T`, «завершить дерево» в диспетчере задач) на мёртвом родителе
+/// останавливается и до шлюза не доходит.
+///
+/// `/B` — без нового окна консоли. Поток вывода при этом НАСЛЕДУЕТСЯ от лончера,
+/// поэтому `stdout`/`stderr`, переданные лончеру, продолжают работать
+/// (проверено экспериментом: лог пишется полностью при мёртвом лончере).
+///
+/// Пустой элемент — заголовок окна: `start` съедает первый аргумент в кавычках
+/// как title, и без него путём оказался бы сам exe.
+pub(crate) fn gateway_launch_args(exe: &Path, data_dir: &Path, port: u16) -> Vec<String> {
+    vec![
+        "/C".to_string(),
+        "start".to_string(),
+        String::new(),
+        "/B".to_string(),
+        exe.to_string_lossy().into_owned(),
+        "--data-dir".to_string(),
+        data_dir.to_string_lossy().into_owned(),
+        "--port".to_string(),
+        port.to_string(),
+    ]
+}
 
 /// Папка установки нашего шлюза.
 ///
@@ -175,14 +212,15 @@ pub fn start_server(app: &AppHandle, router_id: RouterId, cfg: &RouterConfig) ->
         ));
     }
 
+    // Запуск через лончер `cmd /C start "" /B …`: шлюз обязан переживать
+    // закрытие хоста, а прямой spawn делает его ребёнком хоста (см.
+    // [`gateway_launch_args`] — там же разбор инцидента 27.11.2026).
+    //
     // Каталог данных: порт передаём явно, чтобы не зависеть от того, что новый
     // экземпляр успел прочитать конфиг (он может подниматься поверх старого при
     // самоперезапуске).
-    let mut cmd = std::process::Command::new(&exe);
-    cmd.arg("--data-dir")
-        .arg(&data_dir)
-        .arg("--port")
-        .arg(port.to_string())
+    let mut cmd = std::process::Command::new("cmd");
+    cmd.args(gateway_launch_args(&exe, &data_dir, port))
         .current_dir(&dir)
         .stdin(std::process::Stdio::null())
         .stdout(log_stdio(&data_dir))
@@ -191,7 +229,7 @@ pub fn start_server(app: &AppHandle, router_id: RouterId, cfg: &RouterConfig) ->
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        cmd.creation_flags(CREATE_FLAGS);
+        cmd.creation_flags(LAUNCHER_FLAGS);
     }
 
     log::info!(
@@ -201,28 +239,30 @@ pub fn start_server(app: &AppHandle, router_id: RouterId, cfg: &RouterConfig) ->
         data_dir.display(),
         port
     );
-    let child = cmd
-        .spawn()
+    // Лончер выходит сразу после `start`, поэтому его pid — НЕ pid шлюза.
+    // pid шлюза берём из `server.json`, который бинарь пишет сам при старте
+    // (`crates/gateway/src/main.rs:190`, `std::process::id()`).
+    cmd.spawn()
         .map_err(|e| format!("Не удалось запустить {}: {}", router_id, e))?;
-    let pid = child.id();
-    config::write_server_record(&data_dir, pid, port, None);
 
-    if !wait_port(port, START_TIMEOUT) {
+    let pid = if wait_port(port, START_TIMEOUT) {
+        config::read_server_record(&data_dir)
+            .map(|r| r.pid)
+            .unwrap_or(0)
+    } else {
         log::warn!(
-            "⚠️ {} не открыл порт {} за {} сек (pid {})",
+            "⚠️ {} не открыл порт {} за {} сек",
             router_id,
             port,
-            START_TIMEOUT.as_secs(),
-            pid
+            START_TIMEOUT.as_secs()
         );
-        // Не выкидываем pid: процесс мог подняться чуть позже (антивирус, диск).
-        return Ok(pid);
+        0
+    };
+    if pid != 0 {
+        // Запись уже написана самим бинарём; здесь только фиксируем в логе,
+        // что связка «порт ↔ pid» сошлась (иначе панель покажет «не запущен»).
+        log::info!("{}: шлюз жив (pid {}, порт {})", router_id, pid, port);
     }
-    // Версию ЗАПИСЫВАЕТ САМ БИНАРЬ при старте: main.rs run() вызывает
-    // write_server_record(Some(core VERSION)). Ставить сюда версию плагина
-    // (env!("CARGO_PKG_VERSION") = 0.1.0) нельзя: она затирала бы честную
-    // версию бинаря сразу после bind, и панель показывала «v0.1.0» при живом
-    // 0.1.4 — доказано боем 23.10.2026 (server.json).
     Ok(pid)
 }
 
@@ -580,16 +620,51 @@ mod tests {
         let _ = std::fs::remove_dir_all(&install_dir);
     }
 
+    /// Шлюз обязан переживать закрытие хоста — это его raison d'être.
+    ///
+    /// Прямой `spawn` делал бы шлюз РЕБЁНКОМ хоста, и `taskkill /T` по хосту
+    /// убивал бы его (инцидент 27.11.2026: сборка установщика убила работающий
+    /// шлюз). Живучесть даёт лончер: `cmd /C start "" /B <exe>` выходит сразу,
+    /// поэтому шлюз остаётся сиротой и обход дерева до него не доходит.
+    ///
+    /// `DETACHED_PROCESS` тут был бы ложной защитой: он отвязывает только
+    /// консоль, а родство в таблице процессов не меняет.
     #[test]
-    fn create_flags_detach_process_from_host() {
+    fn launch_args_go_through_a_short_lived_launcher() {
+        let args = gateway_launch_args(
+            Path::new(r"D:\app\gateway\cloud-routers-gateway.exe"),
+            Path::new(r"C:\Users\u\AppData\Roaming\gateway"),
+            20131,
+        );
+
+        assert_eq!(args[0], "/C", "лончер — cmd /C");
+        assert_eq!(args[1], "start", "процесс запускает встроенная команда start");
+        assert_eq!(args[2], "", "пустой title: иначе start съест exe как заголовок окна");
+        assert_eq!(args[3], "/B", "без /B мигало бы окно консоли");
+        assert_eq!(
+            args[4], r"D:\app\gateway\cloud-routers-gateway.exe",
+            "exe идёт сразу после /B"
+        );
+        assert_eq!(&args[5..], ["--data-dir", r"C:\Users\u\AppData\Roaming\gateway", "--port", "20131"]);
+    }
+
+    /// Флаги лончера не должны содержать `DETACHED_PROCESS`: он не даёт
+    /// живучести, но создаёт ложное впечатление защиты (см. тест выше).
+    #[test]
+    fn launcher_flags_do_not_pretend_to_detach_the_process() {
         #[cfg(windows)]
         {
-            // Проверяем константы, а не вызов WinAPI: смысл в том, чтобы флаги
-            // вообще были выставлены. Без DETACHED_PROCESS шлюз умирал бы
-            // вместе с хостом — а это прямое требование.
-            assert_ne!(CREATE_FLAGS & 0x00000008, 0, "нужен DETACHED_PROCESS");
-            assert_ne!(CREATE_FLAGS & 0x08000000, 0, "нужен CREATE_NO_WINDOW");
-            assert_ne!(CREATE_FLAGS & 0x00000200, 0, "нужен CREATE_NEW_PROCESS_GROUP");
+            const DETACHED_PROCESS: u32 = 0x0000_0008;
+            assert_eq!(
+                LAUNCHER_FLAGS & DETACHED_PROCESS,
+                0,
+                "DETACHED_PROCESS не отвязывает родство — живучесть даёт лончер, а не флаг"
+            );
+            assert_ne!(
+                LAUNCHER_FLAGS & 0x0800_0000,
+                0,
+                "нужен CREATE_NO_WINDOW, иначе мигает консоль"
+            );
         }
         #[cfg(not(windows))]
         {
