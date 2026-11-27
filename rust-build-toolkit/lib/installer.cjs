@@ -104,6 +104,80 @@ function stageVersionedResources(cfg) {
 }
 
 /**
+ * Проверить СГЕНЕРИРОВАННЫЙ `installer.nsi` на соответствие раскладке ресурсов.
+ *
+ * ## Зачем гейт на артефакте, а не только тест на исходнике
+ *
+ * Тест-страж `installer-path.test.cjs` ловит «кто-то снова позвал tauri build
+ * напрямую». Но он проверяет ТЕКСТ ИСХОДНИКА, а дефект 27.11.2026 состоял в том,
+ * что в артефакт уехала старая раскладка — при формально правильном коде вызова.
+ * Поэтому проверяем то, что реально попадёт пользователю: сгенерированный NSIS-скрипт.
+ *
+ * Инвариант при `versionedResources: true`:
+ *   - ресурсы обязаны лежать в `$INSTDIR\resources\<version>\…`;
+ *   - `$INSTDIR\agents\`, `$INSTDIR\mcp_servers\`, `$INSTDIR\tasks_for_test_llm\`
+ *     в корне быть НЕ ДОЛЖНО (это и есть источник агентов-призраков);
+ *   - `rootResources` (redist, gateway) остаются в корне — их наличие не проверяем,
+ *     их отсутствие не ломает резолв.
+ *
+ * Падение здесь означает: установщик НЕ будет выпущен. Пользователь не получит
+ * «0 агентов» — сборка упадёт раньше.
+ */
+function assertVersionedLayout(cfg, installerPath) {
+    if (cfg.versionedResources !== true) return;
+
+    const nsiPath = path.join(path.dirname(installerPath), '..', 'nsis', 'x64', 'installer.nsi');
+    // tauri-бандлер кладёт nsi в <target>/release/nsis/x64, а installer.exe —
+    // в <target>/release/bundle/nsis. Путь может отличаться между версиями CLI,
+    // поэтому ищем по обоим кандидатам, а не хардкодим один.
+    const candidates = [
+        nsiPath,
+        path.join(resolveTargetDir(cfg), 'release', 'nsis', 'x64', 'installer.nsi'),
+    ];
+    const found = candidates.find((p) => fs.existsSync(p));
+    if (!found) {
+        console.warn(
+            '[installer] ГЕЙТ ПРОПУЩЕН: installer.nsi не найден (проверьте раскладку ресурсов вручную). ' +
+            `Искали: ${candidates.join(' | ')}`
+        );
+        return;
+    }
+
+    const src = fs.readFileSync(found, 'utf8');
+    const version = readVersion(cfg);
+    const versionedMarker = `$INSTDIR\\resources\\${version}\\`;
+    const legacyMarkers = [
+        '$INSTDIR\\agents\\',
+        '$INSTDIR\\mcp_servers\\',
+        '$INSTDIR\\tasks_for_test_llm\\',
+    ];
+
+    const versionedCount = src.split(versionedMarker).length - 1;
+    if (versionedCount === 0) {
+        throw new Error(
+            `[installer] РАСКЛАДКА РЕСУРСОВ НЕВЕРНА: в ${found} нет ни одного пути ` +
+            `"${versionedMarker}". Ресурсы уедут в корень установки, а exe ищет их в ` +
+            `resources/${version}/ — пользователь получит 0 агентов (инцидент 27.11.2026). ` +
+            `Установщик не выпущен.`
+        );
+    }
+
+    const leaked = legacyMarkers.filter((m) => src.includes(m));
+    if (leaked.length) {
+        throw new Error(
+            `[installer] РАСКЛАДКА РЕСУРСОВ НЕВЕРНА: в ${found} ресурсы дублируются в корень ` +
+            `установки (${leaked.join(', ')}). Это источник агентов-призраков: NSIS /UPDATE не ` +
+            `удаляет файлы, которых нет в текущей сборке. Установщик не выпущен.`
+        );
+    }
+
+    console.log(
+        `[installer] раскладка проверена: ${versionedCount} путей в resources/${version}/, ` +
+        `legacy-корня нет`
+    );
+}
+
+/**
  * Собрать NSIS-установщик — ЕДИНСТВЕННЫЙ путь сборки установщика в toolkit.
  *
  * ## Почему это отдельная функция, а не два вызова `npx tauri build`
@@ -138,6 +212,8 @@ function buildNsisInstaller(cfg) {
     if (!installer) {
         throw new Error(`Installer not found in ${BUNDLE_DIR(cfg)} for version ${version}`);
     }
+    // Гейт на артефакте: битый установщик не должен покинуть сборку.
+    assertVersionedLayout(cfg, installer);
     return installer;
 }
 
