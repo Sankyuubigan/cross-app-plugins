@@ -8,6 +8,7 @@ const path = require('path');
 const { run: sh, killApp } = require('./run.cjs');
 const { prep, ensureBundleActive, checkExeFresh, BUNDLE_DIR } = require('./build.cjs');
 const { buildCargoInstaller } = require('./nsis.cjs');
+const { buildNsisInstaller } = require('./installer.cjs');
 const { resolveTargetDir } = require('./config.cjs');
 const { findInstallerBundle } = require('./selector.cjs');
 const { setupSigningEnv, signInstaller } = require('./signing.cjs');
@@ -70,7 +71,11 @@ async function run(cfg) {
         const exe = checkExeFresh(cfg, buildStart);
         buildCargoInstaller(cfg, exe);
     } else {
-        sh(cfg, 'npx', ['tauri', 'build', '--bundles', 'nsis'], { echo: true });
+        // ОБЯЗАТЕЛЬНО через общую функцию, а не `npx tauri build` напрямую:
+        // только она применяет версионный конфиг (resources/<version>/).
+        // Прямой вызов здесь уже дал регресс 27.11.2026 — релиз 26.11.13 уехал
+        // со старой раскладкой ресурсов, установленная копия получила 0 агентов.
+        buildNsisInstaller(cfg);
     }
 
     const version = readVersion(cfg);

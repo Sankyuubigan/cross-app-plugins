@@ -103,21 +103,26 @@ function stageVersionedResources(cfg) {
     return outPath;
 }
 
-async function run(cfg) {
-    if (cfg.kind === 'cargo') return runCargoInstaller(cfg);
-
-    await prep(cfg);
-
-    console.log('\n=== installer ===');
-    cleanupOldBundle(cfg);
-
-    killApp(cfg); // освободить file lock exe до пересборки
-    setupSigningEnv(cfg, { strict: false });
-    ensureBundleActive(cfg);
-
-    // VC++ runtime DLL копируются ДО сборки, чтобы попасть в NSIS-бандл.
-    copyVcRedistTo(cfg, path.join(resolveTargetDir(cfg), 'release'));
-
+/**
+ * Собрать NSIS-установщик — ЕДИНСТВЕННЫЙ путь сборки установщика в toolkit.
+ *
+ * ## Почему это отдельная функция, а не два вызова `npx tauri build`
+ *
+ * `installer.cjs` и `release.cjs` собирали установщик каждый по-своему:
+ * `installer.cjs` через `stageVersionedResources()` (правильная раскладка
+ * `resources/<version>/`), а `release.cjs` — голым `npx tauri build --bundles nsis`
+ * БЕЗ `--config`. Следствие (регресс 27.11.2026): ручной `generate_installer.bat`
+ * давал рабочий установщик, а `release.bat` — установщик со старой раскладкой
+ * `$INSTDIR\agents\…`. Пользователь обновился релизом 26.11.13 и получил
+ * «0 агентов»: exe ищет `resources\26.11.13\agents`, а его там нет.
+ *
+ * Разные пути сборки одного артефакта — это и есть причина, поэтому здесь один
+ * путь. Оба сценария обязаны звать `buildNsisInstaller`, а не `npx tauri build`.
+ *
+ * Предусловия (prep/killApp/vcRedist) остаются у вызывающего: у installer и
+ * release они разные по смыслу (release ещё чистит bundle и ставит strict-подпись).
+ */
+function buildNsisInstaller(cfg) {
     const versionedConf = stageVersionedResources(cfg);
     try {
         const buildArgs = ['tauri', 'build', '--bundles', 'nsis'];
@@ -133,6 +138,25 @@ async function run(cfg) {
     if (!installer) {
         throw new Error(`Installer not found in ${BUNDLE_DIR(cfg)} for version ${version}`);
     }
+    return installer;
+}
+
+async function run(cfg) {
+    if (cfg.kind === 'cargo') return runCargoInstaller(cfg);
+
+    await prep(cfg);
+
+    console.log('\n=== installer ===');
+    cleanupOldBundle(cfg);
+
+    killApp(cfg); // освободить file lock exe до пересборки
+    setupSigningEnv(cfg, { strict: false });
+    ensureBundleActive(cfg);
+
+    // VC++ runtime DLL копируются ДО сборки, чтобы попасть в NSIS-бандл.
+    copyVcRedistTo(cfg, path.join(resolveTargetDir(cfg), 'release'));
+
+    const installer = buildNsisInstaller(cfg);
     console.log('Installer:', installer);
 
     signInstaller(cfg, installer, { strict: false });
@@ -141,4 +165,4 @@ async function run(cfg) {
     return installer;
 }
 
-module.exports = { run };
+module.exports = { run, buildNsisInstaller };
